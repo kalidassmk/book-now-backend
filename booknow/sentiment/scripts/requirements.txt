@@ -1,0 +1,10 @@
+ccxt
+redis
+pandas
+numpy
+requests
+websockets
+aiohttp
+xgboost
+scikit-learn
+# matplotlib  # Optional: for chart visualization (requires Python ≤ 3.12)

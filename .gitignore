@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+
+# Virtual envs
+venv/
+venv*/
+.venv/
+env/
+
+# Environment variables (NEVER commit secrets)
+.env
+.env.local
+
+# Test / type cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+htmlcov/
+.coverage
+.coverage.*
+
+# Build
+build/
+dist/
+*.egg
+
+# Logs
+*.log
+logs/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

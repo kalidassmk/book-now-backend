@@ -1,0 +1,50 @@
+[project]
+name = "booknow"
+version = "0.1.0"
+description = "BookNow trading engine — single-process Python rewrite of the Spring Boot backend, absorbing binance-sentiment-engine."
+requires-python = ">=3.10"
+authors = [{ name = "kalidassmk" }]
+
+# Runtime dependencies. Pinned to wide ranges; tighten in CI later.
+dependencies = [
+    # Async I/O & web
+    "aiohttp>=3.9",
+    "websockets>=12",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+
+    # Redis (sync API used today; async helpers via redis.asyncio)
+    "redis>=5.0",
+    "hiredis>=2.3",
+
+    # HTTP for the few unavoidable REST seeds (exchangeInfo, historical klines)
+    "httpx>=0.27",
+
+    # Data + math (already used by binance-sentiment-engine)
+    "pandas>=2.1",
+    "numpy>=1.26",
+
+    # Config + validation
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-dotenv>=1.0",
+
+    # Logging
+    "structlog>=24.1",
+
+    # Sentiment engine carry-overs (already in requirements.txt)
+    "ccxt>=4.2",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+]
+
+[project.scripts]
+booknow = "booknow.main:run"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["booknow*"]
