@@ -13,7 +13,7 @@ logger = logging.getLogger("ProfitReachedAnalyzer")
 # Redis Keys
 WATCH_ALL = "BASE_CURRENT_INC_%"
 PROFIT_REACHED_KEY = "PROFIT_REACHED_020"
-BUY_AMOUNT_USDT = 12.0
+BUY_AMOUNT_USDT = 100.0
 PROFIT_THRESHOLD = 0.20
 
 class ProfitReachedAnalyzer:
@@ -36,7 +36,7 @@ class ProfitReachedAnalyzer:
                         if base_price <= 0:
                             continue
 
-                        # 2. Calculate Profit on a standard $12 buy
+                        # 2. Calculate Profit on a standard $100 buy
                         # Qty = BuyAmount / BasePrice
                         # Profit = (CurrPrice - BasePrice) * Qty
                         profit = (curr_price - base_price) * (BUY_AMOUNT_USDT / base_price)

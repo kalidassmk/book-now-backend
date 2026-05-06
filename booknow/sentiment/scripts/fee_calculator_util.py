@@ -12,7 +12,7 @@ class FeeIntelligenceUtil:
     def __init__(self):
         self.r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
-    def calculate_net_targets(self, investment_usdt=12.0, target_net_profit=0.20):
+    def calculate_net_targets(self, investment_usdt=100.0, target_net_profit=0.20):
         # 1. Buy Phase
         buy_fee = investment_usdt * FEE_RATE
         actual_investment = investment_usdt - buy_fee
@@ -39,14 +39,13 @@ class FeeIntelligenceUtil:
 
     def run_and_store(self):
         # Store a lookup table in Redis for the UI.
-        # Includes the active trading config (12 USDT / +$0.20) plus a few
-        # alternative budgets so the dashboard can show what fees look like
-        # for larger plans.
+        # Includes the active trading config (100 USDT / +$0.20) plus a few
+        # alternative profit-target choices so the dashboard can show what
+        # fees look like at different take-profit levels.
         configs = [
-            {"inv": 12,  "target": 0.20},   # actual fast-scalp config
             {"inv": 100, "target": 0.05},
             {"inv": 100, "target": 0.10},
-            {"inv": 100, "target": 0.20},
+            {"inv": 100, "target": 0.20},   # actual fast-scalp config
             {"inv": 100, "target": 0.50},
         ]
 
@@ -61,7 +60,7 @@ class FeeIntelligenceUtil:
         self.r.set("TRADING_FEE_INTELLIGENCE", json.dumps(results))
         print("✅ Fee Intelligence calculated and stored in Redis.")
         sample_key = f"fee_plan_12_{0.20:.2f}"
-        print(f"Sample (12 USDT, 0.20 Profit): {results[sample_key]}")
+        print(f"Sample (100 USDT, 0.20 Profit): {results[sample_key]}")
 
 if __name__ == "__main__":
     util = FeeIntelligenceUtil()

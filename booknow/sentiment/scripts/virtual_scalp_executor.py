@@ -10,17 +10,37 @@ REDIS_PORT = 6379
 ANALYSIS_020_KEY = 'ANALYSIS_020_TIMELINE'
 VIRTUAL_POSITIONS_KEY = 'VIRTUAL_POSITIONS:MICRO'
 VIRTUAL_HISTORY_KEY = 'VIRTUAL_HISTORY:MICRO'
+TRADING_CONFIG_KEY = 'TRADING_CONFIG'
+
+# Fallbacks if Redis trading config is missing/corrupt; kept aligned with
+# booknow.config.trading_config.TradingConfig defaults.
+DEFAULT_BUY_AMOUNT_USDT = 100.0
+DEFAULT_PROFIT_TARGET_USDT = 0.20
 
 # Risk Settings for Virtual Scalper
-TAKE_PROFIT = 0.005 # 0.5%
 STOP_LOSS = 0.003   # 0.3%
-MIN_HOLD_SECONDS = 180 # 3 Minutes "Patience" Rule
+MIN_HOLD_SECONDS = 300 # 5 Minutes "Patience" Rule
 MAX_VIRTUAL_LOSS_USDT = 1.0 # Allow up to $1 loss during patience period
 
 class VirtualScalpExecutor:
     def __init__(self):
         self.r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        print("🚀 [VIRTUAL SCALPER] Patience Mode Active (3m Hold Rule).")
+        print("🚀 [VIRTUAL SCALPER] Patience Mode Active (5m Hold Rule).")
+
+    def _load_trading_config(self):
+        """Read live TradingConfig from Redis at position-open time.
+        Returns (buy_amount_usdt, profit_target_usdt). Falls back to defaults on any failure."""
+        try:
+            raw = self.r.get(TRADING_CONFIG_KEY)
+            if raw:
+                cfg = json.loads(raw)
+                return (
+                    float(cfg.get("buyAmountUsdt", DEFAULT_BUY_AMOUNT_USDT)),
+                    float(cfg.get("profitAmountUsdt", DEFAULT_PROFIT_TARGET_USDT)),
+                )
+        except Exception:
+            pass
+        return (DEFAULT_BUY_AMOUNT_USDT, DEFAULT_PROFIT_TARGET_USDT)
 
     def process_signals(self):
         last_heartbeat = 0
@@ -55,6 +75,9 @@ class VirtualScalpExecutor:
                 time.sleep(5)
 
     def open_virtual_position(self, symbol, price):
+        # Snapshot the live trading config at entry so this position uses a
+        # stable investment + TP target even if the dashboard mutates them mid-trade.
+        investment, profit_target_usdt = self._load_trading_config()
         pos = {
             "id": str(uuid.uuid4())[:8],
             "symbol": symbol,
@@ -63,32 +86,36 @@ class VirtualScalpExecutor:
             "entry_time": datetime.now().strftime('%H:%M:%S'),
             "max_drawdown": 0,
             "status": "OPEN",
-            "quantity": 100 / price
+            "investment": investment,
+            "profit_target_usdt": profit_target_usdt,
+            "quantity": investment / price,
         }
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
-        print(f"💰 [VIRTUAL BUY] {symbol} at {price} (Holding for min 3m)")
+        print(f"💰 [VIRTUAL BUY] {symbol} at {price} | inv=${investment:.2f} | TP=${profit_target_usdt:.2f} (min hold 5m)")
 
     def monitor_positions(self, symbol, curr_price, signal, curr_vol):
         pos_raw = self.r.hget(VIRTUAL_POSITIONS_KEY, symbol)
         if not pos_raw: return
-        
+
         pos = json.loads(pos_raw)
         entry_price = pos['entry_price']
         elapsed = time.time() - pos['entry_timestamp']
+        investment = pos.get('investment', DEFAULT_BUY_AMOUNT_USDT)
+        profit_target_usdt = pos.get('profit_target_usdt', DEFAULT_PROFIT_TARGET_USDT)
         pnl_pct = (curr_price - entry_price) / entry_price
-        pnl_usdt = 100 * pnl_pct
-        
+        pnl_usdt = investment * pnl_pct
+
         # Track Max Drawdown for learning
         if pnl_pct < pos['max_drawdown']:
             pos['max_drawdown'] = pnl_pct
             self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
 
         exit_reason = None
-        
-        # 1. Take Profit (Instant - Don't wait 3m)
-        if pnl_pct >= TAKE_PROFIT:
+
+        # 1. Take Profit (Instant - $-target hit, don't wait 5m)
+        if pnl_usdt >= profit_target_usdt:
             exit_reason = "TAKE_PROFIT"
-        
+
         # 2. Hard Stop Loss (Instant if loss > $1)
         elif pnl_usdt <= -MAX_VIRTUAL_LOSS_USDT:
             exit_reason = "HARD_STOP_LOSS"
@@ -96,20 +123,21 @@ class VirtualScalpExecutor:
         # 3. Strategy Exit (Instant if exhaustion detected)
         elif signal == "EXHAUSTION_EXIT":
             exit_reason = "STRATEGY_EXIT"
-            
-        # 4. Soft Stop Loss (Patience Logic: Wait 3m if loss < $1)
+
+        # 4. Soft Stop Loss (Patience Logic: Wait 5m if loss < $1)
         elif pnl_pct <= -STOP_LOSS:
             if elapsed < MIN_HOLD_SECONDS:
                 pass # Patiently holding for recovery...
             else:
                 exit_reason = "SOFT_STOP_LOSS"
-        
+
         if exit_reason:
             self.close_virtual_position(symbol, pos, curr_price, pnl_pct, exit_reason, curr_vol)
 
     def close_virtual_position(self, symbol, pos, exit_price, pnl_pct, reason, exit_vol):
+        # Investment is the per-position snapshot taken at open (from TradingConfig).
+        investment = pos.get('investment', DEFAULT_BUY_AMOUNT_USDT)
         # Calculate Real-World Fees (0.1% per side)
-        investment = 100.0 # Updated to User Config
         buy_fee = investment * 0.001
         sell_value = investment * (1 + pnl_pct)
         sell_fee = sell_value * 0.001

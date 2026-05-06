@@ -31,13 +31,13 @@ logger = logging.getLogger("booknow.trading_config")
 class TradingConfig:
     """Mirrors the Java ``TradingConfig.java``.
 
-    Defaults are tuned for the user's stated style: $12 buy with a
+    Defaults are tuned for the user's stated style: $100 buy with a
     fixed $0.20 USDT take-profit, fast-scalp mode on, max-hold 5 min.
     """
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 12.0
+    buyAmountUsdt: float = 100.0
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).

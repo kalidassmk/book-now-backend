@@ -73,7 +73,7 @@ class RegimeTraderEngine:
         api_key: str = None,
         api_secret: str = None,
         live_trading: bool = False,
-        trade_amount_usdt: float = 12.0,
+        trade_amount_usdt: float = 100.0,
         redis_host: str = "127.0.0.1",
         redis_port: int = 6379,
     ):

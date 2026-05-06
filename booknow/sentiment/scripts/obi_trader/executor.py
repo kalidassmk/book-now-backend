@@ -16,7 +16,7 @@ class ExecutionManager:
     Handles Binance orders and account balance.
     Supports Live and Paper trading modes.
     """
-    def __init__(self, api_key="", api_secret="", live=False, trade_amount_usdt=12.0):
+    def __init__(self, api_key="", api_secret="", live=False, trade_amount_usdt=100.0):
         self.api_key = api_key
         self.api_secret = api_secret
         self.live = live
