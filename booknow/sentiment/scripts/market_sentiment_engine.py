@@ -13,6 +13,9 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 from symbols_config import ACTIVE_SYMBOLS
 
+# Multi-source kline fetcher (Binance WS cache → REST rotation → CryptoCompare).
+from klines_router import get_default_router as _get_klines_router
+
 # ==========================================
 # 1. LOGGING & CONFIG
 # ==========================================
@@ -22,10 +25,14 @@ logger = logging.getLogger("MarketScanner")
 class AdaptiveMarketEngine:
     def __init__(self, symbol="BTC/USDT"):
         self.symbol = symbol
+        # CCXT kept for fetch_ticker / fetch_order_book / fetch_trades — no WS
+        # cache exists for those endpoints. OHLCV calls now go through the
+        # router which serves them from the shared WS kline buffer.
         self.exchange = ccxt.binance({
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
+        self.klines = _get_klines_router()
         self.r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
         
         # Clear existing results for a fresh start
@@ -78,7 +85,7 @@ class AdaptiveMarketEngine:
     def get_scores_for_timeframe(self, timeframe='5m'):
         """Generates the 5 core behavioral scores for a specific timeframe"""
         try:
-            ohlcv = self.exchange.fetch_ohlcv(self.symbol, timeframe=timeframe, limit=50)
+            ohlcv = self.klines.fetch_ohlcv(self.symbol, timeframe=timeframe, limit=50)
             ticker = self.exchange.fetch_ticker(self.symbol)
             depth = self.exchange.fetch_order_book(self.symbol, limit=20)
             trades = self.exchange.fetch_trades(self.symbol, limit=100)
@@ -133,7 +140,7 @@ class AdaptiveMarketEngine:
     def run_adaptive_analysis(self):
         try:
             # 1. Detect Regime (Using 1h candles)
-            ohlcv_1h = self.exchange.fetch_ohlcv(self.symbol, timeframe='1h', limit=20)
+            ohlcv_1h = self.klines.fetch_ohlcv(self.symbol, timeframe='1h', limit=20)
             regime = self.detect_regime(ohlcv_1h)
             weights = self.regime_weights[regime]
             

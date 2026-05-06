@@ -12,6 +12,9 @@ try:
 except Exception:
     get_default_cache = None  # type: ignore
 
+# Multi-source kline fetcher (Binance → Bybit → OKX → KuCoin → CryptoCompare).
+from klines_router import get_default_router as _get_klines_router
+
 # ==========================================
 # 1. LOGGING & CONFIG
 # ==========================================
@@ -42,12 +45,14 @@ class Profit020TrendAnalyzer:
             log.info("📡 Using TickersCache (!miniTicker@arr WS) — REST fetch_tickers disabled.")
         else:
             log.warning("⚠️ tickers_ws_cache not available — falling back to REST polling.")
+        # Klines: multi-exchange router instead of direct ccxt.binance to spread rate-limit load.
+        self.klines = _get_klines_router()
 
     def fetch_historical_context(self, ccxt_symbol):
         """Fetches last 10 minutes of 1m candles as initial context."""
         try:
             log.info(f"📜 Fetching 10m history for {ccxt_symbol}")
-            ohlcv = self.ccxt.fetch_ohlcv(ccxt_symbol, timeframe='1m', limit=10)
+            ohlcv = self.klines.fetch_ohlcv(ccxt_symbol, timeframe='1m', limit=10)
             context = []
             for candle in ohlcv:
                 ts, open_p, high, low, close, vol = candle

@@ -5,6 +5,9 @@ import logging
 import ccxt
 from datetime import datetime
 
+# Multi-source kline fetcher (Binance → Bybit → OKX → KuCoin → CryptoCompare).
+from klines_router import get_default_router as _get_klines_router
+
 # ==========================================
 # 1. LOGGING & CONFIG
 # ==========================================
@@ -47,12 +50,15 @@ class SuccessPatternRecorder:
         # Dedicated connection for Pattern Storage (Remote Redis Cloud)
         self.r_analyse = redis.Redis(**REMOTE_REDIS)
         
-        # CCXT Client
+        # CCXT Client (kept only for fetch_ticker in the 1h follow-up path; klines
+        # now go through the multi-exchange router below to avoid Binance bans).
         self.ccxt = ccxt.binance({
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
-        
+        # Multi-source kline router (Binance → Bybit → OKX → KuCoin → CryptoCompare).
+        self.klines = _get_klines_router()
+
         self.processed_hits = set()
 
     def run(self):
@@ -204,41 +210,38 @@ class SuccessPatternRecorder:
             return {"state": "ERROR"}
 
     def capture_time_series(self, symbol):
-        """Fetches price and volume across multiple timeframes."""
+        """Fetches price and volume across multiple timeframes via the kline router."""
         data = {"seconds": {}, "minutes": {}, "hours": {}}
         ccxt_symbol = symbol if "/" in symbol else f"{symbol[:-4]}/{symbol[-4:]}"
-        
-        try:
-            # 1. Seconds (1s to 50s)
-            log.info(f"   ⏱️  Capturing seconds-series for {symbol}...")
-            sec_klines = self.ccxt.fetch_ohlcv(ccxt_symbol, timeframe='1s', limit=60)
-            if sec_klines:
-                for sec in INTERVALS_SEC:
-                    if len(sec_klines) >= sec:
-                        k = sec_klines[-sec]
-                        data["seconds"][f"{sec}s"] = {"price": float(k[4]), "volume": float(k[5])}
 
-            # 2. Minutes (1m to 45m)
-            log.info(f"   ⏱️  Capturing minutes-series for {symbol}...")
-            min_klines = self.ccxt.fetch_ohlcv(ccxt_symbol, timeframe='1m', limit=60)
-            if min_klines:
-                for m in INTERVALS_MIN:
-                    if len(min_klines) >= m:
-                        k = min_klines[-m]
-                        data["minutes"][f"{m}m"] = {"price": float(k[4]), "volume": float(k[5])}
+        # 1. Seconds (1s to 50s) — only Binance offers 1s timeframe; the
+        #    router falls back gracefully (returns []) on other sources.
+        log.info(f"   ⏱️  Capturing seconds-series for {symbol}...")
+        sec_klines = self.klines.fetch_ohlcv(ccxt_symbol, timeframe='1s', limit=60)
+        if sec_klines:
+            for sec in INTERVALS_SEC:
+                if len(sec_klines) >= sec:
+                    k = sec_klines[-sec]
+                    data["seconds"][f"{sec}s"] = {"price": float(k[4]), "volume": float(k[5])}
 
-            # 3. Hours (1h to 5h)
-            log.info(f"   ⏱️  Capturing hours-series for {symbol}...")
-            hr_klines = self.ccxt.fetch_ohlcv(ccxt_symbol, timeframe='1h', limit=10)
-            if hr_klines:
-                for h in INTERVALS_HOUR:
-                    if len(hr_klines) >= h:
-                        k = hr_klines[-h]
-                        data["hours"][f"{h}h"] = {"price": float(k[4]), "volume": float(k[5])}
+        # 2. Minutes (1m to 45m)
+        log.info(f"   ⏱️  Capturing minutes-series for {symbol}...")
+        min_klines = self.klines.fetch_ohlcv(ccxt_symbol, timeframe='1m', limit=60)
+        if min_klines:
+            for m in INTERVALS_MIN:
+                if len(min_klines) >= m:
+                    k = min_klines[-m]
+                    data["minutes"][f"{m}m"] = {"price": float(k[4]), "volume": float(k[5])}
 
-        except Exception as e:
-            log.warning(f"⚠️  Time-series capture partial failure for {symbol}: {e}")
-            
+        # 3. Hours (1h to 5h)
+        log.info(f"   ⏱️  Capturing hours-series for {symbol}...")
+        hr_klines = self.klines.fetch_ohlcv(ccxt_symbol, timeframe='1h', limit=10)
+        if hr_klines:
+            for h in INTERVALS_HOUR:
+                if len(hr_klines) >= h:
+                    k = hr_klines[-h]
+                    data["hours"][f"{h}h"] = {"price": float(k[4]), "volume": float(k[5])}
+
         return data
 
 if __name__ == "__main__":
