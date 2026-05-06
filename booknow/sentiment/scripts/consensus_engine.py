@@ -17,7 +17,7 @@ class ConsensusEngine:
     Unifies the 7 Original Spring Boot signals with the 9 New Python engines.
     """
     def __init__(self, interval_sec=2):
-        self.redis_client = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+        self.redis_client = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), decode_responses=True)
         self.interval_sec = interval_sec
         self.symbols = ACTIVE_SYMBOLS  # Monitor all active coins
 

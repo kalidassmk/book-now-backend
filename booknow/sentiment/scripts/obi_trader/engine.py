@@ -1,8 +1,8 @@
 import asyncio
 import json
 import logging
+import os
 import time
-import redis
 import redis
 import ccxt
 import websockets
@@ -23,7 +23,9 @@ logging.basicConfig(
 log = logging.getLogger("OBITrader")
 
 class OBITraderEngine:
-    def __init__(self, symbol="BTCUSDT", live=False, trade_amount=100.0, redis_host="127.0.0.1"):
+    def __init__(self, symbol="BTCUSDT", live=False, trade_amount=100.0, redis_host=None):
+        if redis_host is None:
+            redis_host = os.getenv("REDIS_HOST", "127.0.0.1")
         self.symbol = symbol.upper()
         self.book = OrderBookManager(self.symbol)
         self.metrics_calc = ImbalanceCalculator()

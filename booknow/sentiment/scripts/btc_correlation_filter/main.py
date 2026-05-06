@@ -25,7 +25,7 @@ class BTCFilterBot:
             symbols = BTC_FILTER_SYMBOLS  # All alts (BTC excluded)
         self.symbols = symbols
         self.interval_sec = interval_sec
-        self.redis_client = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+        self.redis_client = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), decode_responses=True)
 
     async def run(self):
         log.info(f"🚀 Starting BTC Correlation Filter (Resilient Mode) for: {len(self.symbols)} symbols")

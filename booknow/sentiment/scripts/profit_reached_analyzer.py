@@ -1,3 +1,4 @@
+import os
 import redis
 import json
 import time
@@ -18,7 +19,11 @@ PROFIT_THRESHOLD = 0.20
 
 class ProfitReachedAnalyzer:
     def __init__(self):
-        self.r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        self.r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            db=0, decode_responses=True,
+        )
 
     def run(self):
         logger.info(f"🚀 Profit Reached Analyzer started. Threshold: ${PROFIT_THRESHOLD}")

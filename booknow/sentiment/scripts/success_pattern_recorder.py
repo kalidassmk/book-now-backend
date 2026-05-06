@@ -1,3 +1,4 @@
+import os
 import redis
 import json
 import time
@@ -15,7 +16,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | 
 log = logging.getLogger("PatternRecorder")
 
 # Redis Configuration
-LOCAL_REDIS = {'host': 'localhost', 'port': 6379, 'db': 0, 'decode_responses': True}
+LOCAL_REDIS = {
+    'host': os.getenv("REDIS_HOST", "127.0.0.1"),
+    'port': int(os.getenv("REDIS_PORT", "6379")),
+    'db': 0,
+    'decode_responses': True,
+}
 REMOTE_REDIS = {
     'host': 'redis-18144.c89.us-east-1-3.ec2.cloud.redislabs.com',
     'port': 18144,

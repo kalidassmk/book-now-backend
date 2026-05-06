@@ -1,3 +1,4 @@
+import os
 import redis
 import json
 import time
@@ -22,7 +23,12 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-7s | 
 log = logging.getLogger("Profit020Trend")
 
 # Redis Configuration
-LOCAL_REDIS = {'host': 'localhost', 'port': 6379, 'db': 0, 'decode_responses': True}
+LOCAL_REDIS = {
+    'host': os.getenv("REDIS_HOST", "127.0.0.1"),
+    'port': int(os.getenv("REDIS_PORT", "6379")),
+    'db': 0,
+    'decode_responses': True,
+}
 
 # Source & Destination Keys
 PROFIT_HIT_KEY = "PROFIT_REACHED_020"

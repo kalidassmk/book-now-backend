@@ -24,6 +24,7 @@
 """
 
 import asyncio
+import os
 import ccxt.async_support as ccxt
 import redis
 import json
@@ -33,6 +34,9 @@ import ssl
 import time
 from datetime import datetime, timezone
 from typing import List, Dict, Any
+
+_DEFAULT_REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+_DEFAULT_REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -71,8 +75,8 @@ class SymbolDiscoveryEngine:
 
     def __init__(
         self,
-        redis_host: str = "127.0.0.1",
-        redis_port: int = 6379,
+        redis_host: str = _DEFAULT_REDIS_HOST,
+        redis_port: int = _DEFAULT_REDIS_PORT,
         top_n: int = 200,
         refresh_interval_sec: int = 3600,
     ):
@@ -380,7 +384,7 @@ class RedisSymbolClient:
         "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "TRXUSDT", "DOTUSDT",
     ]
 
-    def __init__(self, redis_host="127.0.0.1", redis_port=6379):
+    def __init__(self, redis_host=_DEFAULT_REDIS_HOST, redis_port=_DEFAULT_REDIS_PORT):
         try:
             self._r = redis.Redis(
                 host=redis_host, port=redis_port,
@@ -463,8 +467,8 @@ Examples:
     p.add_argument("--once",     action="store_true", help="Run a single scan and exit")
     p.add_argument("--top",      type=int, default=200, help="Number of symbols to keep (default: 200)")
     p.add_argument("--interval", type=int, default=3600, help="Refresh interval in seconds (default: 3600)")
-    p.add_argument("--redis-host", default="127.0.0.1", help="Redis host (default: 127.0.0.1)")
-    p.add_argument("--redis-port", type=int, default=6379, help="Redis port (default: 6379)")
+    p.add_argument("--redis-host", default=_DEFAULT_REDIS_HOST, help=f"Redis host (default from REDIS_HOST env, currently: {_DEFAULT_REDIS_HOST})")
+    p.add_argument("--redis-port", type=int, default=_DEFAULT_REDIS_PORT, help=f"Redis port (default from REDIS_PORT env, currently: {_DEFAULT_REDIS_PORT})")
     return p.parse_args()
 
 

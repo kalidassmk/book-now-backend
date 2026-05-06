@@ -33,7 +33,11 @@ class AdaptiveMarketEngine:
             'options': {'defaultType': 'spot'}
         })
         self.klines = _get_klines_router()
-        self.r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+        self.r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            db=0, decode_responses=True,
+        )
         
         # Clear existing results for a fresh start
         self.clear_old_results()

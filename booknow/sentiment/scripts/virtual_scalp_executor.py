@@ -1,3 +1,4 @@
+import os
 import redis
 import json
 import time
@@ -5,8 +6,10 @@ import uuid
 from datetime import datetime
 
 # --- CONFIGURATION ---
-REDIS_HOST = '127.0.0.1'
-REDIS_PORT = 6379
+# Read from env so Docker can point at the `redis` service while local
+# dev still defaults to 127.0.0.1. Compose sets REDIS_HOST=redis.
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 ANALYSIS_020_KEY = 'ANALYSIS_020_TIMELINE'
 VIRTUAL_POSITIONS_KEY = 'VIRTUAL_POSITIONS:MICRO'
 VIRTUAL_HISTORY_KEY = 'VIRTUAL_HISTORY:MICRO'

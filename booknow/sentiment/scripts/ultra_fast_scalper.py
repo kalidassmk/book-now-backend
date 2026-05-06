@@ -86,7 +86,11 @@ class MultiSymbolScalper:
         # 1. Redis Connection
         try:
             import redis
-            self.redis = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+            self.redis = redis.Redis(
+                host=os.getenv("REDIS_HOST", "127.0.0.1"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                decode_responses=True,
+            )
             self.redis.ping()
             log.info("🔗 Connected to Redis.")
         except Exception as e:

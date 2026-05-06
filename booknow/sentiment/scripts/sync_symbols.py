@@ -4,6 +4,7 @@ sync_symbols.py — Standalone script to fetch top USDT symbols from Binance API
 This script ranks coins by 24h volume and stores them in Redis.
 """
 
+import os
 import requests
 import redis
 import json
@@ -16,8 +17,8 @@ logger = logging.getLogger("SymbolSync")
 
 # Configuration
 BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/24hr"
-REDIS_HOST = "127.0.0.1"
-REDIS_PORT = 6379
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 TOP_N = 200
 
 def fetch_and_sync():

@@ -15,6 +15,7 @@ Usage:
 """
 
 import asyncio
+import os
 import time
 import json
 import logging
@@ -233,7 +234,7 @@ class VolumePriceAnalyzer:
         self.klines_cache = klines_cache
         if use_redis:
             try:
-                self.redis = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+                self.redis = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), db=0, decode_responses=True)
                 self.redis.ping()
             except Exception:
                 logger.warning("Redis not available — results will only be printed.")
@@ -362,7 +363,7 @@ def scan_fast_movers(analyzer, symbols=None):
     """Scan multiple symbols and print ranked summary."""
     if symbols is None:
         try:
-            r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+            r = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), db=0, decode_responses=True)
             fm = r.hkeys("FAST_MOVE")
             symbols = [k.replace("USDT", "/USDT") for k in fm[:20]] if fm else ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
         except Exception:
@@ -411,7 +412,7 @@ async def _daemon_loop(analyzer: "VolumePriceAnalyzer", cache, top_n: int = DAEM
     if analyzer.use_redis:
         r = analyzer.redis
     else:
-        r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+        r = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), db=0, decode_responses=True)
 
     last_scan = 0.0
     while True:

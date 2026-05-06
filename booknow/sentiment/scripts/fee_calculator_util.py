@@ -1,16 +1,21 @@
+import os
 import redis
 import json
 import time
 
 # Binance default fee (0.1%)
-FEE_RATE = 0.001 
+FEE_RATE = 0.001
 
 class FeeIntelligenceUtil:
     """
     Calculates precise trade targets factoring in Binance execution fees.
     """
     def __init__(self):
-        self.r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+        self.r = redis.Redis(
+            host=os.getenv("REDIS_HOST", "127.0.0.1"),
+            port=int(os.getenv("REDIS_PORT", "6379")),
+            decode_responses=True,
+        )
 
     def calculate_net_targets(self, investment_usdt=100.0, target_net_profit=0.20):
         # 1. Buy Phase

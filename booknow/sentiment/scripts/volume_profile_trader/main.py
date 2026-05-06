@@ -33,7 +33,7 @@ class VolumeProfileBot:
         self.interval_sec = interval_sec
         self.engine = VolumeProfileEngine(num_bins=150)
         self.strategy = VolumeProfileStrategy()
-        self.redis_client = redis.Redis(host='127.0.0.1', port=6379, decode_responses=True)
+        self.redis_client = redis.Redis(host=os.getenv("REDIS_HOST", "127.0.0.1"), port=int(os.getenv("REDIS_PORT", "6379")), decode_responses=True)
 
     async def run(self):
         log.info(f"🚀 Starting Volume Profile Bot (Resilient CCXT Mode) for: {self.symbols}")
