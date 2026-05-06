@@ -19,7 +19,6 @@ ALGORITHMS = [
     ("Symbol Discovery Engine", ".", "symbol_discovery_engine.py"),
     ("Regime Trader", "regime_trader", "engine.py"),
     ("OBI Trader", "obi_trader", "engine.py"),
-    ("Funding/OI Trader", "funding_oi_trader", "main.py"),
     ("Volume Profile Trader", "volume_profile_trader", "main.py"),
     ("Trend Alignment Engine", "trend_alignment_engine", "main.py"),
     ("Fakeout Detector", "fakeout_detector_system", "main.py"),

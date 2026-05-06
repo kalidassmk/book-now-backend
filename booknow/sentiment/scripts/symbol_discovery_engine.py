@@ -48,14 +48,12 @@ log = logging.getLogger("SymbolDiscovery")
 
 # ── Constants ──────────────────────────────────────────────────────────────
 BINANCE_SPOT_TICKER   = "https://api.binance.com/api/v3/ticker/24hr"
-BINANCE_FUTURES_INFO  = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-BINANCE_FUTURES_TICKER = "https://fapi.binance.com/fapi/v1/ticker/24hr"
 
-# Scoring weights (must sum to 1.0)
-WEIGHT_QUOTE_VOLUME   = 0.40   # 24h USDT volume — liquidity king
-WEIGHT_TRADE_COUNT    = 0.20   # number of trades — retail activity
-WEIGHT_PRICE_CHANGE   = 0.20   # absolute % price change — momentum
-WEIGHT_OPEN_INTEREST  = 0.20   # futures open interest (if available)
+# Scoring weights (must sum to 1.0). Spot-only — futures open-interest
+# weight was removed when the engine moved to spot-only trading.
+WEIGHT_QUOTE_VOLUME   = 0.50   # 24h USDT volume — liquidity king
+WEIGHT_TRADE_COUNT    = 0.25   # number of trades — retail activity
+WEIGHT_PRICE_CHANGE   = 0.25   # absolute % price change — momentum
 
 # Hard filters
 MIN_QUOTE_VOLUME_USDT = 5_000_000      # at least $5M 24h volume
@@ -108,22 +106,15 @@ class SymbolDiscoveryEngine:
         log.info("  Target: Top %d USDT pairs by composite score", self.top_n)
         log.info("=" * 65)
 
-        # Initialize CCXT
+        # Initialize CCXT (spot-only — futures client removed with spot-only switch).
         self.spot_client = ccxt.binance({
             'enableRateLimit': True,
             'options': {'defaultType': 'spot'}
         })
-        self.futures_client = ccxt.binance({
-            'enableRateLimit': True,
-            'options': {'defaultType': 'swap'}
-        })
 
         try:
-            # 1. Fetch spot + futures ticker data in parallel
-            spot_tickers, futures_tickers = await asyncio.gather(
-                self.spot_client.fetch_tickers(),
-                self.futures_client.fetch_tickers()
-            )
+            # 1. Fetch spot ticker data
+            spot_tickers = await self.spot_client.fetch_tickers()
 
             # Convert CCXT tickers to the internal format
             spot_data = []
@@ -144,26 +135,8 @@ class SymbolDiscoveryEngine:
                     "source": "spot"
                 })
 
-            futures_data = []
-            for sym, t in futures_tickers.items():
-                if not sym.endswith("/USDT"): continue
-                futures_data.append({
-                    "symbol": sym.replace("/", ""),
-                    "futures_volume": float(t.get('quoteVolume', 0)),
-                    "futures_price_change_pct": abs(float(t.get('percentage', 0))),
-                    "futures_trade_count": int(t.get('info', {}).get('count', 0)),
-                })
-
-            # Fetch OI only for the top symbols to save time/limits
-            # (We'll do this after a preliminary ranking or just for all futures symbols)
-            futures_oi = {}
-            log.info("📡 Fetching Open Interest for all active futures pairs...")
-            # For simplicity, we'll try to fetch OI for symbols that have futures
-            futures_syms = [f['symbol'] for f in futures_data]
-            # ... (OI fetching logic below)
-
-            # 2. Merge into unified records
-            ranked = self._rank_symbols(spot_data, futures_data, futures_oi)
+            # 2. Rank
+            ranked = self._rank_symbols(spot_data)
 
             # 3. Dynamic Injection: FAST_MOVE Priority
             try:
@@ -177,9 +150,9 @@ class SymbolDiscoveryEngine:
                             ranked.append({
                                 "symbol": fm, "rank": 999, "score": 100.0,
                                 "price": 0.0, "quote_volume": 0.0, "price_change_pct": 0.0,
-                                "trade_count": 0, "open_interest": 0.0, "has_futures": True,
-                                "high_24h": 0, "low_24h": 0, "norm_volume": 0.0,
-                                "norm_trades": 0.0, "norm_momentum": 0.0, "norm_oi": 0.0
+                                "trade_count": 0,
+                                "high_24h": 0, "low_24h": 0,
+                                "norm_volume": 0.0, "norm_trades": 0.0, "norm_momentum": 0.0,
                             })
             except Exception as e:
                 log.warning("⚠️ Failed to inject Fast Movers: %s", e)
@@ -221,47 +194,29 @@ class SymbolDiscoveryEngine:
 
     async def close(self):
         await self.spot_client.close()
-        await self.futures_client.close()
 
     # ── Ranking Logic ──────────────────────────────────────────────────────
 
-    def _rank_symbols(
-        self,
-        spot_data: List[Dict],
-        futures_data: List[Dict],
-        futures_oi: Dict[str, float],
-    ) -> List[Dict]:
+    def _rank_symbols(self, spot_data: List[Dict]) -> List[Dict]:
         """
-        Merge spot + futures data and compute a composite ranking score.
+        Compute a composite ranking score from spot ticker data.
 
         Score formula (0–100):
-            score = 0.40 × norm(quote_volume)
-                  + 0.20 × norm(trade_count)
-                  + 0.20 × norm(abs_price_change_pct)
-                  + 0.20 × norm(open_interest)
+            score = 0.50 × norm(quote_volume)
+                  + 0.25 × norm(trade_count)
+                  + 0.25 × norm(abs_price_change_pct)
         """
-        # Build lookup maps
-        futures_map = {f["symbol"]: f for f in futures_data}
-        oi_map      = futures_oi
-
-        # Merge spot with futures data
         merged = {}
         for s in spot_data:
             sym = s["symbol"]
-            f   = futures_map.get(sym, {})
             merged[sym] = {
-                "symbol":       sym,
-                "price":        s["price"],
-                "quote_volume": s["quote_volume"] + f.get("futures_volume", 0),
-                "price_change_pct": max(
-                    s["price_change_pct"],
-                    f.get("futures_price_change_pct", 0),
-                ),
-                "trade_count": s["trade_count"] + f.get("futures_trade_count", 0),
-                "open_interest": oi_map.get(sym, 0.0),
-                "has_futures":   sym in futures_map,
-                "high_24h":      s.get("high", 0),
-                "low_24h":       s.get("low", 0),
+                "symbol":           sym,
+                "price":            s["price"],
+                "quote_volume":     s["quote_volume"],
+                "price_change_pct": s["price_change_pct"],
+                "trade_count":      s["trade_count"],
+                "high_24h":         s.get("high", 0),
+                "low_24h":          s.get("low", 0),
             }
 
         records = list(merged.values())
@@ -275,28 +230,24 @@ class SymbolDiscoveryEngine:
                 return [50.0] * len(values)
             return [((v - mn) / (mx - mn)) * 100 for v in values]
 
-        volumes   = [r["quote_volume"]     for r in records]
-        trades    = [r["trade_count"]      for r in records]
-        momentum  = [r["price_change_pct"] for r in records]
-        oi_values = [r["open_interest"]    for r in records]
+        volumes  = [r["quote_volume"]     for r in records]
+        trades   = [r["trade_count"]      for r in records]
+        momentum = [r["price_change_pct"] for r in records]
 
-        norm_vol  = norm(volumes)
-        norm_trd  = norm(trades)
-        norm_mom  = norm(momentum)
-        norm_oi   = norm(oi_values)
+        norm_vol = norm(volumes)
+        norm_trd = norm(trades)
+        norm_mom = norm(momentum)
 
         for i, rec in enumerate(records):
             rec["score"] = round(
-                WEIGHT_QUOTE_VOLUME  * norm_vol[i]
-                + WEIGHT_TRADE_COUNT * norm_trd[i]
-                + WEIGHT_PRICE_CHANGE * norm_mom[i]
-                + WEIGHT_OPEN_INTEREST * norm_oi[i],
+                WEIGHT_QUOTE_VOLUME   * norm_vol[i]
+                + WEIGHT_TRADE_COUNT  * norm_trd[i]
+                + WEIGHT_PRICE_CHANGE * norm_mom[i],
                 2,
             )
             rec["norm_volume"]   = round(norm_vol[i], 2)
             rec["norm_trades"]   = round(norm_trd[i], 2)
             rec["norm_momentum"] = round(norm_mom[i], 2)
-            rec["norm_oi"]       = round(norm_oi[i], 2)
 
         # Sort by composite score descending
         records.sort(key=lambda r: r["score"], reverse=True)
@@ -338,14 +289,11 @@ class SymbolDiscoveryEngine:
                 "quote_volume_24h": rec["quote_volume"],
                 "trade_count_24h":  rec["trade_count"],
                 "price_change_pct": rec["price_change_pct"],
-                "open_interest":    rec["open_interest"],
-                "has_futures":      rec["has_futures"],
                 "high_24h":         rec["high_24h"],
                 "low_24h":          rec["low_24h"],
                 "norm_volume":      rec["norm_volume"],
                 "norm_trades":      rec["norm_trades"],
                 "norm_momentum":    rec["norm_momentum"],
-                "norm_oi":          rec["norm_oi"],
                 "last_updated":     ts,
             }
             pipe.hset("SYMBOLS:METADATA", rec["symbol"], json.dumps(meta))

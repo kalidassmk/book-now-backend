@@ -30,10 +30,11 @@ class FeatureEngineer:
         df = df.ffill().fillna(0)
 
         # 2. Interaction Features (Ensure columns exist first)
-        for col in ['oi_change', 'funding_rate', 'rsi', 'price_change_5m']:
+        # Removed funding_rate / oi_change / oi_funding_interaction with the
+        # move to spot-only trading (those signals are futures-derived).
+        for col in ['rsi', 'price_change_5m']:
             if col not in df.columns: df[col] = 0.0
 
-        df['oi_funding_interaction'] = df['oi_change'] * df['funding_rate']
         df['momentum_interaction'] = df['rsi'] * df['price_change_5m']
 
         # 3. Normalization (Simplified Z-score)
@@ -51,9 +52,9 @@ class FeatureEngineer:
 
         # 4. Enforce Strict Column Set & Order
         required_cols = [
-            'price', 'rsi', 'price_change_5m', 'funding_rate', 
-            'oi_change', 'volatility', 'volume_spike', 
-            'oi_funding_interaction', 'momentum_interaction'
+            'price', 'rsi', 'price_change_5m',
+            'volatility', 'volume_spike',
+            'momentum_interaction',
         ]
         
         # Ensure all required columns exist (fill with 0 if missing)

@@ -3,29 +3,23 @@ meta_model.py
 ─────────────────────────────────────────────────────────────────────────────
 Phase-13 port of ``meta_model_system/data_collector.py``.
 
-The meta-model wants a single feature dict per ``(symbol, tick)`` that
-combines spot kline-derived TA features (RSI, volatility, volume
-spike) with futures-side flow features (funding rate, OI). The legacy
-collector hit CCXT four times per call; this version:
+The meta-model wants a single feature dict per ``(symbol, tick)`` of
+spot kline-derived TA features (RSI, volatility, volume spike). This
+version reads spot klines from the shared :class:`KlinesCache` (one
+shared WS connection across the whole engine) and computes TA
+features with pandas if it's available, falling back to safe defaults
+if it isn't.
 
-  * reads spot klines from the shared :class:`KlinesCache` (one shared
-    WS connection across the whole engine),
-  * runs the futures calls in parallel with the kline read,
-  * computes TA features with pandas if it's available, and falls
-    back to safe defaults if it isn't (matches legacy behaviour).
+Funding-rate and open-interest features were removed when the engine
+moved to spot-only trading (those signals come from Binance Futures).
 
-The output dict matches the legacy schema exactly so
-``meta_model_system/feature_engineering.py`` keeps working without
-edits:
+Output dict:
 
     {
         "symbol": str,
         "price": float,
         "rsi": float,
         "price_change_5m": float,
-        "funding_rate": float,
-        "oi_change": float,        # current absolute OI; "change" is a
-                                   # legacy misnomer kept for schema parity
         "volatility": float,
         "volume_spike": float,
     }
@@ -33,7 +27,6 @@ edits:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -45,54 +38,33 @@ except ImportError:  # pragma: no cover
     _HAS_PANDAS = False
 
 from booknow.subsystems.base_fetcher import KlinesFetcher
-from booknow.subsystems.futures_rest import FuturesRestClient
 
 
 logger = logging.getLogger("booknow.subsystems.meta_model")
 
 
 class MetaModelFetcher(KlinesFetcher):
-    """Combined spot-klines + futures-flow feature collector.
+    """Spot-only feature collector for the meta-model.
 
-    Inherits the cache-first kline path from :class:`KlinesFetcher` and
-    adds funding/OI fetches via :class:`FuturesRestClient`.
+    Inherits the cache-first kline path from :class:`KlinesFetcher`.
     """
 
     default_interval = "5m"
     default_limit = 100
 
-    def __init__(self, *args, futures: Optional[FuturesRestClient] = None, **kwargs):
+    def __init__(self, *args, **kwargs):
         kwargs.setdefault("log_name", "booknow.subsystems.meta_model")
         super().__init__(*args, **kwargs)
-        # If the registry didn't pass one we build our own — same
-        # ownership pattern as the HTTP client in the base class.
-        self._futures = futures or FuturesRestClient()
-        self._owns_futures = futures is None
-
-    async def close(self) -> None:
-        await super().close()
-        if self._owns_futures:
-            await self._futures.aclose()
 
     async def fetch_all_features(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Build one feature row for ``symbol``. ``None`` if klines fail."""
         api_symbol = self._normalise_symbol(symbol)
 
-        # Issue the three fetches concurrently. Funding and OI returning
-        # None is OK — the legacy collector treats those as 0.0.
-        klines_task = asyncio.create_task(
-            self.fetch_klines(api_symbol, interval=self.default_interval, limit=self.default_limit),
+        klines = await self.fetch_klines(
+            api_symbol, interval=self.default_interval, limit=self.default_limit,
         )
-        funding_task = asyncio.create_task(self._futures.get_funding_rate(api_symbol))
-        oi_task      = asyncio.create_task(self._futures.get_open_interest(api_symbol))
-
-        klines = await klines_task
         if not klines:
-            funding_task.cancel()
-            oi_task.cancel()
             return None
-        funding = await funding_task or 0.0
-        oi      = await oi_task or 0.0
 
         try:
             current_price = float(klines[-1][4])
@@ -109,8 +81,6 @@ class MetaModelFetcher(KlinesFetcher):
             "price": current_price,
             "rsi": rsi,
             "price_change_5m": price_change,
-            "funding_rate": float(funding),
-            "oi_change": float(oi),
             "volatility": volatility,
             "volume_spike": volume_spike,
         }

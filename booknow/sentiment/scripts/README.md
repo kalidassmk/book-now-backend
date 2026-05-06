@@ -10,8 +10,7 @@ A production-grade algorithmic trading suite that combines 16 specialized signal
 | :--- | :--- | :--- |
 | **1. Regime Trader** | `regime_trader/` | Detects Market State: Trending (Bull/Bear), Ranging, or Volatile. |
 | **2. OBI Trader** | `obi_trader/` | Real-time Order Book Imbalance and Buy/Sell Wall detection. |
-| **3. Funding/OI Trader**| `funding_oi_trader/` | Bullish/Bearish Divergence between Price and Derivatives data. |
-| **4. Volume Profile** | `volume_profile_trader/`| Identifies High-Liquidity zones (POC, VAH, VAL) for support/resistance. |
+| **3. Volume Profile** | `volume_profile_trader/`| Identifies High-Liquidity zones (POC, VAH, VAL) for support/resistance. |
 | **5. MTF Alignment** | `trend_alignment_engine/`| Trend verification across 6 timeframes (5m, 15m, 1h, 4h, 1d, 1w). |
 | **6. Fakeout Detector** | `fakeout_detector_system/`| Identifies Liquidity Sweeps and Traps using volume confirmation. |
 | **7. Meta-Model (ML)** | `meta_model_system/` | XGBoost model predicting the probability of trade success (0 to 1). |
@@ -71,7 +70,6 @@ If you need to debug a specific algorithm, you can run it separately. You must `
 | :--- | :--- |
 | **Regime Trader** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/regime_trader && /Users/bogoai/Book-Now/venv313/bin/python3 engine.py` |
 | **OBI Trader** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/obi_trader && /Users/bogoai/Book-Now/venv313/bin/python3 engine.py` |
-| **Funding/OI** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/funding_oi_trader && /Users/bogoai/Book-Now/venv313/bin/python3 main.py` |
 | **Volume Profile** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/volume_profile_trader && /Users/bogoai/Book-Now/venv313/bin/python3 main.py` |
 | **MTF Alignment** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/trend_alignment_engine && /Users/bogoai/Book-Now/venv313/bin/python3 main.py` |
 | **Fakeout Detector** | `cd /Users/bogoai/Book-Now/binance-sentiment-engine/fakeout_detector_system && /Users/bogoai/Book-Now/venv313/bin/python3 main.py` |

@@ -77,8 +77,6 @@ class DatasetBuilder:
             "price": price,
             "rsi": 50 + np.random.normal(0, 10),
             "price_change_5m": (price - prev_price) / prev_price,
-            "funding_rate": 0.0001 + np.random.normal(0, 0.00005),
-            "oi_change": np.random.normal(0, 0.02),
             "volatility": np.random.normal(0.01, 0.005),
-            "volume_spike": 1.0 + np.random.normal(0, 0.5)
+            "volume_spike": 1.0 + np.random.normal(0, 0.5),
         }
