@@ -81,10 +81,15 @@ class VirtualScalpExecutor:
         # Snapshot the live trading config at entry so this position uses a
         # stable investment + TP target even if the dashboard mutates them mid-trade.
         investment, profit_target_usdt = self._load_trading_config()
+        # Look up the symbol's baseline (set by profit_reached_analyzer when
+        # the coin first crossed +$0.20 from base) so the dashboard can show
+        # the operator how far the entry price is above base.
+        base_price = self._fetch_base_price(symbol)
         pos = {
             "id": str(uuid.uuid4())[:8],
             "symbol": symbol,
             "entry_price": price,
+            "base_price": base_price,
             "entry_timestamp": time.time(),
             "entry_time": datetime.now().strftime('%H:%M:%S'),
             "max_drawdown": 0,
@@ -94,7 +99,20 @@ class VirtualScalpExecutor:
             "quantity": investment / price,
         }
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
-        print(f"💰 [VIRTUAL BUY] {symbol} at {price} | inv=${investment:.2f} | TP=${profit_target_usdt:.2f} (min hold 5m)")
+        print(f"💰 [VIRTUAL BUY] {symbol} at {price} | base={base_price} | inv=${investment:.2f} | TP=${profit_target_usdt:.2f} (min hold 5m)")
+
+    def _fetch_base_price(self, symbol):
+        """Return the symbol's stored base price, or None if not available."""
+        try:
+            raw = self.r.hget("PROFIT_REACHED_020", symbol)
+            if raw:
+                data = json.loads(raw)
+                bp = data.get("basePrice")
+                if bp is not None:
+                    return float(bp)
+        except Exception:
+            pass
+        return None
 
     def monitor_positions(self, symbol, curr_price, signal, curr_vol):
         pos_raw = self.r.hget(VIRTUAL_POSITIONS_KEY, symbol)
