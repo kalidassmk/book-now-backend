@@ -103,6 +103,11 @@ PER_SYMBOL_LIST_CAP   = 100        # per-symbol crossing history
 LOOP_SLEEP_SEC        = 10
 FOLLOWUP_DELAY_SEC    = 3600       # 1 hour
 EVENTS_FETCH_BATCH    = 1000       # newest-N events scanned per loop
+EVENT_DEFER_SEC       = 30         # wait this long after a crossing before
+                                    # capturing — gives profit_020_trend_analyzer
+                                    # time to populate ANALYSIS_020_TIMELINE
+                                    # via fetch_historical_context (10m of
+                                    # pre-cross 1m klines).
 
 # Multi-timeframe kline samples (for the legacy ANALYSE_DB record).
 INTERVALS_SEC  = [1, 2, 5, 10, 20, 30, 45, 50]
@@ -146,16 +151,37 @@ class SuccessPatternRecorder:
         if not events:
             return
 
-        log.info("📥 [EVENTS] %d new crossing(s) to record", len(events))
+        # Defer capture for very recent events. ANALYSIS_020_TIMELINE is
+        # populated by profit_020_trend_analyzer *after* a coin enters
+        # PROFIT_REACHED_020, so the timeline is empty at the moment of
+        # crossing. Waiting EVENT_DEFER_SEC lets the trend analyzer seed
+        # the timeline (via fetch_historical_context — 10m of 1m klines)
+        # before we snapshot it. Newer events stay in the events list and
+        # get picked up on a subsequent loop.
+        cutoff_ts = time.time() - EVENT_DEFER_SEC
+        ready    = [e for e in events if float(e.get("reachedAtTs", 0) or 0) <= cutoff_ts]
+        deferred = len(events) - len(ready)
+        if not ready:
+            if deferred:
+                log.info("⏳ [EVENTS] %d crossing(s) too recent — deferring to next loop", deferred)
+            return
+
+        if deferred:
+            log.info("📥 [EVENTS] %d ready, %d still deferred (<%ds old)",
+                     len(ready), deferred, EVENT_DEFER_SEC)
+        else:
+            log.info("📥 [EVENTS] %d new crossing(s) to record", len(ready))
+
         recorded_any = False
-        for event in events:
+        for event in ready:
             if self._capture_pattern(event):
                 recorded_any = True
 
-        # Advance the cursor to the newest event we processed (oldest-newest order).
+        # Advance the cursor to the newest READY event. Deferred events
+        # stay newer-than-cursor so the next _fetch_new_events sees them.
         if recorded_any:
             try:
-                self.r_analyse.set(PATTERNS_V2_CURSOR_KEY, events[-1]["event_id"])
+                self.r_analyse.set(PATTERNS_V2_CURSOR_KEY, ready[-1]["event_id"])
             except Exception as e:
                 log.warning(f"Failed to update V2 cursor: {e}")
 
