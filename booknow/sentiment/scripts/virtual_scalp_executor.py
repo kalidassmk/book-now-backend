@@ -17,7 +17,8 @@ BTC_REGIME_KEY = 'BTC_REGIME'
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
 DEFAULT_BUY_AMOUNT_USDT = 100.0
-DEFAULT_PROFIT_TARGET_USDT = 0.50
+DEFAULT_PROFIT_TARGET_USDT = 0.25
+DEFAULT_LIMIT_OFFSET_PCT   = 0.30   # buy this % below the signal price
 
 # Risk / sizing constants. Comments are dollarised against a $100 position
 # so the geometry is obvious — change the constants, not the comments,
@@ -50,6 +51,17 @@ FLAT_EXIT_AFTER_SECONDS = 7200     # 2 h — was 5 min; bumped after the
                                    # than 5 min to play out.
 FLAT_EXIT_BAND_USDT = 0.05         # |net pnl| <= $0.05 counts as "flat"
 
+# Limit-buy entries — when SCALP_BUY_SIGNAL fires, we don't take the
+# market price. Instead we "place a limit order" (paper) at slightly
+# below market and only fill when price comes back to it. Two payoffs:
+#   * better entry → smaller move needed for TP
+#   * implicit selectivity → fast pumps that never pull back are
+#     skipped, which historically were the late-FOMO trades that lost
+#
+# The pending order is stored in VIRTUAL_POSITIONS_KEY with status
+# "PENDING_LIMIT". A sweep each loop fills/expires/cancels it.
+LIMIT_ORDER_TIMEOUT_SECONDS = 60   # cancel the limit if no fill in 60s
+
 
 def _round_trip_fee_estimate(investment, pnl_pct):
     """Closed-form round-trip fee for a position closing at pnl_pct.
@@ -64,11 +76,12 @@ def _round_trip_fee_estimate(investment, pnl_pct):
 class VirtualScalpExecutor:
     def __init__(self):
         self.r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
-        print("🚀 [VIRTUAL SCALPER] Asymmetric R:R mode (TP=$0.40 net, SL=0.2% strict, BE-stop, flat-cut).")
+        print("🚀 [VIRTUAL SCALPER] Limit-entry mode (TP=$0.25 net, SL=0.2% strict, limit-buy below market, BE-stop, flat-cut).")
 
     def _load_trading_config(self):
         """Read live TradingConfig from Redis at position-open time.
-        Returns (buy_amount_usdt, profit_target_usdt). Falls back to defaults on any failure."""
+        Returns (buy_amount_usdt, profit_target_usdt, limit_offset_pct).
+        Falls back to defaults on any failure."""
         try:
             raw = self.r.get(TRADING_CONFIG_KEY)
             if raw:
@@ -76,10 +89,11 @@ class VirtualScalpExecutor:
                 return (
                     float(cfg.get("buyAmountUsdt", DEFAULT_BUY_AMOUNT_USDT)),
                     float(cfg.get("profitAmountUsdt", DEFAULT_PROFIT_TARGET_USDT)),
+                    float(cfg.get("limitBuyOffsetPct", DEFAULT_LIMIT_OFFSET_PCT)),
                 )
         except Exception:
             pass
-        return (DEFAULT_BUY_AMOUNT_USDT, DEFAULT_PROFIT_TARGET_USDT)
+        return (DEFAULT_BUY_AMOUNT_USDT, DEFAULT_PROFIT_TARGET_USDT, DEFAULT_LIMIT_OFFSET_PCT)
 
     def _btc_regime_blocking(self):
         """Returns True if the BTC regime filter says new buys should be skipped.
@@ -104,14 +118,19 @@ class VirtualScalpExecutor:
             try:
                 now = time.time()
                 all_analysis = self.r.hgetall(ANALYSIS_020_KEY)
+                btc_blocked = self._btc_regime_blocking()
 
                 if now - last_heartbeat > 30:
                     active_pos_count = self.r.hlen(VIRTUAL_POSITIONS_KEY)
-                    btc_blocked = self._btc_regime_blocking()
                     print(f"💓 [HEARTBEAT] Monitoring {len(all_analysis)} coins | Active Virtual Positions: {active_pos_count} | BTC blocking buys: {btc_blocked}")
                     last_heartbeat = now
 
-                btc_blocked = self._btc_regime_blocking()
+                # Sweep pending limit orders FIRST so a fill from this
+                # round shows up before the per-symbol monitor tick.
+                # Decoupled from the analysis loop so a coin that drops
+                # out of PROFIT_REACHED_020 still has its pending order
+                # cleaned up.
+                self._sweep_pending_orders(btc_blocked)
 
                 for symbol, data_json in all_analysis.items():
                     try:
@@ -127,8 +146,11 @@ class VirtualScalpExecutor:
                     curr_vol = last.get('volume', 0)
 
                     if signal == 'SCALP_BUY_SIGNAL' and not btc_blocked:
+                        # Skip if there's already any state (PENDING_LIMIT
+                        # or OPEN) for this symbol. Prevents duplicate orders
+                        # if the signal stays hot for several ticks.
                         if not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
-                            self.open_virtual_position(symbol, curr_price, last)
+                            self.place_limit_order(symbol, curr_price, last)
 
                     self.monitor_positions(symbol, curr_price, signal, curr_vol)
 
@@ -137,18 +159,11 @@ class VirtualScalpExecutor:
                 print(f"❌ [VIRTUAL SCALPER ERROR] {e}")
                 time.sleep(5)
 
-    def open_virtual_position(self, symbol, price, snapshot):
-        """Open a paper position. `snapshot` is the latest timeline entry from the
-        analyzer — we copy a few fields into entry_context so post-hoc analysis
-        can correlate winners/losers with entry conditions."""
-        investment, profit_target_usdt = self._load_trading_config()
-        base_price = self._fetch_base_price(symbol)
-
-        # Snapshot the entry conditions the analyzer saw. This is what
-        # backtests/learning loops will key off when we tune the entry
-        # signal — without it we're flying blind. Keep small and JSON-safe.
+    def _build_entry_context(self, snapshot):
+        """Pull the analyzer's diagnostic fields into a flat dict that gets
+        persisted on every position. Same shape regardless of fill path."""
         seq = snapshot.get('sequence_report', {}) or {}
-        entry_context = {
+        return {
             "daily_position": snapshot.get('daily_position'),
             "is_overheated": snapshot.get('is_overheated'),
             "vol_change_pct": seq.get('vol_change'),
@@ -156,10 +171,7 @@ class VirtualScalpExecutor:
             "price_trend_up": snapshot.get('price_trend_up'),
             "btc_pct_5m": snapshot.get('btc_pct_5m'),
             "confidence": snapshot.get('prediction_confidence'),
-            # Falling-knife filter telemetry — these are the values the
-            # analyzer's A1/A2/A4/A5 gates evaluated. If a future loss
-            # has e.g. above_low_pct just above the 2% threshold, that
-            # tells us the keystone filter needs tightening.
+            # Falling-knife filter telemetry — A1/A2/A4/A5 gate inputs.
             "daily_change_pct": snapshot.get('daily_change_pct'),
             "from_high_pct":    snapshot.get('from_high_pct'),
             "above_low_pct":    snapshot.get('above_low_pct'),
@@ -167,24 +179,123 @@ class VirtualScalpExecutor:
             "sustained_up":     snapshot.get('sustained_up'),
         }
 
+    def place_limit_order(self, symbol, signal_price, snapshot):
+        """Replace the old market-buy with a paper limit order at offset%
+        below signal price. Order sits in VIRTUAL_POSITIONS_KEY with
+        status=PENDING_LIMIT until _sweep_pending_orders fills or
+        cancels it."""
+        investment, profit_target_usdt, limit_offset_pct = self._load_trading_config()
+        base_price = self._fetch_base_price(symbol)
+        limit_price = signal_price * (1 - limit_offset_pct / 100.0)
+        now_ts = time.time()
+
         pos = {
             "id": str(uuid.uuid4())[:8],
             "symbol": symbol,
-            "entry_price": price,
+            "status": "PENDING_LIMIT",
+            "signal_price": signal_price,
+            "signal_timestamp": now_ts,
+            "signal_time": datetime.now().strftime('%H:%M:%S'),
+            "limit_price": limit_price,
+            "limit_offset_pct": limit_offset_pct,
             "base_price": base_price,
-            "entry_timestamp": time.time(),
-            "entry_time": datetime.now().strftime('%H:%M:%S'),
-            "max_drawdown": 0,
-            "max_favorable_usdt": 0.0,   # net-pnl watermark for breakeven-stop logic
-            "breakeven_armed": False,
-            "status": "OPEN",
             "investment": investment,
             "profit_target_usdt": profit_target_usdt,
-            "quantity": investment / price,
-            "entry_context": entry_context,
+            # entry_* fields are filled in by _fill_pending_limit when the
+            # order actually fills. Defaults so partial reads don't crash.
+            "entry_price": None,
+            "entry_timestamp": None,
+            "entry_time": None,
+            "quantity": None,
+            "max_drawdown": 0,
+            "max_favorable_usdt": 0.0,
+            "breakeven_armed": False,
+            "entry_context": self._build_entry_context(snapshot),
         }
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
-        print(f"💰 [VIRTUAL BUY] {symbol} at {price} | base={base_price} | inv=${investment:.2f} | TP_net=${profit_target_usdt:.2f} | ctx={entry_context}")
+        print(f"📍 [LIMIT PLACED] {symbol} signal={signal_price} limit={limit_price:.6f} (-{limit_offset_pct}%) inv=${investment:.0f} TP_net=${profit_target_usdt:.2f}")
+
+    def _sweep_pending_orders(self, btc_blocked):
+        """Walk every PENDING_LIMIT order. Fill if price has reached the
+        limit, cancel if expired or if the BTC regime has flipped to
+        blocking since the order was placed."""
+        all_pos = self.r.hgetall(VIRTUAL_POSITIONS_KEY)
+        now_ts = time.time()
+        for symbol, raw in all_pos.items():
+            try:
+                pos = json.loads(raw)
+            except Exception:
+                continue
+            if pos.get('status') != 'PENDING_LIMIT':
+                continue
+
+            elapsed = now_ts - pos.get('signal_timestamp', now_ts)
+
+            if elapsed > LIMIT_ORDER_TIMEOUT_SECONDS:
+                self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+                print(f"⏰ [LIMIT EXPIRED] {symbol} — no fill in {int(elapsed)}s, cancelling")
+                continue
+            if btc_blocked:
+                # Original entry thesis assumed BTC was OK. If BTC has
+                # since started dumping, the bullish setup that produced
+                # the signal is no longer valid — drop the order rather
+                # than fill into a coordinated dump.
+                self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+                print(f"🛑 [LIMIT CANCELLED] {symbol} — BTC regime turned blocking after {int(elapsed)}s")
+                continue
+
+            # Get current price for fill check. Use the tickers cache when
+            # available; fall back to the most recent analysis snapshot
+            # otherwise so the executor still works without WS.
+            curr_price = self._current_price(symbol)
+            if curr_price is None:
+                continue
+
+            if curr_price <= pos['limit_price']:
+                self._fill_pending_limit(symbol, pos, curr_price, elapsed)
+
+    def _current_price(self, symbol):
+        """Best-effort current price. Used by the pending-order sweep so we
+        don't have to wait for the analysis loop to tick."""
+        # ANALYSIS_020_TIMELINE is updated every ~5s by the analyzer and
+        # is the same source of truth the rest of this executor uses, so
+        # reading the latest snapshot keeps fill-check and exit-check in
+        # sync without bringing the WS cache into this process.
+        try:
+            raw = self.r.hget(ANALYSIS_020_KEY, symbol)
+            if not raw:
+                return None
+            tl = json.loads(raw)
+            if not tl:
+                return None
+            return tl[-1].get('price')
+        except Exception:
+            return None
+
+    def _fill_pending_limit(self, symbol, pos, observed_price, elapsed):
+        """Convert a PENDING_LIMIT into an OPEN position. Fill at the
+        original limit price (conservative — real exchange fills the
+        resting order at L when the market touches L)."""
+        fill_price = pos['limit_price']
+        now_ts = time.time()
+
+        pos['status'] = 'OPEN'
+        pos['entry_price'] = fill_price
+        pos['entry_timestamp'] = now_ts
+        pos['entry_time'] = datetime.now().strftime('%H:%M:%S')
+        pos['quantity'] = pos['investment'] / fill_price
+        # Reset watermarks now that the position is live. Drawdown/MFE
+        # tracking starts at fill, not at order placement.
+        pos['max_drawdown'] = 0
+        pos['max_favorable_usdt'] = 0.0
+        pos['breakeven_armed'] = False
+
+        self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
+        # Record how good the fill was vs the signal price — this is the
+        # key metric for tuning limit_offset_pct over time.
+        signal_price = pos.get('signal_price', fill_price)
+        improvement = (signal_price - fill_price) / signal_price * 100 if signal_price else 0
+        print(f"✅ [LIMIT FILLED] {symbol} fill={fill_price:.6f} (-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s | observed={observed_price:.6f}")
 
     def _fetch_base_price(self, symbol):
         """Return the symbol's stored base price, or None if not available."""
@@ -208,6 +319,12 @@ class VirtualScalpExecutor:
         except Exception:
             # Corrupt entry — drop it so it can't poison this loop forever.
             self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+            return
+
+        # PENDING_LIMIT positions are handled by _sweep_pending_orders;
+        # all the OPEN-position machinery below assumes a real entry_price
+        # and would crash on the None placeholders left during pending.
+        if pos.get('status') == 'PENDING_LIMIT':
             return
 
         entry_price = pos['entry_price']
