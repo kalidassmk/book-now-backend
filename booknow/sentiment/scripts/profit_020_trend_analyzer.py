@@ -67,8 +67,19 @@ BTC_HISTORY_SECONDS = 360   # keep ~6 min so the 5-min lookup always has tail
 #      the daily low is the classic falling-knife setup.
 FALLING_KNIFE_DAILY_CHANGE_PCT_MIN  = -3.0   # A1
 FALLING_KNIFE_FROM_HIGH_PCT_MAX     =  8.0   # A2
-FALLING_KNIFE_VOL_CHANGE_PCT_MIN    =   15.0 # A3 lower bound (real burst)
-FALLING_KNIFE_VOL_CHANGE_PCT_MAX    =  500.0 # A3 upper bound (artifact cap)
+# A3 — vol_change calibration. The original 15.0/500.0 thresholds were
+# tuned against early data that was contaminated by cold-start
+# cumulative-volume artifacts (v0 captured at startup → false 144,167%
+# style readings). With the artifact-cap working, the real distribution
+# of bullish vol_change samples across ~200 coins / 10 min looks like:
+#
+#   median 0.058%   p90 0.70%   p95 1.21%   p99 21,494% (artifacts)
+#
+# So 15% was unreachable in normal markets and 500% was so high it
+# barely caught anything. New calibration: a real burst is ~1% in 15s
+# (top decile), and anything > 50% is almost certainly an artifact.
+FALLING_KNIFE_VOL_CHANGE_PCT_MIN    =   1.0  # A3 lower bound (real burst)
+FALLING_KNIFE_VOL_CHANGE_PCT_MAX    =  50.0  # A3 upper bound (artifact cap)
 FALLING_KNIFE_TREND_LOOKBACK        = 6      # A4 ~30s at 5s ticks
 FALLING_KNIFE_TREND_MIN_DRIFT_PCT   = 0.05   # A4 net up-drift required
 FALLING_KNIFE_ABOVE_LOW_PCT_MIN     = 2.0    # A5 must sit at least this far above 24h low
@@ -355,10 +366,15 @@ class Profit020TrendAnalyzer:
                                     micro_signal, confidence = "WEAK_TREND_NO_BUY", 10
                                 else:
                                     # All gates clear — this is a real signal.
+                                    # EARLY_ACCUMULATION uses a sub-threshold of
+                                    # the burst floor (recalibrated 5.0 → 0.3
+                                    # alongside the SCALP threshold drop, since
+                                    # the old 5.0 was already in the p98 of the
+                                    # real distribution).
                                     if (vol_change > FALLING_KNIFE_VOL_CHANGE_PCT_MIN
                                             and 0 < price_impact < 1.0):
                                         micro_signal, confidence = "SCALP_BUY_SIGNAL", 85
-                                    elif vol_change > 5:
+                                    elif vol_change > 0.3:
                                         micro_signal, confidence = "EARLY_ACCUMULATION", 60
 
                             elif v3 < v2 < v1 < v0:
