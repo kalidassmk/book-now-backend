@@ -153,6 +153,15 @@ class VirtualScalpExecutor:
             "price_trend_up": snapshot.get('price_trend_up'),
             "btc_pct_5m": snapshot.get('btc_pct_5m'),
             "confidence": snapshot.get('prediction_confidence'),
+            # Falling-knife filter telemetry — these are the values the
+            # analyzer's A1/A2/A4/A5 gates evaluated. If a future loss
+            # has e.g. above_low_pct just above the 2% threshold, that
+            # tells us the keystone filter needs tightening.
+            "daily_change_pct": snapshot.get('daily_change_pct'),
+            "from_high_pct":    snapshot.get('from_high_pct'),
+            "above_low_pct":    snapshot.get('above_low_pct'),
+            "sustained_drift_pct": snapshot.get('sustained_drift_pct'),
+            "sustained_up":     snapshot.get('sustained_up'),
         }
 
         pos = {
