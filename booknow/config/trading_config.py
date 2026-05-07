@@ -32,7 +32,7 @@ class TradingConfig:
     """Mirrors the Java ``TradingConfig.java``.
 
     Defaults are tuned for the user's stated style: $100 buy with a
-    fixed $0.20 USDT take-profit, fast-scalp mode on, max-hold 5 min.
+    fixed $0.20 USDT take-profit, fast-scalp mode on, max-hold 1 h.
     """
 
     # ── Core safety ──────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ class TradingConfig:
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
     fastScalpMode: bool = True
-    maxHoldSeconds: int = 300
+    maxHoldSeconds: int = 3600
     marketExitOnTimeout: bool = True
 
     @classmethod

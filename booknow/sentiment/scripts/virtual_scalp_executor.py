@@ -22,7 +22,7 @@ DEFAULT_PROFIT_TARGET_USDT = 0.20
 
 # Risk Settings for Virtual Scalper
 STOP_LOSS = 0.003   # 0.3%
-MIN_HOLD_SECONDS = 300 # 5 Minutes "Patience" Rule
+MIN_HOLD_SECONDS = 3600 # 1 Hour "Patience" Rule
 MAX_VIRTUAL_LOSS_USDT = 1.0 # Allow up to $1 loss during patience period
 
 class VirtualScalpExecutor:
