@@ -33,8 +33,17 @@ LOCAL_REDIS = {
 # Source & Destination Keys
 PROFIT_HIT_KEY = "PROFIT_REACHED_020"
 TREND_ANALYSIS_KEY = "ANALYSIS_020_TIMELINE"
+BTC_REGIME_KEY = "BTC_REGIME"   # consumed by virtual_scalp_executor
 MAX_HISTORY_POINTS = 100  # Keep last 100 snapshots per coin
 MAX_TRACKING_HOURS = 4    # Stop tracking coins after 4 hours of inactivity
+
+# BTC regime filter — when BTC drops more than this over the rolling
+# 5-minute window, we treat the broader market as bearish and stop
+# emitting SCALP_BUY_SIGNAL for everything else. Empirical: in the
+# 2026-05-07 paper run, 13 of 16 losses fell inside an 18-minute window
+# of correlated dump — exactly what this filter is meant to dodge.
+BTC_DUMP_PCT_5M = -0.30
+BTC_HISTORY_SECONDS = 360   # keep ~6 min so the 5-min lookup always has tail
 
 class Profit020TrendAnalyzer:
     def __init__(self):
@@ -53,6 +62,9 @@ class Profit020TrendAnalyzer:
             log.warning("⚠️ tickers_ws_cache not available — falling back to REST polling.")
         # Klines: multi-exchange router instead of direct ccxt.binance to spread rate-limit load.
         self.klines = _get_klines_router()
+        # Rolling BTCUSDT samples for the 5-minute regime filter — list of
+        # (ts, price). Trimmed every loop in update_btc_regime.
+        self.btc_history = []
 
     def fetch_historical_context(self, ccxt_symbol):
         """Fetches last 10 minutes of 1m candles as initial context."""
@@ -85,13 +97,62 @@ class Profit020TrendAnalyzer:
             return False
         volumes = [h['volume'] for h in history[-5:]]
         avg_prev = sum(volumes[:-1]) / (len(volumes) - 1)
-        return volumes[-1] > avg_prev * 1.02 
+        return volumes[-1] > avg_prev * 1.02
+
+    def update_btc_regime(self):
+        """Maintain rolling BTCUSDT samples and write the regime to Redis.
+
+        Returns the current 5m % change (or None if not enough history yet).
+        Both the analyzer (entry signal) and the executor (defensive secondary
+        check) read this — keep the single producer here so the two stay
+        in sync.
+        """
+        if not self.tickers_cache:
+            return None
+        t = self.tickers_cache.get_ticker('BTCUSDT')
+        if not t or t.get('last') is None:
+            return None
+        now = time.time()
+        price = float(t['last'])
+
+        # Trim, then append. Trimming first means we never compare against
+        # a sample we've already discarded.
+        self.btc_history = [(ts, p) for ts, p in self.btc_history if now - ts <= BTC_HISTORY_SECONDS]
+        self.btc_history.append((now, price))
+
+        # Need at least one sample that is ~5 min old for a meaningful read.
+        old_samples = [(ts, p) for ts, p in self.btc_history if now - ts >= 290]
+        if not old_samples:
+            return None
+        # Use the oldest sample inside the window as the reference price.
+        ref_price = old_samples[0][1]
+        pct_5m = (price - ref_price) / ref_price * 100 if ref_price else 0.0
+        blocking = pct_5m <= BTC_DUMP_PCT_5M
+
+        try:
+            self.r.set(BTC_REGIME_KEY, json.dumps({
+                "pct_5m": round(pct_5m, 4),
+                "ref_price": ref_price,
+                "last_price": price,
+                "ts": now,
+                "blocking": blocking,
+                "threshold": BTC_DUMP_PCT_5M,
+            }))
+        except Exception as e:
+            log.error(f"Failed to write BTC_REGIME: {e}")
+        return pct_5m
 
     def run(self):
         log.info("🚀 Optimized Profit 0.20 Trend Analyzer Started.")
-        
+
         while True:
             try:
+                # Refresh BTC regime first — every per-symbol path below
+                # consumes the result. Failure to compute (cold start) is
+                # treated as "not blocking" by downstream readers.
+                btc_pct_5m = self.update_btc_regime()
+                btc_blocking = btc_pct_5m is not None and btc_pct_5m <= BTC_DUMP_PCT_5M
+
                 hits = self.r.hgetall(PROFIT_HIT_KEY)
                 if not hits:
                     log.info("⏳ No profit hits found. Monitoring...")
@@ -176,24 +237,57 @@ class Profit020TrendAnalyzer:
                         seq_report = {"type": "neutral", "vol_change": 0, "price_impact": 0}
                         micro_signal, confidence = "NEUTRAL", 0
 
+                        # NOTE on the volume math: curr_vol is Binance's
+                        # 24h rolling quoteVolume from miniTicker, which is
+                        # monotonically non-decreasing for any actively
+                        # traded coin — so v3>v2>v1>v0 is trivially true
+                        # most of the time. The real filter is the magnitude
+                        # check (vol_change > 15) which detects a sudden
+                        # 24h-volume jump (i.e. a recent burst that's
+                        # large relative to the prior 24h trail).
+                        price_trend_up = False
                         if len(timeline) >= 3:
                             v0, v1, v2, v3 = timeline[-3]['volume'], timeline[-2]['volume'], timeline[-1]['volume'], curr_vol
                             p0, p1, p2, p3 = timeline[-3]['price'], timeline[-2]['price'], timeline[-1]['price'], curr_price
-                            
+
+                            # Directional confirmation — the previous "price
+                            # hasn't moved yet" rule (`price_impact < 0.3`)
+                            # caught dumps as readily as pumps. Require
+                            # price actually trending up over the last two
+                            # ticks before we'll buy.
+                            price_trend_up = (p3 > p2) and (p3 >= p1)
+
                             if v3 > v2 > v1 > v0:
-                                seq_report = {"type": "bullish_seq", "vol_change": ((v3-v0)/v0)*100 if v0>0 else 0, "price_impact": ((p3-p0)/p0)*100 if p0>0 else 0}
-                                
-                                # Apply OVERHEATED FILTER to Buy Signals
-                                if not is_overheated:
-                                    if seq_report['vol_change'] > 15 and seq_report['price_impact'] < 0.3:
-                                        micro_signal, confidence = "SCALP_BUY_SIGNAL", 85
-                                    elif seq_report['vol_change'] > 5:
-                                        micro_signal, confidence = "EARLY_ACCUMULATION", 60
-                                else:
+                                seq_report = {
+                                    "type": "bullish_seq",
+                                    "vol_change": ((v3-v0)/v0)*100 if v0 > 0 else 0,
+                                    "price_impact": ((p3-p0)/p0)*100 if p0 > 0 else 0,
+                                }
+
+                                if is_overheated:
                                     micro_signal, confidence = "OVERHEATED_NO_BUY", 10
-                                    
+                                elif btc_blocking:
+                                    # Broad-market dump in progress — refuse
+                                    # to take new longs. Existing positions
+                                    # still exit via their own rules.
+                                    micro_signal, confidence = "BTC_REGIME_NO_BUY", 5
+                                else:
+                                    # SCALP_BUY: volume burst + trend-up + bounded
+                                    # extension. Cap at +1% in 15s so we don't
+                                    # chase a candle that's already broken out.
+                                    if (seq_report['vol_change'] > 15
+                                            and price_trend_up
+                                            and 0 < seq_report['price_impact'] < 1.0):
+                                        micro_signal, confidence = "SCALP_BUY_SIGNAL", 85
+                                    elif seq_report['vol_change'] > 5 and price_trend_up:
+                                        micro_signal, confidence = "EARLY_ACCUMULATION", 60
+
                             elif v3 < v2 < v1 < v0:
-                                seq_report = {"type": "bearish_seq", "vol_change": ((v3-v0)/v0)*100 if v0>0 else 0, "price_impact": ((p3-p0)/p0)*100 if p0>0 else 0}
+                                seq_report = {
+                                    "type": "bearish_seq",
+                                    "vol_change": ((v3-v0)/v0)*100 if v0 > 0 else 0,
+                                    "price_impact": ((p3-p0)/p0)*100 if p0 > 0 else 0,
+                                }
                                 if seq_report['vol_change'] < -10:
                                     micro_signal, confidence = "EXHAUSTION_EXIT", 90
 
@@ -209,8 +303,13 @@ class Profit020TrendAnalyzer:
                             "micro_signal": micro_signal,
                             "prediction_confidence": confidence,
                             "is_candle": False,
-                            "daily_position": round(price_pos * 100, 2), # % of 24h range
-                            "is_overheated": is_overheated
+                            "daily_position": round(price_pos * 100, 2),  # % of 24h range
+                            "is_overheated": is_overheated,
+                            # New context fields used by the executor to log
+                            # entry conditions on each opened position.
+                            "price_trend_up": price_trend_up,
+                            "btc_pct_5m": round(btc_pct_5m, 4) if btc_pct_5m is not None else None,
+                            "btc_blocking": btc_blocking,
                         }
                         
                         timeline.append(snapshot)
