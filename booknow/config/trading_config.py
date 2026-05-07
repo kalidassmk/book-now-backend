@@ -50,7 +50,7 @@ class TradingConfig:
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
     fastScalpMode: bool = True
-    maxHoldSeconds: int = 300
+    maxHoldSeconds: int = 7200
     marketExitOnTimeout: bool = True
 
     @classmethod

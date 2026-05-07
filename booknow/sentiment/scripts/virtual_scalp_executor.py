@@ -44,7 +44,10 @@ MAX_VIRTUAL_LOSS_USDT = 1.0        # absolute hard cap (catastrophic)
 FEE_RATE = 0.001                   # 0.1% per side (Binance spot taker)
 BREAKEVEN_ARM_USDT = 0.10          # net profit watermark that arms BE stop
 BREAKEVEN_TRIGGER_USDT = 0.0       # exit if net pnl falls back to 0 after armed
-FLAT_EXIT_AFTER_SECONDS = 300      # 5 min
+FLAT_EXIT_AFTER_SECONDS = 7200     # 2 h — was 5 min; bumped after the
+                                   # TP target moved 0.20 → 0.50, since
+                                   # a 0.7% move can take much longer
+                                   # than 5 min to play out.
 FLAT_EXIT_BAND_USDT = 0.05         # |net pnl| <= $0.05 counts as "flat"
 
 
