@@ -84,7 +84,7 @@ class PositionMonitor(AsyncProcessor):
         trade_state: TradeState,
         tsl: TrailingStopLoss,
         executor: ExitExecutor,
-        max_hold_seconds: int = 7200,  # 2 h default; live config wins via cfg.maxHoldSeconds
+        max_hold_seconds: int = 300,  # 5 min default; matches Java fast-scalp config
     ):
         super().__init__()
         self._redis = redis_client
