@@ -41,11 +41,13 @@ class TradingConfig:
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
-    profitPct: float = 0.0
-    profitAmountUsdt: float = 0.20
+    # New default is percentage-based (profitPct=0.50, profitAmountUsdt=0.0)
+    # to match the user's scalping formula: buy at -0.50%, sell at +0.50%.
+    profitPct: float = 0.50
+    profitAmountUsdt: float = 0.0
 
     # ── Order placement ──────────────────────────────────────────────────
-    limitBuyOffsetPct: float = 0.3   # buy this % below market
+    limitBuyOffsetPct: float = 0.50  # buy this % below market
     tslPct: float = 2.0              # trailing stop-loss
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
