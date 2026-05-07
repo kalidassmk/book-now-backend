@@ -17,7 +17,7 @@ BTC_REGIME_KEY = 'BTC_REGIME'
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
 DEFAULT_BUY_AMOUNT_USDT = 100.0
-DEFAULT_PROFIT_TARGET_USDT = 0.20
+DEFAULT_PROFIT_TARGET_USDT = 0.50
 
 # Risk / sizing constants. Comments are dollarised against a $100 position
 # so the geometry is obvious — change the constants, not the comments,

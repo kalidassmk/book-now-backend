@@ -32,7 +32,7 @@ class TradingConfig:
     """Mirrors the Java ``TradingConfig.java``.
 
     Defaults are tuned for the user's stated style: $100 buy with a
-    fixed $0.20 USDT take-profit, fast-scalp mode on, max-hold 5 min.
+    fixed $0.50 USDT take-profit, fast-scalp mode on, max-hold 5 min.
     """
 
     # ── Core safety ──────────────────────────────────────────────────────
@@ -42,7 +42,7 @@ class TradingConfig:
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
     profitPct: float = 0.0
-    profitAmountUsdt: float = 0.20
+    profitAmountUsdt: float = 0.50
 
     # ── Order placement ──────────────────────────────────────────────────
     limitBuyOffsetPct: float = 0.3   # buy this % below market
