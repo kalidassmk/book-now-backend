@@ -199,7 +199,7 @@ class MultiSymbolScalper:
                 self.auto_enabled = cfg.get("autoBuyEnabled", False)
                 self.buy_amount_usdt = cfg.get("buyAmountUsdt", 100.0)
                 self.profit_target_usdt = cfg.get("profitAmountUsdt", 0.20)
-                self.stop_loss_usdt = 0.50
+                self.stop_loss_usdt = cfg.get("stopLossUsdt", 0.50)
         except Exception:
             pass
 
