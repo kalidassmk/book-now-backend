@@ -23,9 +23,9 @@ DEFAULT_PROFIT_PCT = 0.50            # % above entry; matches the user's scalpin
 DEFAULT_LIMIT_OFFSET_PCT = 0.50      # % below signal price; from same formula
 
 # Risk Settings for Virtual Scalper
-STOP_LOSS = 0.003   # 0.3%
-MIN_HOLD_SECONDS = 3600 # 1 Hour "Patience" Rule
-MAX_VIRTUAL_LOSS_USDT = 1.0 # Allow up to $1 loss during patience period
+SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience
+MIN_HOLD_SECONDS = 3600    # 1 Hour "Patience" Rule
+MAX_VIRTUAL_LOSS_USDT = 1.0 # Hard stop loss; immediate exit at $1.00 loss
 
 # Limit-buy lifecycle: when SCALP_BUY_SIGNAL fires we don't take the
 # market price. Instead we "place" a paper limit at limitBuyOffsetPct
@@ -252,8 +252,8 @@ class VirtualScalpExecutor:
         elif signal == "EXHAUSTION_EXIT":
             exit_reason = "STRATEGY_EXIT"
 
-        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss < $1)
-        elif pnl_pct <= -STOP_LOSS:
+        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss between $0.50 and $1)
+        elif pnl_usdt <= -SOFT_STOP_LOSS_USDT:
             if elapsed < MIN_HOLD_SECONDS:
                 pass # Patiently holding for recovery...
             else:
