@@ -185,9 +185,9 @@ class Profit020TrendAnalyzer:
                                 
                                 # Apply OVERHEATED FILTER to Buy Signals
                                 if not is_overheated:
-                                    if seq_report['vol_change'] > 15 and seq_report['price_impact'] < 0.3:
+                                    if seq_report['vol_change'] > 8 and seq_report['price_impact'] < 0.5:
                                         micro_signal, confidence = "SCALP_BUY_SIGNAL", 85
-                                    elif seq_report['vol_change'] > 5:
+                                    elif seq_report['vol_change'] > 3:
                                         micro_signal, confidence = "EARLY_ACCUMULATION", 60
                                 else:
                                     micro_signal, confidence = "OVERHEATED_NO_BUY", 10

@@ -88,16 +88,19 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("profit_reached_analyzer.py",),
         kind="persistent",
     ),
-    SubprocessTask(
-        name="Pattern Recorder",
-        cmd_argv=("success_pattern_recorder.py",),
-        kind="persistent",
-    ),
-    SubprocessTask(
-        name="Pattern Matcher",
-        cmd_argv=("pattern_matching_engine.py",),
-        kind="persistent",
-    ),
+    # Pattern Recorder + Pattern Matcher disabled — both depend on Redis
+    # Cloud which is at capacity (writes rejected). Re-enable when the
+    # cloud DB is replaced or upgraded.
+    # SubprocessTask(
+    #     name="Pattern Recorder",
+    #     cmd_argv=("success_pattern_recorder.py",),
+    #     kind="persistent",
+    # ),
+    # SubprocessTask(
+    #     name="Pattern Matcher",
+    #     cmd_argv=("pattern_matching_engine.py",),
+    #     kind="persistent",
+    # ),
     SubprocessTask(
         name="Profit Trend",
         cmd_argv=("profit_020_trend_analyzer.py",),
