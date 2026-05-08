@@ -108,4 +108,9 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("virtual_scalp_executor.py",),
         kind="persistent",
     ),
+    SubprocessTask(
+        name="VP History Recorder",
+        cmd_argv=("vp_history_recorder.py",),
+        kind="persistent",
+    ),
 ]
