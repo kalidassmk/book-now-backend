@@ -111,9 +111,12 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("virtual_scalp_executor.py",),
         kind="persistent",
     ),
-    SubprocessTask(
-        name="VP History Recorder",
-        cmd_argv=("vp_history_recorder.py",),
-        kind="persistent",
-    ),
+    # VP History Recorder disabled — depends on the same Redis Cloud DB
+    # that's already at capacity. Re-enable once an analyse-side Redis
+    # with headroom is online.
+    # SubprocessTask(
+    #     name="VP History Recorder",
+    #     cmd_argv=("vp_history_recorder.py",),
+    #     kind="persistent",
+    # ),
 ]

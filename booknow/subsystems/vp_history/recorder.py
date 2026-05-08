@@ -64,6 +64,9 @@ class VPHistoryRecorder:
         self.r_cloud = get_cloud_redis()
         self.tickers = get_default_cache()
         self._running = True
+        # Rate-limit timestamps for noisy error paths.
+        self._last_pipe_err_at = 0.0
+        self._last_tick_err_at = 0.0
 
     # ── Lifecycle ────────────────────────────────────────────────────────
     def stop(self, *_: object) -> None:
@@ -87,8 +90,11 @@ class VPHistoryRecorder:
             iter_start = time.monotonic()
             try:
                 self._tick()
-            except Exception:
-                logger.exception("vp_history tick failed (continuing)")
+            except Exception as e:
+                now = time.monotonic()
+                if now - self._last_tick_err_at >= 60.0:
+                    logger.warning("vp_history tick failed: %s", str(e)[:200])
+                    self._last_tick_err_at = now
 
             # Steady cadence regardless of tick duration.
             elapsed = time.monotonic() - iter_start
@@ -127,8 +133,13 @@ class VPHistoryRecorder:
 
         try:
             pipe.execute()
-        except Exception:
-            logger.exception("cloud pipeline execute failed")
+        except Exception as e:
+            # Rate-limited: one short line per 60 s so a full Redis Cloud
+            # (the most common cause) doesn't drown the supervisor logs.
+            now = time.monotonic()
+            if now - self._last_pipe_err_at >= 60.0:
+                logger.warning("cloud pipeline execute failed: %s", str(e)[:200])
+                self._last_pipe_err_at = now
 
     # ── Per-symbol logic ─────────────────────────────────────────────────
     def _handle_symbol(
