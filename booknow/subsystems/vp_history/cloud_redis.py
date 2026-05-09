@@ -1,10 +1,11 @@
-"""Redis Cloud connection helper.
+"""AnalyseDB Redis connection helper.
 
-Mirrors the credential pattern already in
-``booknow/sentiment/scripts/init_analyse_db.py`` — same host the user
-designated for AnalyseDB. Falls back to the hardcoded values when env
-overrides are absent so this module works whether or not the operator
-has rolled the password into ``.env``.
+Same target as the analyse-side scripts (pattern_matching_engine,
+success_pattern_recorder, init_analyse_db). Defaults to the on-EC2
+``redis-analyse`` container created in compose; env vars override.
+
+Module name kept as ``cloud_redis`` for backwards compatibility, but
+the data lives on a colocated EC2 container now, not Redis Cloud.
 """
 
 from __future__ import annotations
@@ -14,18 +15,12 @@ import os
 import redis
 
 
-# Defaults match init_analyse_db.py exactly so a fresh checkout works
-# without extra env wiring; production should override via .env.
-_DEFAULT_HOST = "redis-18144.c89.us-east-1-3.ec2.cloud.redislabs.com"
-_DEFAULT_PORT = 18144
-_DEFAULT_PASS = "Gn9jKtL0SBkMLYynSjXbblmkjkIGrdPS"
-
-
 def get_cloud_redis() -> redis.Redis:
+    """Return a client for the analyse-side Redis (env-driven, on-EC2 default)."""
     return redis.Redis(
-        host=os.getenv("REDIS_CLOUD_HOST", _DEFAULT_HOST),
-        port=int(os.getenv("REDIS_CLOUD_PORT", _DEFAULT_PORT)),
-        password=os.getenv("REDIS_CLOUD_PASS", _DEFAULT_PASS),
+        host=os.getenv("REDIS_ANALYSE_HOST", os.getenv("REDIS_CLOUD_HOST", "redis-analyse")),
+        port=int(os.getenv("REDIS_ANALYSE_PORT", os.getenv("REDIS_CLOUD_PORT", "6379"))),
+        password=os.getenv("REDIS_ANALYSE_PASS") or os.getenv("REDIS_CLOUD_PASS") or None,
         decode_responses=True,
         socket_keepalive=True,
         socket_connect_timeout=5,
