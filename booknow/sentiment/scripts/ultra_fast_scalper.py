@@ -388,20 +388,22 @@ class MultiSymbolScalper:
             log.info(f"🛒 [SCALPER] Buying {symbol} @ {price}")
             order = await self.client.create_market_buy_order(symbol, qty)
 
-            # Trust the exchange's response, not our local math:
-            #   - 'filled' is the actual base-asset received (already net
-            #     of any fees taken in the base asset on Binance Spot)
-            #   - 'average' is the volume-weighted fill price across any
-            #     partial fills
-            # This eliminates the long-running bug where we recorded the
-            # *requested* qty and then later sells were rejected with
-            # "insufficient balance" because Binance had taken its 0.1 %
-            # fee out of the base-asset side and we owned slightly less
-            # than we thought.
+            # Read the exchange's response for the real fill numbers.
+            #   'filled'   = total base asset filled, GROSS (before fees)
+            #   'fills[]'  = per-trade fee breakdown — we subtract any
+            #                fee taken in the base asset itself, since
+            #                that's what Binance keeps and it's what
+            #                makes the eventual sell qty match the wallet
+            #
+            # Earlier we trusted `filled` as net-of-fees, which is wrong:
+            # Binance Spot deducts its 0.1 % fee from the base asset
+            # received, so on a 68.35 TIA fill the wallet ends up holding
+            # 68.28 TIA. Selling 68.35 then 422s with "insufficient
+            # balance". This was the OCO-rejection root cause.
             exec_price = float(order.get('average') or order.get('price') or price)
-            filled_qty = float(order.get('filled') or 0.0)
+            filled_qty_gross = float(order.get('filled') or 0.0)
 
-            if filled_qty <= 0:
+            if filled_qty_gross <= 0:
                 # Order accepted but didn't actually fill (rare on market
                 # orders — usually means insufficient balance or the
                 # exchange immediately cancelled). Don't record a phantom
@@ -409,10 +411,30 @@ class MultiSymbolScalper:
                 log.warning(f"⚠️ Buy {symbol} returned filled=0; ignoring")
                 return
 
-            # Round down by step_size so the eventual sell is guaranteed
-            # to be ≤ what we own (Binance's stricter rounding can shave
-            # a satoshi off the fill, and we never want to oversell).
-            sellable_qty = self.round_step(filled_qty, f['step_size'])
+            # Subtract base-asset fees. CCXT normalises Binance's `fills`
+            # array; commissionAsset is in upper case for the symbol the
+            # fee is taken from. For BTC/USDT the base is BTC.
+            base_asset = symbol.split('/')[0] if '/' in symbol else symbol[:-4]
+            base_asset = base_asset.upper()
+            fee_in_base = 0.0
+            for fill in (order.get('fills') or []):
+                fee = fill.get('fee') or {}
+                fee_ccy = (fee.get('currency') or fill.get('commissionAsset') or '').upper()
+                fee_amt = float(fee.get('cost') or fill.get('commission') or 0.0)
+                if fee_ccy == base_asset and fee_amt > 0:
+                    fee_in_base += fee_amt
+
+            filled_qty_net = filled_qty_gross - fee_in_base
+
+            # Defence in depth: even after subtracting reported fees,
+            # round down by step_size so we never oversell. If `fills`
+            # was empty (some endpoints omit it) we still get a 0.1 %
+            # safety buffer from the explicit floor below.
+            sellable_qty = self.round_step(filled_qty_net, f['step_size'])
+            if fee_in_base == 0 and sellable_qty == filled_qty_gross:
+                # No fees reported — apply a 0.1 % safety buffer so the
+                # OCO/sell quantity stays inside what we actually own.
+                sellable_qty = self.round_step(filled_qty_gross * 0.999, f['step_size'])
 
             # Place an OCO sell on the exchange so TP/SL fire the moment
             # price touches them — no polling delay, works even if the
