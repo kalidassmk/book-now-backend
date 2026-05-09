@@ -323,27 +323,42 @@ class MultiSymbolScalper:
         """Analyze and trade a single symbol."""
         # 1. Manage existing position
         if symbol in self.active_positions:
+            pos = self.active_positions[symbol]
+
+            # 1a. If we have an OCO order on Binance, check whether it
+            # filled (TP or SL). The exchange handles the cancel-the-other
+            # leg automatically, so once ALL_DONE we just clear our local
+            # tracking. Done first so the polling fallback below doesn't
+            # double-sell something the exchange already closed.
+            if pos.get('oco_list_id'):
+                resolved = await self._check_oco_status(symbol, pos)
+                if resolved:
+                    return
+
             df = await self.get_indicators(symbol)
             if df is None: return
-            
+
             curr = df.iloc[-1]
-            pos = self.active_positions[symbol]
             pnl = (curr['close'] - pos['buy_price']) * pos['qty']
-            
-            # Exit Conditions
-            should_exit = False
-            if pnl >= self.profit_target_usdt: 
-                log.info(f"💰 [{symbol}] Profit Target Hit: +${pnl:.2f}")
-                should_exit = True
-            elif pnl <= -self.stop_loss_usdt:
-                log.info(f"🛡️ [{symbol}] Stop Loss Hit: -${pnl:.2f}")
-                should_exit = True
-            elif curr['ema9'] < curr['ema21']:
+
+            # 1b. Trend reversal exit always wins — even when OCO is
+            # active. We cancel the resting orders so a later TP/SL fill
+            # doesn't double-sell, then market-sell.
+            if curr['ema9'] < curr['ema21']:
                 log.info(f"🔄 [{symbol}] Trend Reversal")
-                should_exit = True
-                
-            if should_exit:
                 await self.execute_sell(symbol, curr['close'])
+                return
+
+            # 1c. Polling-based TP/SL — backup safety net for positions
+            # whose OCO placement failed (oco_list_id is None). When OCO
+            # is active we let Binance handle it for tighter timing.
+            if not pos.get('oco_list_id'):
+                if pnl >= self.profit_target_usdt:
+                    log.info(f"💰 [{symbol}] Profit Target Hit (poll): +${pnl:.2f}")
+                    await self.execute_sell(symbol, curr['close'])
+                elif pnl <= -self.stop_loss_usdt:
+                    log.info(f"🛡️ [{symbol}] Stop Loss Hit (poll): -${pnl:.2f}")
+                    await self.execute_sell(symbol, curr['close'])
             return
 
         # 2. Look for new entry
@@ -399,13 +414,127 @@ class MultiSymbolScalper:
             # a satoshi off the fill, and we never want to oversell).
             sellable_qty = self.round_step(filled_qty, f['step_size'])
 
+            # Place an OCO sell on the exchange so TP/SL fire the moment
+            # price touches them — no polling delay, works even if the
+            # bot is offline. If OCO placement fails the position falls
+            # back to the polling-based exits in process_symbol.
+            oco_list_id = await self._place_oco_sell(
+                symbol, sellable_qty, exec_price, f
+            )
+
             self.active_positions[symbol] = {
-                'buy_price': exec_price,
-                'qty':       sellable_qty,
+                'buy_price':    exec_price,
+                'qty':          sellable_qty,
+                'oco_list_id':  oco_list_id,    # str or None
+                'opened_ts':    time.time(),
             }
-            log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price}")
+            mode_tag = f"oco={oco_list_id}" if oco_list_id else "oco=FAILED→polling"
+            log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price} {mode_tag}")
         except Exception as e:
             log.error(f"❌ Buy {symbol} failed: {e}")
+
+    async def _place_oco_sell(self, symbol: str, qty: float, entry_price: float, filters: dict):
+        """Place a one-cancels-other sell on Binance (LIMIT TP + STOP_LOSS_LIMIT SL).
+
+        Returns the orderListId on success, None on failure (caller
+        falls back to the polling-based exit pattern).
+
+        Prices derived from current config:
+            TP = entry × (1 + profit_target_usdt / buy_amount_usdt)
+            SL trigger = entry × (1 - stop_loss_usdt / buy_amount_usdt)
+            SL limit   = trigger × 0.998   (small buffer below trigger so
+                                            the stop-limit can fill in
+                                            fast-moving markets)
+        """
+        if self.buy_amount_usdt <= 0:
+            return None
+        try:
+            tick = filters.get('tick_size', 0.00000001) or 0.00000001
+            tp_pct = self.profit_target_usdt / self.buy_amount_usdt
+            sl_pct = self.stop_loss_usdt / self.buy_amount_usdt
+            tp_price = self.round_step(entry_price * (1 + tp_pct), tick)
+            sl_trigger = self.round_step(entry_price * (1 - sl_pct), tick)
+            sl_limit = self.round_step(sl_trigger * 0.998, tick)
+
+            # Sanity: TP must be strictly above entry, SL strictly below.
+            if not (tp_price > entry_price > sl_trigger > sl_limit > 0):
+                log.warning(
+                    f"⚠️ [OCO] {symbol} bad price triplet: "
+                    f"entry={entry_price} tp={tp_price} sl_trig={sl_trigger} sl_lim={sl_limit} — skipping OCO"
+                )
+                return None
+
+            params = {
+                'symbol':                 symbol.replace('/', ''),  # Binance native (no slash)
+                'side':                   'SELL',
+                'quantity':               str(qty),
+                'price':                  str(tp_price),     # limit sell (TP leg)
+                'stopPrice':              str(sl_trigger),    # SL trigger
+                'stopLimitPrice':         str(sl_limit),      # SL limit price after trigger
+                'stopLimitTimeInForce':   'GTC',
+            }
+            # ccxt exposes Binance's POST /api/v3/order/oco as private_post_order_oco.
+            result = await self.client.private_post_order_oco(params)
+            list_id = result.get('orderListId')
+            if list_id is None:
+                log.warning(f"⚠️ [OCO] {symbol} response missing orderListId: {result}")
+                return None
+            log.info(f"📋 [OCO] {symbol} placed list={list_id} TP={tp_price} SL={sl_trigger}/{sl_limit}")
+            return str(list_id)
+        except Exception as e:
+            log.warning(f"⚠️ [OCO] placement failed for {symbol}: {e}")
+            return None
+
+    async def _check_oco_status(self, symbol: str, pos: dict) -> bool:
+        """Poll OCO list status. Returns True if the position has been
+        closed by the exchange (one leg filled, the other auto-cancelled)."""
+        list_id = pos.get('oco_list_id')
+        if not list_id:
+            return False
+        try:
+            result = await self.client.private_get_orderlist({'orderListId': list_id})
+        except Exception as e:
+            log.debug(f"[OCO] {symbol} status check transient error: {e}")
+            return False
+
+        # Binance OCO list status:
+        #   EXECUTING  – one or both orders still open
+        #   ALL_DONE   – list resolved (filled or cancelled on both legs)
+        #   REJECT     – never placed successfully
+        list_status = (result.get('listOrderStatus') or '').upper()
+        if list_status != 'ALL_DONE':
+            return False
+
+        # Identify which leg actually filled by inspecting the children.
+        leg_summary = []
+        for leg in result.get('orders', []) or []:
+            try:
+                child = await self.client.fetch_order(leg.get('orderId'), self._to_ccxt_symbol(symbol))
+                leg_summary.append(f"{leg.get('orderId')}:{child.get('status')}:{child.get('filled')}")
+            except Exception:
+                continue
+
+        log.info(f"✅ [OCO] {symbol} resolved by exchange — list={list_id} legs=[{', '.join(leg_summary)}]")
+        del self.active_positions[symbol]
+        return True
+
+    async def _cancel_oco(self, symbol: str, list_id: str) -> None:
+        """Best-effort OCO cancel; absorbs failures so the caller can
+        always proceed to a market sell."""
+        if not list_id:
+            return
+        try:
+            await self.client.private_delete_orderlist({
+                'symbol':       symbol.replace('/', ''),
+                'orderListId':  list_id,
+            })
+            log.info(f"🚫 [OCO] cancelled list={list_id} for {symbol}")
+        except Exception as e:
+            log.warning(f"⚠️ [OCO] cancel failed for {symbol} list={list_id}: {e}")
+
+    @staticmethod
+    def _to_ccxt_symbol(symbol: str) -> str:
+        return symbol if '/' in symbol else f"{symbol[:-4]}/USDT"
 
     async def execute_sell(self, symbol, price):
         if symbol not in self.active_positions: return
@@ -413,6 +542,14 @@ class MultiSymbolScalper:
             pos = self.active_positions[symbol]
             qty = pos['qty']
             buy_price = pos.get('buy_price', 0.0) or 0.0
+            list_id = pos.get('oco_list_id')
+
+            # If an OCO is sitting on the exchange we must cancel it
+            # before market-selling — otherwise a TP/SL leg could fill
+            # in parallel and we'd try to oversell what we own.
+            if list_id:
+                await self._cancel_oco(symbol, list_id)
+
             log.info(f"⚡ [SCALPER] Selling {symbol} @ {price}")
             await self.client.create_market_sell_order(symbol, qty)
 
