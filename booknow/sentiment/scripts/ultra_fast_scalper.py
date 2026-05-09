@@ -43,7 +43,11 @@ RSI_PERIOD     = 7
 VOL_PERIOD     = 20
 
 # Redis Keys
-CONFIG_KEY     = "booknow:config"
+# CONFIG_KEY now points at TRADING_CONFIG — the same key the dashboard
+# UI writes to. Previously this was "booknow:config" which lived in
+# isolation, so toggling autoBuyEnabled in the UI never affected the
+# Fast Scalper. Single source of truth now.
+CONFIG_KEY     = "TRADING_CONFIG"
 SYMBOL_LIST_KEY = "SYMBOLS:ACTIVE"
 SIGNAL_PREFIX  = "SCALPER:SIGNAL:"
 POSITIONS_KEY  = "SCALPER:POSITIONS" # Local positions for the scalper
@@ -195,18 +199,41 @@ class MultiSymbolScalper:
             pass
 
     async def sync_config(self):
-        """Fetch global dashboard settings."""
+        """Fetch global dashboard settings from TRADING_CONFIG.
+
+        Field semantics (mirrors what the dashboard writes):
+          autoBuyEnabled    : bool  — gates new buys
+          buyAmountUsdt     : float — investment per trade
+          profitPct         : float — profit target as % of entry; takes
+                                      priority when > 0 (matches the
+                                      dashboard's UX)
+          profitAmountUsdt  : float — flat USDT profit target; used only
+                                      when profitPct == 0
+          stopLossUsdt      : float — flat USDT loss before exit; falls
+                                      back to 1 % of buyAmountUsdt if
+                                      omitted, so older configs without
+                                      this field still get a sane stop
+        """
         if not self.redis: return
         try:
             raw = self.redis.get(CONFIG_KEY)
-            if raw:
-                cfg = json.loads(raw)
-                self.auto_enabled = cfg.get("autoBuyEnabled", True)
-                self.buy_amount_usdt = cfg.get("buyAmountUsdt", 100.0)
-                self.profit_target_usdt = cfg.get("profitAmountUsdt", 0.20)
-                self.stop_loss_usdt = cfg.get("stopLossUsdt", 0.50)
-        except Exception:
-            pass
+            if not raw:
+                return
+            cfg = json.loads(raw)
+            self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 100.0))
+
+            # Profit: prefer percentage if set, fall back to flat USDT.
+            profit_pct = float(cfg.get("profitPct", 0.0) or 0.0)
+            if profit_pct > 0:
+                self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
+            else:
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.20))
+
+            # Stop loss: explicit USDT; if absent, default to 1 % of trade size.
+            self.stop_loss_usdt = float(cfg.get("stopLossUsdt", self.buy_amount_usdt * 0.01))
+        except Exception as e:
+            log.warning("sync_config failed (continuing with last values): %s", e)
 
     async def get_indicators(self, symbol: str):
         """Fetch data and compute indicators for a symbol."""
@@ -345,9 +372,38 @@ class MultiSymbolScalper:
 
             log.info(f"🛒 [SCALPER] Buying {symbol} @ {price}")
             order = await self.client.create_market_buy_order(symbol, qty)
-            
-            exec_price = float(order.get('average', order.get('price', price)))
-            self.active_positions[symbol] = {'buy_price': exec_price, 'qty': qty}
+
+            # Trust the exchange's response, not our local math:
+            #   - 'filled' is the actual base-asset received (already net
+            #     of any fees taken in the base asset on Binance Spot)
+            #   - 'average' is the volume-weighted fill price across any
+            #     partial fills
+            # This eliminates the long-running bug where we recorded the
+            # *requested* qty and then later sells were rejected with
+            # "insufficient balance" because Binance had taken its 0.1 %
+            # fee out of the base-asset side and we owned slightly less
+            # than we thought.
+            exec_price = float(order.get('average') or order.get('price') or price)
+            filled_qty = float(order.get('filled') or 0.0)
+
+            if filled_qty <= 0:
+                # Order accepted but didn't actually fill (rare on market
+                # orders — usually means insufficient balance or the
+                # exchange immediately cancelled). Don't record a phantom
+                # position.
+                log.warning(f"⚠️ Buy {symbol} returned filled=0; ignoring")
+                return
+
+            # Round down by step_size so the eventual sell is guaranteed
+            # to be ≤ what we own (Binance's stricter rounding can shave
+            # a satoshi off the fill, and we never want to oversell).
+            sellable_qty = self.round_step(filled_qty, f['step_size'])
+
+            self.active_positions[symbol] = {
+                'buy_price': exec_price,
+                'qty':       sellable_qty,
+            }
+            log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price}")
         except Exception as e:
             log.error(f"❌ Buy {symbol} failed: {e}")
 
