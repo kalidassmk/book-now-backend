@@ -369,6 +369,13 @@ class VirtualScalpExecutor:
         if status == "closed" and filled > 0:
             # ccxt 'closed' for limit orders means fully filled.
             avg_price = float(order.get("average") or order.get("price") or pos.get("live_limit_price"))
+            # Per-fill audit log — same as Fast Scalper.
+            for i, fl in enumerate(order.get('fills') or order.get('trades') or []):
+                fl_qty = fl.get('qty') or fl.get('amount')
+                fl_pr  = fl.get('price')
+                fl_fee = (fl.get('fee') or {}).get('cost') if isinstance(fl.get('fee'), dict) else fl.get('commission')
+                fl_cur = (fl.get('fee') or {}).get('currency') if isinstance(fl.get('fee'), dict) else fl.get('commissionAsset')
+                print(f"   fill[{i}] qty={fl_qty} @ {fl_pr} fee={fl_fee} {fl_cur}")
             self._fill_pending_limit(symbol, pos, avg_price, elapsed, real_filled_qty=filled)
         elif status in ("canceled", "expired"):
             self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
@@ -680,18 +687,61 @@ class VirtualScalpExecutor:
         print(f"{color} [{tag} SELL] {symbol} | Net PnL: ${net_pnl_usdt:.4f} | Fees: ${total_fees:.4f} | Held: {int(pos['hold_duration'])}s")
 
     def _place_real_market_sell(self, symbol: str, qty: float):
-        """Best-effort market sell. Returns {price, qty} on success,
-        None on failure so the caller can retry."""
+        """Wrapper kept for API compatibility — internally now uses an
+        aggressive-limit-at-bid sell instead of a market sell. Returns
+        {price, qty} on success, None on failure."""
+        return self._place_real_aggressive_limit_sell(symbol, qty, max_wait_sec=5, retries=3)
+
+    def _place_real_aggressive_limit_sell(self, symbol: str, qty: float,
+                                          max_wait_sec: int = 5, retries: int = 3):
+        """Synchronous version of the aggressive-limit-sell pattern
+        (matches Fast Scalper's async helper).
+
+        Places a LIMIT SELL at the current best bid, waits up to
+        max_wait_sec for fill, retries up to `retries` times if
+        the bid moves. Replaces every market-sell path in Virtual
+        Scalper so we never accept unbounded slippage on exit.
+        """
         if self.client is None:
             return None
-        try:
-            ccxt_sym = self._to_ccxt_symbol(symbol)
-            order = self.client.create_market_sell_order(ccxt_sym, qty)
-            avg_price = float(order.get("average") or order.get("price") or 0.0)
-            return {"price": avg_price, "qty": qty}
-        except Exception as e:
-            print(f"❌ [VIRTUAL] create_market_sell_order failed for {symbol}: {e}")
-            return None
+
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        for attempt in range(1, retries + 1):
+            try:
+                book = self.client.fetch_order_book(ccxt_sym, limit=5)
+                bids = book.get('bids') or []
+                if not bids:
+                    print(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt}: empty bid book — retrying")
+                    time.sleep(1)
+                    continue
+                bid_price = float(bids[0][0])
+                print(f"⚡ [VIRTUAL] {symbol} attempt {attempt}/{retries}: LIMIT SELL {qty} @ {bid_price}")
+                order = self.client.create_limit_sell_order(ccxt_sym, qty, bid_price)
+                order_id = order.get('id')
+                if not order_id:
+                    print(f"⚠️ [LIMIT-SELL] {symbol} placement returned no order id")
+                    continue
+
+                deadline = time.time() + max_wait_sec
+                while time.time() < deadline:
+                    time.sleep(1)
+                    o = self.client.fetch_order(order_id, ccxt_sym)
+                    if (o.get('status') or '').lower() == 'closed':
+                        avg = float(o.get('average') or bid_price)
+                        print(f"✅ [LIMIT-SELL] {symbol} filled @ {avg}")
+                        return {'price': avg, 'qty': qty}
+
+                # Not filled — cancel and retry with fresh bid.
+                try:
+                    self.client.cancel_order(order_id, ccxt_sym)
+                except Exception:
+                    pass
+                print(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} timed out — cancelling and retrying")
+            except Exception as e:
+                print(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt} error: {e}")
+                time.sleep(1)
+
+        return None
 
 if __name__ == "__main__":
     executor = VirtualScalpExecutor()

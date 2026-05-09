@@ -464,6 +464,15 @@ class MultiSymbolScalper:
             log.info(f"🛒 [SCALPER] Buying {symbol} @ {price}")
             order = await self.client.create_market_buy_order(symbol, qty)
 
+            # Per-fill audit. Binance market buys often split across
+            # several price levels — log each so the operator can
+            # verify the bot's avg-price math against the actual fills.
+            for i, fl in enumerate(order.get('fills') or []):
+                log.info(
+                    f"   fill[{i}] qty={fl.get('qty')} @ {fl.get('price')} "
+                    f"fee={fl.get('commission')} {fl.get('commissionAsset')}"
+                )
+
             # Read the exchange's response for the real fill numbers.
             #   'filled'   = total base asset filled, GROSS (before fees)
             #   'fills[]'  = per-trade fee breakdown — we subtract any
@@ -645,27 +654,37 @@ class MultiSymbolScalper:
             list_id = pos.get('oco_list_id')
 
             # If an OCO is sitting on the exchange we must cancel it
-            # before market-selling — otherwise a TP/SL leg could fill
-            # in parallel and we'd try to oversell what we own.
+            # before any sell — otherwise a TP/SL leg could fill in
+            # parallel and we'd oversell what we own.
             if list_id:
                 await self._cancel_oco(symbol, list_id)
 
-            log.info(f"⚡ [SCALPER] Selling {symbol} @ {price}")
-            await self.client.create_market_sell_order(symbol, qty)
+            # Replaces the previous market-sell. We never want unbounded
+            # slippage — even on trend-reversal exits. The aggressive
+            # limit places at the current best bid, which crosses the
+            # spread and fills near-instantly at a *known* price. Up to
+            # 3 retries (5 s each) before we give up and surface a
+            # warning so the operator can intervene.
+            sold = await self._place_aggressive_limit_sell(symbol, qty, max_wait_sec=5, retries=3)
+            if sold is None:
+                log.error(f"❌ [SCALPER] {symbol} aggressive-limit sell failed after retries — position retained for retry")
+                return
+
+            exit_price = float(sold.get('average') or sold.get('price') or price)
 
             # Long-term archive on the analyse Redis (best-effort).
             buy_value  = buy_price * qty
-            sell_value = price * qty
+            sell_value = exit_price * qty
             buy_fee    = buy_value * 0.001
             sell_fee   = sell_value * 0.001
             net_pnl    = (sell_value - buy_value) - (buy_fee + sell_fee)
             archive_closed_trade(symbol, "FAST", {
                 "entry_price": buy_price,
-                "exit_price": price,
+                "exit_price": exit_price,
                 "qty": qty,
                 "investment": buy_value,
                 "pnl_usdt": net_pnl,
-                "pnl_pct": ((price - buy_price) / buy_price * 100.0) if buy_price else 0.0,
+                "pnl_pct": ((exit_price - buy_price) / buy_price * 100.0) if buy_price else 0.0,
                 "fees_paid": buy_fee + sell_fee,
                 "reason": "SCALPER_EXIT",
                 "exit_time": datetime.now().strftime("%H:%M:%S"),
@@ -675,6 +694,59 @@ class MultiSymbolScalper:
             del self.active_positions[symbol]
         except Exception as e:
             log.error(f"❌ Sell {symbol} failed: {e}")
+
+    async def _place_aggressive_limit_sell(self, symbol: str, qty: float, max_wait_sec: int = 5, retries: int = 3):
+        """Place a LIMIT SELL at the current best bid and wait up to
+        max_wait_sec for it to fill. If it doesn't, cancel and try
+        again with a freshly-fetched bid. Total attempts = retries.
+
+        Returns the filled order dict on success, None on total failure.
+
+        Why aggressive-limit instead of market:
+          - Market orders take whatever liquidity is available, slipping
+            through multiple price levels in fast-moving markets.
+          - LIMIT-at-current-best-bid is a "marketable limit" — it crosses
+            the spread and matches the bid book immediately, but the
+            worst-case fill is bounded by the limit price itself.
+          - The 5 s wait gives Binance time to match; the retry handles
+            the case where the bid moved between fetch and place.
+        """
+        for attempt in range(1, retries + 1):
+            try:
+                book = await self.client.fetch_order_book(symbol, limit=5)
+                bids = book.get('bids') or []
+                if not bids:
+                    log.warning(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt}: empty bid book — retrying")
+                    await asyncio.sleep(1)
+                    continue
+                bid_price = float(bids[0][0])
+                log.info(f"⚡ [SCALPER] {symbol} attempt {attempt}/{retries}: LIMIT SELL {qty} @ {bid_price}")
+                order = await self.client.create_limit_sell_order(symbol, qty, bid_price)
+                order_id = order.get('id')
+                if not order_id:
+                    log.warning(f"⚠️ [LIMIT-SELL] {symbol} placement returned no order id")
+                    continue
+
+                # Poll for fill
+                deadline = time.time() + max_wait_sec
+                while time.time() < deadline:
+                    await asyncio.sleep(1)
+                    o = await self.client.fetch_order(order_id, symbol)
+                    if (o.get('status') or '').lower() == 'closed':
+                        log.info(f"✅ [LIMIT-SELL] {symbol} filled @ {o.get('average') or bid_price}")
+                        return o
+
+                # Not filled — cancel and try again
+                try:
+                    await self.client.cancel_order(order_id, symbol)
+                except Exception:
+                    pass
+                log.warning(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} timed out — cancelling and retrying")
+            except Exception as e:
+                log.warning(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt} error: {e}")
+                await asyncio.sleep(1)
+
+        return None
 
     def broadcast_signal(self, symbol, status, price, matrix=None):
         if not self.redis: return
