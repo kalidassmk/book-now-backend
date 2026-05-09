@@ -396,13 +396,19 @@ class VirtualScalpExecutor:
         exchanges fill resting orders at L when the market touches L).
 
         Live mode: fill at the actual fill price returned by Binance,
-        with the real filled quantity (may be slightly less than the
-        requested live_qty if Binance applied stricter rounding).
+        with the real filled quantity. Same fee/qty trap as Fast
+        Scalper: Binance's `filled` is GROSS-of-fees. The 0.1 % spot
+        fee is taken from the base asset received, so we apply a
+        0.999 safety floor (and round down by step_size) before any
+        downstream sell uses the qty. Without this the OCO leg would
+        be rejected with "insufficient balance".
         """
         if real_filled_qty is not None:
-            # Live fill — use exchange-reported price/qty for accuracy.
+            # Live fill — apply fee-safety floor + step_size rounding.
             fill_price = observed_price
-            quantity   = real_filled_qty
+            f = self._get_filters(symbol) if self.client is not None else None
+            step = (f or {}).get('step_size', 0.00000001) or 0.00000001
+            quantity = self._round_step(real_filled_qty * 0.999, step)
         else:
             # Paper fill — synthetic at the limit.
             fill_price = pos['limit_price']
@@ -416,13 +422,131 @@ class VirtualScalpExecutor:
         pos['entry_time'] = datetime.now().strftime('%H:%M:%S')
         pos['quantity'] = quantity
         pos['max_drawdown'] = 0  # restart tracking from fill, not from order placement
+        pos['oco_list_id'] = None    # populated below if live + OCO succeeds
+
+        # In live mode, place an OCO sell on Binance so TP/SL fire
+        # inside the matching engine — same protection Fast Scalper has.
+        # If placement fails (filter, balance, network) we fall back to
+        # the polling-based exit logic in monitor_positions.
+        if pos.get('mode') == 'live' and self.client is not None and quantity > 0:
+            list_id = self._place_oco_sell(symbol, quantity, fill_price, pos.get('profit_pct') or DEFAULT_PROFIT_PCT)
+            pos['oco_list_id'] = list_id
 
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
         signal_price = pos.get('signal_price', fill_price)
         improvement = (signal_price - fill_price) / signal_price * 100 if signal_price else 0
         tag = "LIVE" if pos.get("mode") == "live" else "PAPER"
+        oco_tag = f" oco={pos['oco_list_id']}" if pos.get('oco_list_id') else (" oco=FAILED→polling" if pos.get('mode') == 'live' else "")
         print(f"✅ [{tag} FILLED] {symbol} fill={fill_price:.6f} qty={quantity:.6f} "
-              f"(-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s")
+              f"(-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s{oco_tag}")
+
+    # ── OCO helpers (mirror the Fast Scalper pattern) ────────────────────
+
+    def _place_oco_sell(self, symbol, qty, entry_price, profit_pct):
+        """Place a Binance OCO sell — LIMIT TP + STOP_LOSS_LIMIT SL.
+
+        Returns the orderListId on success, None on any failure (caller
+        falls back to polling-based exits).
+
+            TP = entry × (1 + profit_pct / 100)              ← +0.5 % default
+            SL_trig = entry × (1 - MAX_VIRTUAL_LOSS_USDT /
+                                   pos['investment'])         ← -$1 hard stop
+            SL_lim  = SL_trig × 0.998                         ← 0.2 % slack
+        """
+        if self.client is None:
+            return None
+        try:
+            f = self._get_filters(symbol)
+            if not f:
+                return None
+            tick = f.get('tick_size', 0.00000001) or 0.00000001
+            tp_price   = self._round_step(entry_price * (1 + profit_pct / 100.0), tick)
+            sl_loss_pct = MAX_VIRTUAL_LOSS_USDT / DEFAULT_BUY_AMOUNT_USDT  # ratio of investment
+            sl_trigger = self._round_step(entry_price * (1 - sl_loss_pct), tick)
+            sl_limit   = self._round_step(sl_trigger * 0.998, tick)
+
+            if not (tp_price > entry_price > sl_trigger > sl_limit > 0):
+                print(f"⚠️ [OCO] {symbol} bad price triplet "
+                      f"entry={entry_price} tp={tp_price} sl_trig={sl_trigger} sl_lim={sl_limit} — skipping")
+                return None
+
+            params = {
+                'symbol':                 symbol.replace('/', ''),
+                'side':                   'SELL',
+                'quantity':               str(qty),
+                'price':                  str(tp_price),
+                'stopPrice':              str(sl_trigger),
+                'stopLimitPrice':         str(sl_limit),
+                'stopLimitTimeInForce':   'GTC',
+            }
+            result = self.client.private_post_order_oco(params)
+            list_id = result.get('orderListId')
+            if list_id is None:
+                print(f"⚠️ [OCO] {symbol} response missing orderListId: {result}")
+                return None
+            print(f"📋 [OCO] {symbol} placed list={list_id} TP={tp_price} SL={sl_trigger}/{sl_limit}")
+            return str(list_id)
+        except Exception as e:
+            print(f"⚠️ [OCO] placement failed for {symbol}: {e}")
+            return None
+
+    def _check_oco_status(self, symbol, pos):
+        """Poll OCO list status. Returns True if the position has been
+        closed by the exchange (one leg filled, the other auto-cancelled)."""
+        list_id = pos.get('oco_list_id')
+        if not list_id or self.client is None:
+            return False
+        try:
+            result = self.client.private_get_orderlist({'orderListId': list_id})
+        except Exception as e:
+            # Transient — try again next tick.
+            return False
+        list_status = (result.get('listOrderStatus') or '').upper()
+        if list_status != 'ALL_DONE':
+            return False
+
+        print(f"✅ [OCO] {symbol} resolved by exchange — list={list_id}")
+        # Best-effort archive so dashboards see the close. Compute net
+        # PnL from entry→avg-fill via the leg orders if we can.
+        try:
+            avg_exit_price = pos.get('entry_price') or 0.0
+            for leg in result.get('orders', []) or []:
+                child = self.client.fetch_order(leg.get('orderId'), self._to_ccxt_symbol(symbol))
+                if child.get('status') == 'closed':
+                    avg_exit_price = float(child.get('average') or child.get('price') or avg_exit_price)
+                    break
+            entry_price = float(pos.get('entry_price') or avg_exit_price)
+            qty = float(pos.get('quantity') or 0.0)
+            buy_value  = entry_price * qty
+            sell_value = avg_exit_price * qty
+            buy_fee    = buy_value * 0.001
+            sell_fee   = sell_value * 0.001
+            net_pnl    = (sell_value - buy_value) - (buy_fee + sell_fee)
+            archived = dict(pos)
+            archived['exit_price'] = avg_exit_price
+            archived['pnl_usdt'] = net_pnl
+            archived['fees_paid'] = buy_fee + sell_fee
+            archived['reason'] = 'OCO_FILLED'
+            archive_closed_trade(symbol, "VIRTUAL_LIVE", archived)
+        except Exception:
+            pass
+
+        self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+        return True
+
+    def _cancel_oco(self, symbol, list_id):
+        """Best-effort OCO cancel — absorbs failures so the caller can
+        always continue to a market sell."""
+        if not list_id or self.client is None:
+            return
+        try:
+            self.client.private_delete_orderlist({
+                'symbol':       symbol.replace('/', ''),
+                'orderListId':  list_id,
+            })
+            print(f"🚫 [OCO] cancelled list={list_id} for {symbol}")
+        except Exception as e:
+            print(f"⚠️ [OCO] cancel failed for {symbol} list={list_id}: {e}")
 
     def _fetch_base_price(self, symbol):
         """Return the symbol's stored base price, or None if not available."""
@@ -447,6 +571,13 @@ class VirtualScalpExecutor:
         # their entry_price/timestamp are None until fill.
         if pos.get('status') == 'PENDING_LIMIT':
             return
+
+        # If we placed an OCO sell at fill time, check it first. When the
+        # exchange resolves the OCO (TP or SL leg fills), we drop the
+        # local row and skip the polling logic — Binance already exited.
+        if pos.get('oco_list_id'):
+            if self._check_oco_status(symbol, pos):
+                return
 
         entry_price = pos['entry_price']
         elapsed = time.time() - pos['entry_timestamp']
@@ -500,6 +631,12 @@ class VirtualScalpExecutor:
         #    accounting when the exchange confirms. If the sell fails we
         #    re-queue the position and bail so a future tick retries it.
         if mode == "live" and pos.get("quantity"):
+            # Cancel any active OCO BEFORE the market sell so a TP/SL
+            # leg can't fire in parallel and oversell what we own.
+            list_id = pos.get('oco_list_id')
+            if list_id:
+                self._cancel_oco(symbol, list_id)
+
             real_exit = self._place_real_market_sell(symbol, float(pos["quantity"]))
             if real_exit is None:
                 # Don't delete the position — we still own the coin on
