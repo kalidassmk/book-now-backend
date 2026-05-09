@@ -135,6 +135,82 @@ class MultiSymbolScalper:
         await self.refresh_symbols()
         log.info(f"📊 Initialized with {len(self.symbols)} USDT pairs from Redis.")
 
+        # 4. Restore active positions from Redis. Without this, every
+        # container restart (deploy/OOM/crash) loses track of coins we
+        # actually own — they sit on Binance with no exit logic until
+        # someone manually sells. Reconcile each restored row against
+        # Binance so we drop entries whose OCO already filled while the
+        # bot was offline.
+        await self._restore_positions_from_redis()
+
+    # ── Position persistence ─────────────────────────────────────────────
+    # active_positions is the in-memory dict the rest of the loop reads
+    # and writes. We mirror every change to the SCALPER:POSITIONS hash
+    # in Redis so a restart can rebuild the dict from durable storage.
+
+    def _persist_position(self, symbol: str) -> None:
+        """Write a single position row to Redis. No-op if redis is down
+        or the symbol isn't in the in-memory dict."""
+        if not self.redis or symbol not in self.active_positions:
+            return
+        try:
+            self.redis.hset(POSITIONS_KEY, symbol, json.dumps(self.active_positions[symbol]))
+        except Exception as e:
+            log.warning(f"position persist failed for {symbol}: {e}")
+
+    def _drop_persisted_position(self, symbol: str) -> None:
+        """Remove a position row from Redis. Called immediately before
+        the in-memory `del` so the two stores never disagree."""
+        if not self.redis:
+            return
+        try:
+            self.redis.hdel(POSITIONS_KEY, symbol)
+        except Exception as e:
+            log.warning(f"position drop failed for {symbol}: {e}")
+
+    async def _restore_positions_from_redis(self) -> None:
+        """Rehydrate active_positions on boot. For positions that had
+        an OCO list id, query Binance to see if it already resolved —
+        any ALL_DONE list means the position is already closed on the
+        exchange and the local row should be discarded."""
+        if not self.redis:
+            return
+        try:
+            raw = self.redis.hgetall(POSITIONS_KEY)
+        except Exception as e:
+            log.warning(f"position restore: hgetall failed: {e}")
+            return
+        if not raw:
+            log.info("📦 No persisted positions to restore.")
+            return
+
+        restored, dropped = 0, 0
+        for symbol, payload in raw.items():
+            try:
+                pos = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+
+            list_id = pos.get('oco_list_id')
+            if list_id:
+                # If the OCO already resolved while we were down, drop it.
+                try:
+                    result = await self.client.private_get_orderlist({'orderListId': list_id})
+                    if (result.get('listOrderStatus') or '').upper() == 'ALL_DONE':
+                        log.info(f"📦 [restore] {symbol} OCO {list_id} already ALL_DONE — dropping")
+                        self._drop_persisted_position(symbol)
+                        dropped += 1
+                        continue
+                except Exception as e:
+                    # Transient — keep the position and let the monitor
+                    # loop figure it out next tick.
+                    log.warning(f"[restore] {symbol} OCO check failed (keeping): {e}")
+
+            self.active_positions[symbol] = pos
+            restored += 1
+
+        log.info(f"📦 Restored {restored} position(s) from Redis (dropped {dropped} already closed).")
+
     async def refresh_symbols(self):
         """Fetch the latest Top USDT pairs + Fast Movers from Redis."""
         if not self.redis: return
@@ -450,6 +526,7 @@ class MultiSymbolScalper:
                 'oco_list_id':  oco_list_id,    # str or None
                 'opened_ts':    time.time(),
             }
+            self._persist_position(symbol)  # mirror to Redis for restart safety
             mode_tag = f"oco={oco_list_id}" if oco_list_id else "oco=FAILED→polling"
             log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price} {mode_tag}")
         except Exception as e:
@@ -537,6 +614,7 @@ class MultiSymbolScalper:
                 continue
 
         log.info(f"✅ [OCO] {symbol} resolved by exchange — list={list_id} legs=[{', '.join(leg_summary)}]")
+        self._drop_persisted_position(symbol)
         del self.active_positions[symbol]
         return True
 
@@ -593,6 +671,7 @@ class MultiSymbolScalper:
                 "exit_time": datetime.now().strftime("%H:%M:%S"),
             })
 
+            self._drop_persisted_position(symbol)
             del self.active_positions[symbol]
         except Exception as e:
             log.error(f"❌ Sell {symbol} failed: {e}")
