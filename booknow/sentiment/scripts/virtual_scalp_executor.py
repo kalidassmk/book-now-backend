@@ -5,6 +5,8 @@ import time
 import uuid
 from datetime import datetime
 
+from booknow.util.trade_archive import archive_closed_trade
+
 # --- CONFIGURATION ---
 # Read from env so Docker can point at the `redis` service while local
 # dev still defaults to 127.0.0.1. Compose sets REDIS_HOST=redis.
@@ -286,6 +288,10 @@ class VirtualScalpExecutor:
         self.r.lpush(VIRTUAL_HISTORY_KEY, json.dumps(pos))
         self.r.ltrim(VIRTUAL_HISTORY_KEY, 0, 99)
         self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+
+        # Long-term archive on the analyse Redis (best-effort, won't
+        # block on a bad connection).
+        archive_closed_trade(symbol, "VIRTUAL", pos)
         
         color = "🟢" if net_pnl_usdt > 0 else "🔴"
         print(f"{color} [VIRTUAL SELL] {symbol} | Net PnL: ${net_pnl_usdt:.4f} | Fees: ${total_fees:.4f} | Held: {int(pos['hold_duration'])}s")

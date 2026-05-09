@@ -10,6 +10,8 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 # from dotenv import load_dotenv  <-- Removed to solve ModuleNotFoundError
 
+from booknow.util.trade_archive import archive_closed_trade
+
 # WebSocket-backed kline cache replaces fetch_ohlcv polling.
 # When unavailable (older deployments), fall back to CCXT REST.
 try:
@@ -349,9 +351,30 @@ class MultiSymbolScalper:
     async def execute_sell(self, symbol, price):
         if symbol not in self.active_positions: return
         try:
-            qty = self.active_positions[symbol]['qty']
+            pos = self.active_positions[symbol]
+            qty = pos['qty']
+            buy_price = pos.get('buy_price', 0.0) or 0.0
             log.info(f"⚡ [SCALPER] Selling {symbol} @ {price}")
             await self.client.create_market_sell_order(symbol, qty)
+
+            # Long-term archive on the analyse Redis (best-effort).
+            buy_value  = buy_price * qty
+            sell_value = price * qty
+            buy_fee    = buy_value * 0.001
+            sell_fee   = sell_value * 0.001
+            net_pnl    = (sell_value - buy_value) - (buy_fee + sell_fee)
+            archive_closed_trade(symbol, "FAST", {
+                "entry_price": buy_price,
+                "exit_price": price,
+                "qty": qty,
+                "investment": buy_value,
+                "pnl_usdt": net_pnl,
+                "pnl_pct": ((price - buy_price) / buy_price * 100.0) if buy_price else 0.0,
+                "fees_paid": buy_fee + sell_fee,
+                "reason": "SCALPER_EXIT",
+                "exit_time": datetime.now().strftime("%H:%M:%S"),
+            })
+
             del self.active_positions[symbol]
         except Exception as e:
             log.error(f"❌ Sell {symbol} failed: {e}")

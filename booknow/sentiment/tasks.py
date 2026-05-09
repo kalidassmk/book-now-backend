@@ -113,4 +113,9 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("vp_history_recorder.py",),
         kind="persistent",
     ),
+    SubprocessTask(
+        name="Stale Cleaner",
+        cmd_argv=("stale_cleaner.py",),
+        kind="persistent",
+    ),
 ]
