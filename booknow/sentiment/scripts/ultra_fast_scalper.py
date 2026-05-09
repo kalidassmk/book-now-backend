@@ -65,7 +65,10 @@ class MultiSymbolScalper:
         self.active_positions = {} # symbol -> {buy_price, qty}
 
         # Dynamic Settings (Aligned with User Micro-Trend Strategy)
-        self.auto_enabled = False
+        # auto_enabled defaults to True — auto buy/sell is the intended
+        # operational mode. Explicitly set "autoBuyEnabled": false in
+        # booknow:config to pause without restarting the process.
+        self.auto_enabled = True
         self.buy_amount_usdt = 100.0
         self.profit_target_usdt = 0.20
         self.stop_loss_usdt = 0.50
@@ -198,7 +201,7 @@ class MultiSymbolScalper:
             raw = self.redis.get(CONFIG_KEY)
             if raw:
                 cfg = json.loads(raw)
-                self.auto_enabled = cfg.get("autoBuyEnabled", False)
+                self.auto_enabled = cfg.get("autoBuyEnabled", True)
                 self.buy_amount_usdt = cfg.get("buyAmountUsdt", 100.0)
                 self.profit_target_usdt = cfg.get("profitAmountUsdt", 0.20)
                 self.stop_loss_usdt = cfg.get("stopLossUsdt", 0.50)
