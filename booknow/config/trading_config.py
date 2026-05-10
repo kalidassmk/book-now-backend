@@ -59,7 +59,10 @@ class TradingConfig:
     # where dips actually fill (≈ 60 % fill rate in 60 min) AND the +1 % TP
     # is reachable (≈ 42 % TP-hit rate of fills).
     limitBuyOffsetPct: float = 0.65  # buy this % below market signal
-    limitBuyTimeoutSec: int = 60     # cancel limit-buy if not filled in this window
+    # 2026-05-10: 60 → 3600 (60 min). Option B's -0.65% offset needs the
+    # full hour to fill (~63 % fill rate at 60 min in the backtest);
+    # 60 seconds was a leftover from the old -0.09 % era.
+    limitBuyTimeoutSec: int = 3600   # cancel limit-buy if not filled in this window
     tslPct: float = 2.0              # trailing stop-loss (legacy)
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
