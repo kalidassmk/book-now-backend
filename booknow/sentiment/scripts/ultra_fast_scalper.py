@@ -77,6 +77,13 @@ class MultiSymbolScalper:
         self.profit_target_usdt = 0.20
         self.stop_loss_usdt = 0.50
 
+        # Market-context filters (derived from yesterday's P&L analysis).
+        # Hot-reloaded from TRADING_CONFIG so thresholds can be tuned
+        # without redeploy. See evaluate_entry() for how they're applied.
+        self.min_change_24h_pct = -1.0    # skip falling-knife coins (24h trend)
+        self.min_range_24h_pct  = 5.0     # skip too-quiet coins (TP unlikely)
+        self.min_vol_24h_usd    = 2_000_000  # liquidity floor
+
         # Filter cache
         self.filters = {} # symbol -> {step_size, tick_size, min_notional}
 
@@ -308,6 +315,13 @@ class MultiSymbolScalper:
 
             # Stop loss: explicit USDT; if absent, default to 1 % of trade size.
             self.stop_loss_usdt = float(cfg.get("stopLossUsdt", self.buy_amount_usdt * 0.01))
+
+            # Market-context filters (added 2026-05-10 after PENGU/AAVE
+            # post-mortem revealed the bot was buying coins already in
+            # 24h downtrends). Set any to None / 0 to disable a filter.
+            self.min_change_24h_pct = float(cfg.get("minChange24hPct", -1.0))
+            self.min_range_24h_pct  = float(cfg.get("minRange24hPct", 5.0))
+            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 2_000_000))
         except Exception as e:
             log.warning("sync_config failed (continuing with last values): %s", e)
 
@@ -359,30 +373,57 @@ class MultiSymbolScalper:
         except Exception:
             return None
 
-    def evaluate_entry(self, symbol, df, btc_df):
-        """Micro-Trend Momentum Acceleration Strategy."""
+    def evaluate_entry(self, symbol, df, btc_df, ticker_24h=None):
+        """Micro-Trend Momentum Acceleration Strategy + 24h market filter.
+
+        ticker_24h is an optional dict with Binance's 24h ticker fields
+        (percentage, high, low, quoteVolume). Pre-fetched by the caller
+        in async context. None disables the 24h filter for this call.
+        """
         if df is None or btc_df is None or len(df) < 20: return False, None
-        
+
         curr = df.iloc[-1]
         prev = df.iloc[-2]
         btc  = btc_df.iloc[-1]
 
         # BTC Trend Filter (Must not be crashing)
         btc_ok = btc['close'] > btc['ema21']
-        
+
         # 1. TREND: EMAs are stacked (9 > 21 > 50)
         uptrend = curr['ema9'] > curr['ema21'] > curr['ema50']
-        
+
         # 2. ACCELERATION: Current price breaking above previous high (Micro-breakout)
         breakout = curr['close'] > prev['high']
-        
+
         # 3. MOMENTUM: RSI is strong but not exhausted
         rsi_ok = 60 < curr['rsi'] < 82
-        
+
         # 4. VELOCITY: Volume is surging
         vol_ok = curr['vol'] > (curr['v_avg'] * 1.5)
-        
+
         bullish = curr['close'] > curr['open']
+
+        # 5. MARKET CONTEXT — 24h ticker filter.
+        # Derived from the 2026-05-10 P&L post-mortem:
+        #   - winners avg 24h change +3.5 %, losers -2.8 %
+        #     → reject coins already trending DOWN over 24h
+        #   - winners avg 24h range 15.7 %, losers 8.5 %
+        #     → reject coins too quiet to hit +0.5 % TP
+        #   - extreme low-volume coins (ZRX $0.2M, STRAX $0.3M)
+        #     showed up as losers → enforce a $2 M floor
+        ticker_24h_ok = True
+        change_24h = range_24h = vol_24h = 0.0
+        if ticker_24h:
+            change_24h = float(ticker_24h.get('percentage') or 0)
+            high = float(ticker_24h.get('high') or 0)
+            low = float(ticker_24h.get('low') or 0)
+            range_24h = ((high - low) / low * 100) if low > 0 else 0
+            vol_24h = float(ticker_24h.get('quoteVolume') or 0)
+            ticker_24h_ok = (
+                change_24h >= self.min_change_24h_pct and
+                range_24h  >= self.min_range_24h_pct and
+                vol_24h    >= self.min_vol_24h_usd
+            )
 
         # Signal Matrix
         matrix = {
@@ -391,9 +432,38 @@ class MultiSymbolScalper:
             "micro_breakout": bool(breakout),
             "rsi_momentum": bool(rsi_ok),
             "volume_surge": bool(vol_ok),
-            "bullish_candle": bool(bullish)
+            "bullish_candle": bool(bullish),
+            "ticker_24h": bool(ticker_24h_ok),
+            "change_24h_pct": round(change_24h, 2),
+            "range_24h_pct": round(range_24h, 2),
+            "vol_24h_m_usd": round(vol_24h / 1_000_000, 2),
         }
-        return all(matrix.values()), matrix
+        # Pass requires every original gate plus the 24h filter.
+        passed = (btc_ok and uptrend and breakout and rsi_ok and vol_ok and bullish and ticker_24h_ok)
+        return passed, matrix
+
+    # 24h ticker cache (one fetch per symbol per ~30 s)
+    _t24h_cache = None
+    _t24h_cache_ttl_sec = 30
+
+    async def _fetch_24h_ticker(self, symbol: str):
+        """Cached async fetch of the 24h ticker. One Binance call per
+        symbol per ~30 s — cheap enough that even with ~600 symbols
+        we stay well under the 1200/min weight cap.
+        Weight per call: 1. So 600 symbols × 1 / 30 s = 20 weight/min."""
+        if self._t24h_cache is None:
+            self._t24h_cache = {}
+        now = time.time()
+        cached = self._t24h_cache.get(symbol)
+        if cached and (now - cached['_ts']) < self._t24h_cache_ttl_sec:
+            return cached['data']
+        try:
+            data = await self.client.fetch_ticker(symbol)
+        except Exception:
+            return None
+        if data:
+            self._t24h_cache[symbol] = {'_ts': now, 'data': data}
+        return data
 
     async def process_symbol(self, symbol, btc_df):
         """Analyze and trade a single symbol."""
@@ -439,8 +509,11 @@ class MultiSymbolScalper:
 
         # 2. Look for new entry
         df = await self.get_indicators(symbol)
-        should_buy, matrix = self.evaluate_entry(symbol, df, btc_df)
-        
+        # Pre-fetch 24h ticker (cached 30 s) so the sync evaluate_entry
+        # can use it for the post-mortem-derived market filter.
+        ticker_24h = await self._fetch_24h_ticker(symbol)
+        should_buy, matrix = self.evaluate_entry(symbol, df, btc_df, ticker_24h=ticker_24h)
+
         # Broadcast detailed matrix
         self.broadcast_signal(symbol, "BUY" if should_buy else "NEUTRAL", df.iloc[-1]['close'] if df is not None else 0, matrix)
 
