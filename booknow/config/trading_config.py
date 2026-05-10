@@ -48,9 +48,11 @@ class TradingConfig:
     profitAmountUsdt: float = 0.0
 
     # ── Stop loss (Fast Scalper consumes; Virtual Scalper too) ──────────
-    # Scaled to 1 % of $6 buy = $0.06; Option B is patient, but a stop
-    # remains in case the falling-knife filter ever lets a bad coin through.
-    stopLossUsdt: float = 0.06       # exit when unrealized loss reaches this USDT
+    # 2026-05-10: DISABLED by default (set to 0). Operator chose Option B
+    # "patient hold" — wait for TP even on heavy paper losses. Set this to
+    # a positive USDT amount to re-enable a stop-loss exit; both scalpers
+    # treat 0 (or negative) as "no stop, no SL leg on the OCO".
+    stopLossUsdt: float = 0.0        # 0 = disabled (was 0.06)
 
     # ── Order placement ──────────────────────────────────────────────────
     # 0.65 % limit-buy offset comes from the 2026-05-10 backtest: that is

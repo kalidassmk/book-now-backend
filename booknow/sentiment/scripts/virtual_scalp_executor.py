@@ -72,6 +72,10 @@ class VirtualScalpExecutor:
         self.fk_overbought_skip = True
         self.fk_overbought_60m = 1.5
 
+        # Stop-loss USDT — when 0/negative, SOFT_STOP_LOSS_USDT and
+        # MAX_VIRTUAL_LOSS_USDT below are bypassed (Option B patient hold).
+        self.stop_loss_usdt = 0.0
+
         # Metrics collector — same Redis as everything else.
         self.metrics = make_collector(self.r, enabled=True) if make_collector else None
 
@@ -107,7 +111,9 @@ class VirtualScalpExecutor:
     def _sync_live_mode(self):
         """Hot-reload live_mode flag + falling-knife filter knobs from
         TRADING_CONFIG every iteration. Default True — operator must
-        explicitly set ``virtualScalperLiveMode: false`` to pause live."""
+        explicitly set ``virtualScalperLiveMode: false`` to pause live.
+        Also picks up stopLossUsdt: when 0/negative, the SOFT/HARD stops
+        are bypassed entirely (Option B "patient hold")."""
         try:
             raw = self.r.get(TRADING_CONFIG_KEY)
             if raw:
@@ -118,6 +124,8 @@ class VirtualScalpExecutor:
                 self.fk_max_1h_range = float(cfg.get("maxRange1hPct", 6.0))
                 self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
                 self.fk_overbought_60m = float(cfg.get("overbought60mPct", 1.5))
+                # Stop-loss config (0 = disabled, matches Fast Scalper).
+                self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception:
@@ -715,16 +723,18 @@ class VirtualScalpExecutor:
         if tp_hit:
             exit_reason = "TAKE_PROFIT"
 
-        # 2. Hard Stop Loss (Instant if loss > $1)
-        elif pnl_usdt <= -MAX_VIRTUAL_LOSS_USDT:
+        # 2. Hard Stop Loss (Instant if loss > $1) — DISABLED when
+        # stopLossUsdt <= 0 (Option B patient-hold mode).
+        elif self.stop_loss_usdt > 0 and pnl_usdt <= -MAX_VIRTUAL_LOSS_USDT:
             exit_reason = "HARD_STOP_LOSS"
 
         # 3. Strategy Exit (Instant if exhaustion detected)
         elif signal == "EXHAUSTION_EXIT":
             exit_reason = "STRATEGY_EXIT"
 
-        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss between $0.50 and $1)
-        elif pnl_usdt <= -SOFT_STOP_LOSS_USDT:
+        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss between
+        # $0.50 and $1) — also DISABLED when stopLossUsdt <= 0.
+        elif self.stop_loss_usdt > 0 and pnl_usdt <= -SOFT_STOP_LOSS_USDT:
             if elapsed < MIN_HOLD_SECONDS:
                 pass # Patiently holding for recovery...
             else:

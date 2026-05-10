@@ -359,8 +359,10 @@ class MultiSymbolScalper:
             else:
                 self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.05))
 
-            # Stop loss: explicit USDT; if absent, default to 1 % of trade size.
-            self.stop_loss_usdt = float(cfg.get("stopLossUsdt", self.buy_amount_usdt * 0.01))
+            # Stop loss: explicit USDT; 0 (or negative) disables both the
+            # OCO SL leg and the polling SL exit. Default to 0 so older
+            # configs without this field opt into Option B's patient hold.
+            self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
 
             # Market-context filters (added 2026-05-10 after PENGU/AAVE
             # post-mortem revealed the bot was buying coins already in
@@ -578,6 +580,13 @@ class MultiSymbolScalper:
                 if resolved:
                     return
 
+            # 1a-bis. TP-only LIMIT path (Option B "no stop" mode). Same
+            # pattern: ask Binance whether the TP filled, finalize if yes.
+            if pos.get('tp_order_id'):
+                resolved = await self._check_tp_only_status(symbol, pos)
+                if resolved:
+                    return
+
             df = await self.get_indicators(symbol)
             if df is None: return
 
@@ -593,13 +602,17 @@ class MultiSymbolScalper:
                 return
 
             # 1c. Polling-based TP/SL — backup safety net for positions
-            # whose OCO placement failed (oco_list_id is None). When OCO
-            # is active we let Binance handle it for tighter timing.
-            if not pos.get('oco_list_id'):
+            # whose exchange-side resting order placement failed (no
+            # oco_list_id and no tp_order_id). When either is active we
+            # let Binance handle it for tighter timing.
+            if not pos.get('oco_list_id') and not pos.get('tp_order_id'):
                 if pnl >= self.profit_target_usdt:
                     log.info(f"💰 [{symbol}] Profit Target Hit (poll): +${pnl:.2f}")
                     await self.execute_sell(symbol, curr['close'])
-                elif pnl <= -self.stop_loss_usdt:
+                elif self.stop_loss_usdt > 0 and pnl <= -self.stop_loss_usdt:
+                    # Stop-loss only fires when explicitly enabled
+                    # (stopLossUsdt > 0). Option B sets it to 0 so this
+                    # branch is dead — patient hold until TP or trend exit.
                     log.info(f"🛡️ [{symbol}] Stop Loss Hit (poll): -${pnl:.2f}")
                     await self.execute_sell(symbol, curr['close'])
             return
@@ -744,22 +757,37 @@ class MultiSymbolScalper:
                 # OCO/sell quantity stays inside what we actually own.
                 sellable_qty = self.round_step(filled_qty_gross * 0.999, f['step_size'])
 
-            # Place an OCO sell on the exchange so TP/SL fire the moment
-            # price touches them — no polling delay, works even if the
-            # bot is offline. If OCO placement fails the position falls
-            # back to the polling-based exits in process_symbol.
-            oco_list_id = await self._place_oco_sell(
-                symbol, sellable_qty, exec_price, f
-            )
+            # Choose the resting-sell pattern based on whether stop-loss is
+            # active. Option B (stopLossUsdt <= 0) means "patient hold, no
+            # stop" — place a single TP-only LIMIT instead of OCO so the
+            # exchange never auto-exits us at a loss.
+            oco_list_id = None
+            tp_order_id = None
+            if self.stop_loss_usdt > 0:
+                # Classic OCO (TP + SL legs) — exchange handles either.
+                oco_list_id = await self._place_oco_sell(
+                    symbol, sellable_qty, exec_price, f
+                )
+            else:
+                # TP-only: a plain LIMIT SELL at the profit target.
+                tp_order_id = await self._place_tp_only_limit(
+                    symbol, sellable_qty, exec_price, f
+                )
 
             self.active_positions[symbol] = {
                 'buy_price':    exec_price,
                 'qty':          sellable_qty,
                 'oco_list_id':  oco_list_id,    # str or None
+                'tp_order_id':  tp_order_id,    # str or None — Option B path
                 'opened_ts':    time.time(),
             }
             self._persist_position(symbol)  # mirror to Redis for restart safety
-            mode_tag = f"oco={oco_list_id}" if oco_list_id else "oco=FAILED→polling"
+            if oco_list_id:
+                mode_tag = f"oco={oco_list_id}"
+            elif tp_order_id:
+                mode_tag = f"tp-only={tp_order_id}"
+            else:
+                mode_tag = "exit-pattern=FAILED→polling"
             log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price} {mode_tag}")
             if self.metrics is not None:
                 size_usdt = exec_price * sellable_qty
@@ -871,6 +899,90 @@ class MultiSymbolScalper:
         except Exception as e:
             log.warning(f"⚠️ [OCO] cancel failed for {symbol} list={list_id}: {e}")
 
+    # ── TP-only LIMIT (no SL leg) — Option B "patient hold" path ─────────
+    async def _place_tp_only_limit(self, symbol: str, qty: float, entry_price: float, filters: dict):
+        """Place a single LIMIT SELL at the profit-target price.
+
+        Used when the operator has disabled stop-loss (stopLossUsdt <= 0).
+        The exchange will fire whenever price reaches TP; we never get
+        auto-exited at a loss. Cancellation on trend-reversal still works
+        via the order_id we return.
+        """
+        if self.buy_amount_usdt <= 0 or self.profit_target_usdt <= 0:
+            return None
+        try:
+            tick = filters.get('tick_size', 0.00000001) or 0.00000001
+            tp_pct = self.profit_target_usdt / self.buy_amount_usdt
+            tp_price = self.round_step(entry_price * (1 + tp_pct), tick)
+            if not (tp_price > entry_price > 0):
+                log.warning(f"⚠️ [TP-only] {symbol} bad TP price entry={entry_price} tp={tp_price}")
+                return None
+            order = await self.client.create_limit_sell_order(symbol, qty, tp_price)
+            order_id = order.get('id')
+            if order_id is None:
+                log.warning(f"⚠️ [TP-only] {symbol} response missing order id: {order}")
+                return None
+            log.info(f"📋 [TP-only] {symbol} LIMIT SELL @ {tp_price} (no SL — patient hold)")
+            return str(order_id)
+        except Exception as e:
+            log.warning(f"⚠️ [TP-only] placement failed for {symbol}: {e}")
+            return None
+
+    async def _check_tp_only_status(self, symbol: str, pos: dict) -> bool:
+        """Poll a TP-only LIMIT SELL. Returns True if it filled (position
+        closed and metrics/archive recorded)."""
+        order_id = pos.get('tp_order_id')
+        if not order_id:
+            return False
+        try:
+            order = await self.client.fetch_order(order_id, symbol)
+        except Exception as e:
+            log.debug(f"[TP-only] {symbol} status check transient error: {e}")
+            return False
+        if (order.get('status') or '').lower() != 'closed':
+            return False
+
+        exit_price = float(order.get('average') or order.get('price') or 0.0)
+        qty = float(pos.get('qty') or 0.0)
+        buy_price = float(pos.get('buy_price') or 0.0)
+        buy_value = buy_price * qty
+        sell_value = exit_price * qty
+        fees = (buy_value + sell_value) * 0.001
+        net_pnl = (sell_value - buy_value) - fees
+
+        if self.metrics is not None:
+            self.metrics.tp_hit(symbol, buy_price, exit_price)
+            self.metrics.exit_recorded(symbol, buy_price, exit_price,
+                                       reason="tp", pnl_usdt=net_pnl)
+
+        archive_closed_trade(symbol, "FAST", {
+            "entry_price":  buy_price,
+            "exit_price":   exit_price,
+            "qty":          qty,
+            "investment":   buy_value,
+            "pnl_usdt":     net_pnl,
+            "pnl_pct":      ((exit_price - buy_price) / buy_price * 100.0) if buy_price else 0.0,
+            "fees_paid":    fees,
+            "reason":       "TP_ONLY_FILLED",
+            "exit_time":    datetime.now().strftime("%H:%M:%S"),
+        })
+
+        self._drop_persisted_position(symbol)
+        del self.active_positions[symbol]
+        log.info(f"💰 [{symbol}] TP-only filled @ {exit_price} → +${net_pnl:.4f}")
+        return True
+
+    async def _cancel_tp_only(self, symbol: str, order_id: str) -> None:
+        """Best-effort cancel of a TP-only LIMIT SELL (used by trend-reversal
+        exits and execute_sell)."""
+        if not order_id:
+            return
+        try:
+            await self.client.cancel_order(order_id, symbol)
+            log.info(f"🚫 [TP-only] cancelled order={order_id} for {symbol}")
+        except Exception as e:
+            log.warning(f"⚠️ [TP-only] cancel failed for {symbol} order={order_id}: {e}")
+
     @staticmethod
     def _to_ccxt_symbol(symbol: str) -> str:
         return symbol if '/' in symbol else f"{symbol[:-4]}/USDT"
@@ -882,12 +994,16 @@ class MultiSymbolScalper:
             qty = pos['qty']
             buy_price = pos.get('buy_price', 0.0) or 0.0
             list_id = pos.get('oco_list_id')
+            tp_order_id = pos.get('tp_order_id')
 
-            # If an OCO is sitting on the exchange we must cancel it
-            # before any sell — otherwise a TP/SL leg could fill in
-            # parallel and we'd oversell what we own.
+            # If a resting sell is sitting on the exchange we must cancel
+            # it before any new sell — otherwise the TP leg could fill in
+            # parallel and we'd oversell what we own. Both OCO list IDs
+            # and TP-only order IDs need clearing.
             if list_id:
                 await self._cancel_oco(symbol, list_id)
+            if tp_order_id:
+                await self._cancel_tp_only(symbol, tp_order_id)
 
             # Replaces the previous market-sell. We never want unbounded
             # slippage — even on trend-reversal exits. The aggressive
