@@ -88,15 +88,16 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
-        # Defaults tuned for $30 trades aiming at ~$0.02 NET profit per win
-        # (gross $0.08 = 0.267 % of $30, after $0.06 round-trip fees).
-        # If Redis TRADING_CONFIG is ever wiped, these defaults take over —
-        # we never want a fallback to the old $100 / $0.20 settings that
-        # blindsided the operator on 2026-05-09.
+        # 2026-05-10: switched to Option B sizing — $6 buys aiming at
+        # $0.05 NET per win (gross $0.06 = 1 % of $6, after $0.012 in
+        # round-trip Binance fees). If Redis TRADING_CONFIG is ever wiped,
+        # these defaults take over — we never want a fallback to the old
+        # $100 / $0.20 settings that blindsided the operator on 2026-05-09,
+        # nor the intermediate $30 sizing the operator iterated past.
         self.auto_enabled = True
-        self.buy_amount_usdt = 30.0
-        self.profit_target_usdt = 0.08
-        self.stop_loss_usdt = 0.30
+        self.buy_amount_usdt = 6.0
+        self.profit_target_usdt = 0.06
+        self.stop_loss_usdt = 0.06
 
         # Market-context filters (derived from yesterday's P&L analysis).
         # Hot-reloaded from TRADING_CONFIG so thresholds can be tuned
@@ -108,7 +109,8 @@ class MultiSymbolScalper:
         # Limit-buy entry tunables (replaces the old market-buy path).
         # Operator can switch between market and limit by setting
         # limitBuyOffsetPct to 0 (or negative) → market buy fallback.
-        self.limit_buy_offset_pct = 0.09     # default 0.09 % below signal price
+        # 0.65 % matches the 2026-05-10 Option B backtest sweet spot.
+        self.limit_buy_offset_pct = 0.65     # default 0.65 % below signal price
         self.limit_buy_timeout_sec = 60      # cancel if not filled
 
         # Falling-knife filter (added 2026-05-10). Hot-reloaded from
@@ -347,14 +349,15 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 30.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 6.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
-            profit_pct = float(cfg.get("profitPct", 0.0) or 0.0)
+            # Defaults: profitPct = 1.0 % (Option B), legacy USDT = $0.05.
+            profit_pct = float(cfg.get("profitPct", 1.0) or 1.0)
             if profit_pct > 0:
                 self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
             else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.02))
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.05))
 
             # Stop loss: explicit USDT; if absent, default to 1 % of trade size.
             self.stop_loss_usdt = float(cfg.get("stopLossUsdt", self.buy_amount_usdt * 0.01))
@@ -370,7 +373,8 @@ class MultiSymbolScalper:
             # back to market buys). Same Redis key the dashboard already
             # writes for Virtual Scalper, so both engines use the same
             # offset and the operator only has one knob to tune.
-            self.limit_buy_offset_pct = float(cfg.get("limitBuyOffsetPct", 0.09))
+            # Default 0.65 % matches Option B (2026-05-10 backtest).
+            self.limit_buy_offset_pct = float(cfg.get("limitBuyOffsetPct", 0.65))
             self.limit_buy_timeout_sec = int(cfg.get("limitBuyTimeoutSec", 60))
 
             # Falling-knife filter (added 2026-05-10 after Option-B backtest

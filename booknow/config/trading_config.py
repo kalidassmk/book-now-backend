@@ -31,25 +31,32 @@ logger = logging.getLogger("booknow.trading_config")
 class TradingConfig:
     """Mirrors the Java ``TradingConfig.java``.
 
-    Defaults are tuned for the user's stated style: $100 buy with a
-    fixed $0.20 USDT take-profit, fast-scalp mode on, max-hold 1 h.
+    Defaults aligned with operator's "Option B" sizing (2026-05-10):
+      $6 buy, +1.0 % TP (≈ $0.05 net per win after fees), -0.65 % limit-buy
+      offset, patient hold (no tight stop). Fast-scalp mode on.
     """
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 30.0      # 2026-05-10: aligned with operator's small-scalp config
+    buyAmountUsdt: float = 6.0       # 2026-05-10: Option B sizing (was 30.0)
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
-    # 0.267 % = $0.08 gross / $0.02 net per win on a $30 buy.
-    profitPct: float = 0.267
+    # 1.0 % = $0.06 gross / ≈$0.05 net per win on a $6 buy after 0.2 %
+    # round-trip Binance fees.
+    profitPct: float = 1.0
     profitAmountUsdt: float = 0.0
 
     # ── Stop loss (Fast Scalper consumes; Virtual Scalper too) ──────────
-    stopLossUsdt: float = 0.30       # exit when unrealized loss reaches this USDT
+    # Scaled to 1 % of $6 buy = $0.06; Option B is patient, but a stop
+    # remains in case the falling-knife filter ever lets a bad coin through.
+    stopLossUsdt: float = 0.06       # exit when unrealized loss reaches this USDT
 
     # ── Order placement ──────────────────────────────────────────────────
-    limitBuyOffsetPct: float = 0.09  # buy this % below market signal
+    # 0.65 % limit-buy offset comes from the 2026-05-10 backtest: that is
+    # where dips actually fill (≈ 60 % fill rate in 60 min) AND the +1 % TP
+    # is reachable (≈ 42 % TP-hit rate of fills).
+    limitBuyOffsetPct: float = 0.65  # buy this % below market signal
     limitBuyTimeoutSec: int = 60     # cancel limit-buy if not filled in this window
     tslPct: float = 2.0              # trailing stop-loss (legacy)
 
