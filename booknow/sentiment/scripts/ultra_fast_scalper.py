@@ -315,7 +315,7 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 100.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 30.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
             profit_pct = float(cfg.get("profitPct", 0.0) or 0.0)

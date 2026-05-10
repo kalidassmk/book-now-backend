@@ -62,7 +62,7 @@ class BinanceExecutor:
     """
 
     def __init__(self, api_key: str = "", api_secret: str = "",
-                 live: bool = False, trade_amount_usdt: float = 100.0):
+                 live: bool = False, trade_amount_usdt: float = 30.0):
         self.api_key = api_key
         self.api_secret = api_secret
         self.live = live

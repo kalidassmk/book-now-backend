@@ -53,7 +53,7 @@ Examples:
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading pair (default: BTCUSDT)")
     parser.add_argument("--interval", default="5m", help="Kline interval (default: 5m)")
     parser.add_argument("--period", type=int, default=14, help="Indicator period (default: 14)")
-    parser.add_argument("--amount", type=float, default=100.0, help="Trade amount in USDT (default: 100)")
+    parser.add_argument("--amount", type=float, default=30.0, help="Trade amount in USDT (default: 30)")
     parser.add_argument("--live", action="store_true", help="Enable live trading")
     parser.add_argument("--api-key", default=os.getenv("BINANCE_API_KEY", ""), help="Binance API key")
     parser.add_argument("--api-secret", default=os.getenv("BINANCE_SECRET_KEY", ""), help="Binance API secret")

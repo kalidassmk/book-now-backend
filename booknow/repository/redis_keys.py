@@ -89,7 +89,7 @@ FINAL_CONSENSUS_STATE       = "FINAL_CONSENSUS_STATE"       # hash
 TRADING_FEE_INTELLIGENCE    = "TRADING_FEE_INTELLIGENCE"    # JSON value
 
 # ── Defaults (also held in TradingConfig in Redis; these are fallbacks) ─
-BUY_AMOUNT_USDT_DEFAULT     = 100.0
+BUY_AMOUNT_USDT_DEFAULT     = 30.0
 SELL_PCT_RULE_1_FULL        = 5.0
 SELL_PCT_RULE_1_FAST        = 3.5
 SELL_PCT_RULE_2             = 7.0
