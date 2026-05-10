@@ -27,10 +27,14 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
-DEFAULT_BUY_AMOUNT_USDT = 100.0
-DEFAULT_PROFIT_TARGET_USDT = 0.20    # legacy USDT target — only used when profitPct == 0
-DEFAULT_PROFIT_PCT = 0.50            # % above entry; matches the user's scalping formula
-DEFAULT_LIMIT_OFFSET_PCT = 0.50      # % below signal price; from same formula
+# Defaults tuned for $30 trades aiming at ~$0.02 NET profit per win
+# (gross 0.267 %, fees consume 0.2 % round-trip → +$0.02 net on $30).
+# If Redis TRADING_CONFIG is wiped these defaults take over instead
+# of the old $100 / 0.5 % values that triggered the 2026-05-09 blow-up.
+DEFAULT_BUY_AMOUNT_USDT = 30.0
+DEFAULT_PROFIT_TARGET_USDT = 0.08    # legacy USDT target — only used when profitPct == 0
+DEFAULT_PROFIT_PCT = 0.267           # % above entry → $0.02 NET on $30 buy
+DEFAULT_LIMIT_OFFSET_PCT = 0.09      # % below signal price; tight enough to actually fill
 
 # Risk Settings for Virtual Scalper
 SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience

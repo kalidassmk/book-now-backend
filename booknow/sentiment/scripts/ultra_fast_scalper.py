@@ -72,10 +72,15 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
+        # Defaults tuned for $30 trades aiming at ~$0.02 NET profit per win
+        # (gross $0.08 = 0.267 % of $30, after $0.06 round-trip fees).
+        # If Redis TRADING_CONFIG is ever wiped, these defaults take over —
+        # we never want a fallback to the old $100 / $0.20 settings that
+        # blindsided the operator on 2026-05-09.
         self.auto_enabled = True
-        self.buy_amount_usdt = 100.0
-        self.profit_target_usdt = 0.20
-        self.stop_loss_usdt = 0.50
+        self.buy_amount_usdt = 30.0
+        self.profit_target_usdt = 0.08
+        self.stop_loss_usdt = 0.30
 
         # Market-context filters (derived from yesterday's P&L analysis).
         # Hot-reloaded from TRADING_CONFIG so thresholds can be tuned
