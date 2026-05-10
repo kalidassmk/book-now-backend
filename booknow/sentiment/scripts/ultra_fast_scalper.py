@@ -84,6 +84,12 @@ class MultiSymbolScalper:
         self.min_range_24h_pct  = 5.0     # skip too-quiet coins (TP unlikely)
         self.min_vol_24h_usd    = 2_000_000  # liquidity floor
 
+        # Limit-buy entry tunables (replaces the old market-buy path).
+        # Operator can switch between market and limit by setting
+        # limitBuyOffsetPct to 0 (or negative) → market buy fallback.
+        self.limit_buy_offset_pct = 0.09     # default 0.09 % below signal price
+        self.limit_buy_timeout_sec = 60      # cancel if not filled
+
         # Filter cache
         self.filters = {} # symbol -> {step_size, tick_size, min_notional}
 
@@ -322,6 +328,13 @@ class MultiSymbolScalper:
             self.min_change_24h_pct = float(cfg.get("minChange24hPct", -1.0))
             self.min_range_24h_pct  = float(cfg.get("minRange24hPct", 5.0))
             self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 2_000_000))
+
+            # Limit-buy entry params (set offset to 0 or negative to fall
+            # back to market buys). Same Redis key the dashboard already
+            # writes for Virtual Scalper, so both engines use the same
+            # offset and the operator only has one knob to tune.
+            self.limit_buy_offset_pct = float(cfg.get("limitBuyOffsetPct", 0.09))
+            self.limit_buy_timeout_sec = int(cfg.get("limitBuyTimeoutSec", 60))
         except Exception as e:
             log.warning("sync_config failed (continuing with last values): %s", e)
 
@@ -530,14 +543,54 @@ class MultiSymbolScalper:
         try:
             if symbol not in self.filters: await self.fetch_filters(symbol)
             f = self.filters[symbol]
-            
-            qty = self.round_step(self.buy_amount_usdt / price, f['step_size'])
-            if (qty * price) < f['min_notional']: return
 
-            log.info(f"🛒 [SCALPER] Buying {symbol} @ {price}")
-            order = await self.client.create_market_buy_order(symbol, qty)
+            # ── LIMIT BUY entry (replaces market buy) ─────────────────
+            # Per operator request 2026-05-10: enter via LIMIT at
+            # limit_buy_offset_pct below signal price, wait up to
+            # limit_buy_timeout_sec for fill, otherwise cancel and skip.
+            # Set offset to 0 or negative to fall back to MARKET buy.
+            order = None
+            if self.limit_buy_offset_pct > 0:
+                tick = f.get('tick_size') or 0.00000001
+                limit_price = self.round_step(price * (1 - self.limit_buy_offset_pct / 100.0), tick)
+                qty = self.round_step(self.buy_amount_usdt / limit_price, f['step_size'])
+                if (qty * limit_price) < f['min_notional']:
+                    return
 
-            # Per-fill audit. Binance market buys often split across
+                log.info(f"🛒 [SCALPER] LIMIT BUY {symbol} qty={qty} @ {limit_price} "
+                         f"(-{self.limit_buy_offset_pct}% from {price}, timeout={self.limit_buy_timeout_sec}s)")
+                placed = await self.client.create_limit_buy_order(symbol, qty, limit_price)
+                order_id = placed.get('id')
+                if not order_id:
+                    log.warning(f"⚠️ LIMIT BUY {symbol} returned no order id")
+                    return
+
+                # Poll for fill
+                deadline = time.time() + self.limit_buy_timeout_sec
+                while time.time() < deadline:
+                    await asyncio.sleep(1)
+                    o = await self.client.fetch_order(order_id, symbol)
+                    if (o.get('status') or '').lower() == 'closed':
+                        order = o
+                        break
+
+                if order is None:
+                    # Cancel the unfilled (or partially-filled) order so we
+                    # don't leak a resting bid sitting on the book.
+                    try:
+                        await self.client.cancel_order(order_id, symbol)
+                    except Exception:
+                        pass
+                    log.info(f"⏰ LIMIT BUY {symbol} expired without fill — cancelled")
+                    return
+            else:
+                # Fallback to market buy when offset is 0 or negative.
+                qty = self.round_step(self.buy_amount_usdt / price, f['step_size'])
+                if (qty * price) < f['min_notional']: return
+                log.info(f"🛒 [SCALPER] MARKET BUY {symbol} qty={qty} @ {price} (offset disabled)")
+                order = await self.client.create_market_buy_order(symbol, qty)
+
+            # Per-fill audit. Binance buy orders often split across
             # several price levels — log each so the operator can
             # verify the bot's avg-price math against the actual fills.
             for i, fl in enumerate(order.get('fills') or []):
