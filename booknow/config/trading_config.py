@@ -90,6 +90,18 @@ class TradingConfig:
     overboughtSkipEnabled: bool = True # skip if 24h>0 AND 60m>+1.5%
     overbought60mPct: float = 1.5      # 60m threshold for overbought combo
 
+    # ── Fast-drop-without-volume filter (Pattern C, post-signal) ─────────
+    # 2026-05-10 trajectory analysis showed BIO/SOPH (today's losers) both
+    # dropped to -0.5% within minutes of signal WITHOUT a volume surge,
+    # while winner JOE crossed -1% just as fast but had a 28× volume
+    # explosion (panic capitulation → bounce). This filter monitors price
+    # + volume during the limit-buy wait and CANCELS the order if the
+    # bad pattern fires — saving us from filling into a slow bleed.
+    fastDropFilterEnabled: bool = True
+    fastDropDetectMinutes: int = 3        # how long after signal we watch
+    fastDropThresholdPct: float = 0.5     # price must dip >= this % below signal
+    volSurgeThresholdMultiplier: float = 2.0  # vol-1m / pre-baseline must exceed this to keep order
+
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
 

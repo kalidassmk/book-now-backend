@@ -121,6 +121,14 @@ class MultiSymbolScalper:
         self.fk_overbought_skip = True
         self.fk_overbought_60m_pct = 1.5
 
+        # Fast-drop-without-volume filter (Pattern C). Watches price +
+        # volume during the limit-buy wait window and cancels the order
+        # if the coin is bleeding without capitulation volume.
+        self.fd_enabled = True
+        self.fd_detect_minutes = 3
+        self.fd_threshold_pct = 0.5
+        self.fd_vol_surge_mult = 2.0
+
         # Metrics collector — bound after Redis connects.
         self.metrics = None
 
@@ -387,10 +395,73 @@ class MultiSymbolScalper:
             self.fk_max_range_1h_pct = float(cfg.get("maxRange1hPct", 6.0))
             self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
             self.fk_overbought_60m_pct = float(cfg.get("overbought60mPct", 1.5))
+
+            # Fast-drop-without-volume filter (Pattern C). Cancels the
+            # limit-buy if price falls fast in the first few minutes
+            # without a corresponding volume surge.
+            self.fd_enabled = bool(cfg.get("fastDropFilterEnabled", True))
+            self.fd_detect_minutes = int(cfg.get("fastDropDetectMinutes", 3))
+            self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
+            self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
+
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception as e:
             log.warning("sync_config failed (continuing with last values): %s", e)
+
+    def _update_trajectory_metrics(self, symbol, pos, curr_row):
+        """Persist post-fill trajectory features to METRICS:OUTCOME so the
+        dashboard can render a live BtmDrop% / MaxRise% / Vol1m-ratio per
+        coin. Best-effort — silently no-ops if metrics are off or Redis
+        misbehaves."""
+        if self.metrics is None or not self.metrics.enabled or not self.redis:
+            return
+        try:
+            buy_price = float(pos.get('buy_price') or 0)
+            if buy_price <= 0:
+                return
+            high = float(curr_row.get('high', curr_row.get('close')) or 0)
+            low = float(curr_row.get('low', curr_row.get('close')) or 0)
+            close = float(curr_row.get('close') or 0)
+            vol_base = float(curr_row.get('vol') or 0)
+
+            from datetime import datetime as _dt
+            date = _dt.utcnow().strftime("%Y-%m-%d")
+            outcome_key = f"METRICS:OUTCOME:{date}:{symbol.replace('/', '')}"
+
+            # Read existing extrema; only widen them.
+            prev = self.redis.hmget(outcome_key, 'bottom_pct', 'max_pct', 'pre_vol_baseline_usdt')
+            prev_btm = float(prev[0]) if prev[0] else 0.0
+            prev_max = float(prev[1]) if prev[1] else 0.0
+            pre_baseline = float(prev[2]) if prev[2] else 0.0
+
+            new_btm = (low - buy_price) / buy_price * 100 if low > 0 else prev_btm
+            new_max = (high - buy_price) / buy_price * 100 if high > 0 else prev_max
+            now_pct = (close - buy_price) / buy_price * 100 if close > 0 else 0
+
+            updates = {
+                'now_pct':  round(now_pct, 4),
+                'last_tick_ts': int(time.time() * 1000),
+            }
+            if low > 0 and new_btm < prev_btm:
+                updates['bottom_pct'] = round(new_btm, 4)
+                updates['bottom_ts'] = int(time.time() * 1000)
+            if high > 0 and new_max > prev_max:
+                updates['max_pct'] = round(new_max, 4)
+                updates['max_ts'] = int(time.time() * 1000)
+
+            # Vol-1m / pre-baseline ratio (proxy for capitulation strength).
+            if pre_baseline > 0 and close > 0 and vol_base > 0:
+                vol_usdt = close * vol_base
+                ratio = vol_usdt / pre_baseline
+                updates['vol_1m_usdt'] = round(vol_usdt, 2)
+                updates['vol_ratio'] = round(ratio, 3)
+
+            self.redis.hset(outcome_key, mapping=updates)
+            # Keep TTL aligned with metrics_collector's 30-day window.
+            self.redis.expire(outcome_key, 30 * 24 * 3600)
+        except Exception as exc:
+            log.debug(f"trajectory metrics update failed for {symbol}: {exc}")
 
     async def passes_falling_knife(self, symbol):
         """Returns (ok, features_dict). When ``ok`` is False the buy must
@@ -593,6 +664,12 @@ class MultiSymbolScalper:
             curr = df.iloc[-1]
             pnl = (curr['close'] - pos['buy_price']) * pos['qty']
 
+            # Track post-fill trajectory in METRICS:OUTCOME so the
+            # dashboard can show how the price has moved since fill.
+            # We update bottom_pct (lowest), max_pct (highest), and
+            # the most recent vol-1m / pre-baseline ratio.
+            self._update_trajectory_metrics(symbol, pos, curr)
+
             # 1b. Trend reversal exit always wins — even when OCO is
             # active. We cancel the resting orders so a later TP/SL fill
             # doesn't double-sell, then market-sell.
@@ -675,14 +752,74 @@ class MultiSymbolScalper:
                     log.warning(f"⚠️ LIMIT BUY {symbol} returned no order id")
                     return
 
-                # Poll for fill
-                deadline = time.time() + self.limit_buy_timeout_sec
+                # Pre-signal volume baseline used by the fast-drop pattern
+                # check (one number, captured at signal time inside the
+                # MarketFeatures snapshot).
+                signal_price = price
+                signal_ts = time.time()
+                vol_baseline = 0.0
+                if features:
+                    vol_baseline = float(features.get("pre_vol_baseline_usdt") or 0)
+
+                # Poll for fill — also runs the fast-drop trajectory check
+                # while we wait. If the bad pattern fires we cancel the
+                # order before it can fill into a falling knife.
+                deadline = signal_ts + self.limit_buy_timeout_sec
+                fd_deadline = signal_ts + self.fd_detect_minutes * 60
+                fd_cancelled = False
                 while time.time() < deadline:
                     await asyncio.sleep(1)
                     o = await self.client.fetch_order(order_id, symbol)
                     if (o.get('status') or '').lower() == 'closed':
                         order = o
                         break
+
+                    # Fast-drop check, only inside the detection window.
+                    if (self.fd_enabled and vol_baseline > 0
+                            and time.time() <= fd_deadline):
+                        try:
+                            tk = await self.client.fetch_ticker(symbol)
+                            last = float(tk.get("last") or 0)
+                        except Exception:
+                            last = 0
+                        if last > 0:
+                            drop_pct = (last - signal_price) / signal_price * 100
+                            if drop_pct <= -self.fd_threshold_pct:
+                                # Price has bled past the threshold. Now
+                                # measure live vol-1m vs the pre-signal
+                                # baseline. If volume is NOT surging, we
+                                # treat this as Pattern C (slow bleed).
+                                try:
+                                    rec = await self.client.fetch_ohlcv(symbol, "1m", limit=1)
+                                except Exception:
+                                    rec = []
+                                vol_1m = 0.0
+                                if rec:
+                                    close = float(rec[-1][4] or 0)
+                                    base_vol = float(rec[-1][5] or 0)
+                                    if close and base_vol:
+                                        vol_1m = close * base_vol
+                                vol_ratio = (vol_1m / vol_baseline) if vol_baseline > 0 else 0
+                                if vol_ratio < self.fd_vol_surge_mult:
+                                    log.info(f"🔪🩸 [{symbol}] fast-drop {drop_pct:+.2f}% "
+                                             f"vol={vol_ratio:.2f}x baseline → cancel")
+                                    try:
+                                        await self.client.cancel_order(order_id, symbol)
+                                    except Exception:
+                                        pass
+                                    fd_cancelled = True
+                                    if self.metrics is not None:
+                                        reason = (f"fast-drop {drop_pct:+.2f}% within "
+                                                  f"{self.fd_detect_minutes}m, vol "
+                                                  f"{vol_ratio:.2f}x < {self.fd_vol_surge_mult}x")
+                                        self.metrics.signal_skipped(
+                                            symbol, "fast_drop_no_volume", reason,
+                                            features or {},
+                                        )
+                                    break
+
+                if fd_cancelled:
+                    return
 
                 if order is None:
                     # Cancel the unfilled (or partially-filled) order so we
@@ -796,6 +933,18 @@ class MultiSymbolScalper:
                                         features=features, order_type=order_type,
                                         offset_pct=self.limit_buy_offset_pct)
                 self.metrics.fill_recorded(symbol, exec_price, sellable_qty)
+                # Stamp the pre-signal volume baseline directly on the
+                # OUTCOME hash so trajectory ticks can compute vol_ratio
+                # without re-reading features.
+                try:
+                    pre_baseline = float((features or {}).get("pre_vol_baseline_usdt") or 0)
+                    if pre_baseline > 0:
+                        from datetime import datetime as _dt
+                        date = _dt.utcnow().strftime("%Y-%m-%d")
+                        outcome_key = f"METRICS:OUTCOME:{date}:{symbol.replace('/', '')}"
+                        self.redis.hset(outcome_key, "pre_vol_baseline_usdt", pre_baseline)
+                except Exception:
+                    pass
         except Exception as e:
             log.error(f"❌ Buy {symbol} failed: {e}")
 

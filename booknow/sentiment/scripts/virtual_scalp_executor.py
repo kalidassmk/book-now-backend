@@ -76,6 +76,12 @@ class VirtualScalpExecutor:
         # MAX_VIRTUAL_LOSS_USDT below are bypassed (Option B patient hold).
         self.stop_loss_usdt = 0.0
 
+        # Fast-drop-without-volume filter (Pattern C). Mirrors Fast Scalper.
+        self.fd_enabled = True
+        self.fd_detect_minutes = 3
+        self.fd_threshold_pct = 0.5
+        self.fd_vol_surge_mult = 2.0
+
         # Metrics collector — same Redis as everything else.
         self.metrics = make_collector(self.r, enabled=True) if make_collector else None
 
@@ -126,6 +132,11 @@ class VirtualScalpExecutor:
                 self.fk_overbought_60m = float(cfg.get("overbought60mPct", 1.5))
                 # Stop-loss config (0 = disabled, matches Fast Scalper).
                 self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
+                # Fast-drop-without-volume filter knobs.
+                self.fd_enabled = bool(cfg.get("fastDropFilterEnabled", True))
+                self.fd_detect_minutes = int(cfg.get("fastDropDetectMinutes", 3))
+                self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
+                self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception:
@@ -202,12 +213,23 @@ class VirtualScalpExecutor:
             origin = prices[0]
             change_24h_pct = (curr - origin) / origin * 100 if origin else 0
 
+            # Pre-signal USDT-volume baseline = avg per-tick (price × vol)
+            # over the last 60 ticks. Used by the fast-drop filter to
+            # decide whether a quick down-move is real capitulation.
+            usdt_vols = []
+            for t in timeline[-60:]:
+                p = float(t.get("price") or 0); v = float(t.get("volume") or 0)
+                if p > 0 and v > 0:
+                    usdt_vols.append(p * v)
+            pre_vol_baseline_usdt = (sum(usdt_vols) / len(usdt_vols)) if usdt_vols else 0.0
+
             features = {
                 "symbol": symbol, "price": curr,
                 "change_24h_pct": change_24h_pct,
                 "change_1h_pct": change_1h_pct,
                 "range_1h_pct": range_1h_pct,
                 "high_1h": hi_1h, "low_1h": lo_1h,
+                "pre_vol_baseline_usdt": pre_vol_baseline_usdt,
             }
 
             if change_24h_pct > self.fk_max_24h:
@@ -407,6 +429,11 @@ class VirtualScalpExecutor:
         - live: poll Binance for the actual order state; on FILLED mark
           OPEN with the real fill price; on CANCELED/EXPIRED drop the
           position; on timeout cancel the order on Binance and drop.
+
+        Both modes also run the fast-drop pattern check (Pattern C):
+        if price falls past the threshold within the detection window
+        AND volume isn't surging, cancel the order — we don't want to
+        fill into a coin that's bleeding without capitulation.
         """
         all_pos = self.r.hgetall(VIRTUAL_POSITIONS_KEY)
         now_ts = time.time()
@@ -420,6 +447,11 @@ class VirtualScalpExecutor:
 
             elapsed = now_ts - pos.get('signal_timestamp', now_ts)
             mode = pos.get('mode', 'paper')
+
+            # Fast-drop check applies to both modes — cancel before fill.
+            if self._fast_drop_should_cancel(symbol, pos, elapsed):
+                self._cancel_pending_due_to_fast_drop(symbol, pos)
+                continue
 
             if mode == 'live':
                 self._sweep_pending_live(symbol, pos, elapsed)
@@ -436,6 +468,113 @@ class VirtualScalpExecutor:
                 continue
             if curr_price <= pos['limit_price']:
                 self._fill_pending_limit(symbol, pos, curr_price, elapsed)
+
+    def _fast_drop_should_cancel(self, symbol, pos, elapsed) -> bool:
+        """Return True iff the limit-buy should be cancelled because the
+        coin is falling fast WITHOUT a volume surge (Pattern C)."""
+        if not self.fd_enabled:
+            return False
+        if elapsed > self.fd_detect_minutes * 60:
+            return False
+        baseline = float((pos.get('features') or {}).get('pre_vol_baseline_usdt') or 0)
+        if baseline <= 0:
+            return False
+        signal_price = float(pos.get('signal_price') or 0)
+        if signal_price <= 0:
+            return False
+        curr = self._current_price(symbol)
+        if not curr or curr <= 0:
+            return False
+        drop_pct = (curr - signal_price) / signal_price * 100
+        if drop_pct > -self.fd_threshold_pct:
+            return False  # not a fast drop yet
+
+        # Volume estimate from the latest analyser tick — same source
+        # as _current_price uses, so consistent.
+        try:
+            raw = self.r.hget(ANALYSIS_020_KEY, symbol.replace('/', ''))
+            if not raw:
+                return False
+            tl = json.loads(raw)
+            tail = tl[-12:] if len(tl) >= 12 else tl   # ~last 12 ticks
+            tail_usdt = []
+            for t in tail:
+                p = float(t.get('price') or 0); v = float(t.get('volume') or 0)
+                if p > 0 and v > 0:
+                    tail_usdt.append(p * v)
+            if not tail_usdt:
+                return False
+            recent_per_tick = sum(tail_usdt) / len(tail_usdt)
+        except Exception:
+            return False
+
+        ratio = recent_per_tick / baseline if baseline > 0 else 0
+        return ratio < self.fd_vol_surge_mult
+
+    def _update_trajectory_metrics(self, symbol, pos, curr_price, curr_vol):
+        """Persist running BtmDrop% / MaxRise% / vol-ratio into the
+        per-coin OUTCOME hash so the dashboard can render a live
+        trajectory. Best-effort (Redis hiccups never crash the loop)."""
+        if self.metrics is None or not self.metrics.enabled:
+            return
+        try:
+            entry = float(pos.get('entry_price') or 0)
+            if entry <= 0 or curr_price <= 0:
+                return
+            now_pct = (curr_price - entry) / entry * 100
+
+            from datetime import datetime as _dt
+            date = _dt.utcnow().strftime("%Y-%m-%d")
+            key = f"METRICS:OUTCOME:{date}:{symbol.replace('/', '')}"
+            prev = self.r.hmget(key, 'bottom_pct', 'max_pct', 'pre_vol_baseline_usdt')
+            prev_btm = float(prev[0]) if prev[0] else 0.0
+            prev_max = float(prev[1]) if prev[1] else 0.0
+            baseline = float(prev[2]) if prev[2] else float(
+                (pos.get('features') or {}).get('pre_vol_baseline_usdt') or 0
+            )
+
+            updates = {
+                'now_pct': round(now_pct, 4),
+                'last_tick_ts': int(time.time() * 1000),
+            }
+            if now_pct < prev_btm:
+                updates['bottom_pct'] = round(now_pct, 4)
+                updates['bottom_ts'] = int(time.time() * 1000)
+            if now_pct > prev_max:
+                updates['max_pct'] = round(now_pct, 4)
+                updates['max_ts'] = int(time.time() * 1000)
+
+            # Vol-1m proxy: most recent tick volume × price.
+            if baseline > 0 and curr_vol > 0:
+                vol_usdt = curr_price * curr_vol
+                updates['vol_1m_usdt'] = round(vol_usdt, 2)
+                updates['vol_ratio'] = round(vol_usdt / baseline, 3)
+                # Stamp baseline once so trajectory can read it later.
+                if not prev[2]:
+                    updates['pre_vol_baseline_usdt'] = round(baseline, 2)
+
+            self.r.hset(key, mapping=updates)
+            self.r.expire(key, 30 * 24 * 3600)
+        except Exception:
+            pass
+
+    def _cancel_pending_due_to_fast_drop(self, symbol, pos):
+        """Cancel the resting LIMIT (live) and clear the row."""
+        order_id = pos.get('order_id')
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        if order_id and self.client is not None:
+            try:
+                self.client.cancel_order(order_id, ccxt_sym)
+            except Exception as e:
+                print(f"⚠️ [FAST-DROP CANCEL] {symbol} cancel failed: {e}")
+        self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+        print(f"🔪🩸 [FAST-DROP CANCEL] {symbol} cancelled before fill (no vol surge)")
+        if self.metrics is not None:
+            self.metrics.signal_skipped(
+                symbol, "fast_drop_no_volume",
+                "fast drop within detection window without volume surge",
+                pos.get('features') or {},
+            )
 
     def _sweep_pending_live(self, symbol, pos, elapsed):
         """Query Binance for a live PENDING_LIMIT order's current state."""
@@ -710,6 +849,9 @@ class VirtualScalpExecutor:
         if pnl_pct < pos['max_drawdown']:
             pos['max_drawdown'] = pnl_pct
             self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
+
+        # Live trajectory metrics for the dashboard
+        self._update_trajectory_metrics(symbol, pos, curr_price, curr_vol)
 
         exit_reason = None
 

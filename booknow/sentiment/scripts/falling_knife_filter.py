@@ -52,6 +52,13 @@ class MarketFeatures:
     from_24h_high_pct: float    # e.g. -5.9 = 5.9% below 24h peak
     from_1h_high_pct: float
 
+    # Per-minute USDT-volume baseline over the last 60 min. Used by the
+    # post-signal "fast-drop without volume" rule (Pattern C from the
+    # 2026-05-10 trajectory analysis): a quick down-move with low
+    # relative volume = orderly bleed → keeps falling. A quick down-move
+    # with high relative volume = capitulation → snap-back likely.
+    pre_vol_baseline_usdt: float = 0.0
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -114,6 +121,14 @@ async def compute_features(client, symbol: str) -> Optional[MarketFeatures]:
     from_24h_high_pct = (last_price - high_24h) / high_24h * 100 if high_24h else 0
     from_1h_high_pct = (last_price - high_1h) / high_1h * 100 if high_1h else 0
 
+    # USDT-volume baseline = avg per-minute (close × volume) over last 60m
+    minute_usdt = []
+    for c_ in candles:
+        close = float(c_[4] or 0); vol = float(c_[5] or 0)
+        if close > 0 and vol > 0:
+            minute_usdt.append(close * vol)
+    pre_vol_baseline_usdt = (sum(minute_usdt) / len(minute_usdt)) if minute_usdt else 0.0
+
     return MarketFeatures(
         symbol=symbol,
         price=last_price,
@@ -127,6 +142,7 @@ async def compute_features(client, symbol: str) -> Optional[MarketFeatures]:
         change_1h_pct=change_1h_pct,
         from_24h_high_pct=from_24h_high_pct,
         from_1h_high_pct=from_1h_high_pct,
+        pre_vol_baseline_usdt=pre_vol_baseline_usdt,
     )
 
 
