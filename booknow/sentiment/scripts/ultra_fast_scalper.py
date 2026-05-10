@@ -322,7 +322,7 @@ class MultiSymbolScalper:
             if profit_pct > 0:
                 self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
             else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.20))
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.02))
 
             # Stop loss: explicit USDT; if absent, default to 1 % of trade size.
             self.stop_loss_usdt = float(cfg.get("stopLossUsdt", self.buy_amount_usdt * 0.01))
