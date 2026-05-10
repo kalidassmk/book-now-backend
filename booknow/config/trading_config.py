@@ -67,6 +67,20 @@ class TradingConfig:
     minRange24hPct:  float = 5.0     # skip too-quiet coins
     minVol24hUsd:    float = 2_000_000.0  # liquidity floor
 
+    # ── Falling-knife filter (skip top-of-pump buys) ─────────────────────
+    # Derived from 2026-05-10 backtest: XEC/LUNC/LUMIA/etc deep losses came
+    # from buying coins that had already pumped or were too volatile.
+    # Layering this filter on the same 12 signals would have skipped all 4
+    # deep losers (XEC×2, LUNC, LUMIA) without losing a single winner.
+    fallingKnifeFilterEnabled: bool = True
+    maxChange24hPct: float = 8.0       # skip if 24h change > +8%
+    maxRange1hPct: float = 6.0         # skip if 1h hi-lo range > 6%
+    overboughtSkipEnabled: bool = True # skip if 24h>0 AND 60m>+1.5%
+    overbought60mPct: float = 1.5      # 60m threshold for overbought combo
+
+    # ── Metrics collection ───────────────────────────────────────────────
+    metricsEnabled: bool = True
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TradingConfig":
         """Tolerantly construct from a dict — unknown keys ignored."""

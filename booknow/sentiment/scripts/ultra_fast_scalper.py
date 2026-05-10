@@ -19,6 +19,22 @@ try:
 except Exception:
     KlinesCache = None  # type: ignore
 
+# Falling-knife filter (skip top-of-pump buys). Ships with the scalper
+# but is import-safe — older deploys without the helper still run.
+try:
+    from falling_knife_filter import compute_features as _fk_compute_features
+    from falling_knife_filter import evaluate as _fk_evaluate
+except Exception:
+    _fk_compute_features = None  # type: ignore
+    _fk_evaluate = None  # type: ignore
+
+# Metrics collector — captures every signal/skip/buy/fill/exit into Redis
+# for the new dashboard metrics page.
+try:
+    from metrics_collector import make_collector
+except Exception:
+    make_collector = None  # type: ignore
+
 def manual_load_dotenv(path):
     if not os.path.exists(path): return
     with open(path, 'r') as f:
@@ -95,6 +111,17 @@ class MultiSymbolScalper:
         self.limit_buy_offset_pct = 0.09     # default 0.09 % below signal price
         self.limit_buy_timeout_sec = 60      # cancel if not filled
 
+        # Falling-knife filter (added 2026-05-10). Hot-reloaded from
+        # TRADING_CONFIG so the operator can tune live.
+        self.fk_enabled = True
+        self.fk_max_change_24h_pct = 8.0
+        self.fk_max_range_1h_pct = 6.0
+        self.fk_overbought_skip = True
+        self.fk_overbought_60m_pct = 1.5
+
+        # Metrics collector — bound after Redis connects.
+        self.metrics = None
+
         # Filter cache
         self.filters = {} # symbol -> {step_size, tick_size, min_notional}
 
@@ -122,6 +149,11 @@ class MultiSymbolScalper:
             log.info("🔗 Connected to Redis.")
         except Exception as e:
             log.error(f"❌ Redis Connection Failed: {e}")
+
+        # Metrics collector — uses the same Redis as everything else.
+        if make_collector is not None and self.redis is not None:
+            self.metrics = make_collector(self.redis, enabled=True)
+            log.info("📈 Metrics collector enabled.")
 
         # 2. Fetch API Keys (Redis Priority -> Env Fallback)
         redis_key = None
@@ -340,8 +372,51 @@ class MultiSymbolScalper:
             # offset and the operator only has one knob to tune.
             self.limit_buy_offset_pct = float(cfg.get("limitBuyOffsetPct", 0.09))
             self.limit_buy_timeout_sec = int(cfg.get("limitBuyTimeoutSec", 60))
+
+            # Falling-knife filter (added 2026-05-10 after Option-B backtest
+            # showed XEC/LUNC/LUMIA were all bought near a peak/pump).
+            # Layered on top of the existing 24h market-context filter.
+            self.fk_enabled = bool(cfg.get("fallingKnifeFilterEnabled", True))
+            self.fk_max_change_24h_pct = float(cfg.get("maxChange24hPct", 8.0))
+            self.fk_max_range_1h_pct = float(cfg.get("maxRange1hPct", 6.0))
+            self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
+            self.fk_overbought_60m_pct = float(cfg.get("overbought60mPct", 1.5))
+            if self.metrics is not None:
+                self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception as e:
             log.warning("sync_config failed (continuing with last values): %s", e)
+
+    async def passes_falling_knife(self, symbol):
+        """Returns (ok, features_dict). When ``ok`` is False the buy must
+        be skipped — the filter found a top-of-pump / overbought / volatile
+        setup. On any error we fall back to ``ok=True`` to avoid a Binance
+        hiccup silently disabling the filter."""
+        if _fk_compute_features is None or _fk_evaluate is None:
+            return True, None
+        if not self.fk_enabled:
+            return True, None
+        try:
+            features = await _fk_compute_features(self.client, symbol)
+            if features is None:
+                return True, None
+            verdict = _fk_evaluate(
+                features,
+                enabled=True,
+                max_change_24h_pct=self.fk_max_change_24h_pct,
+                max_range_1h_pct=self.fk_max_range_1h_pct,
+                overbought_skip=self.fk_overbought_skip,
+                overbought_60m_pct=self.fk_overbought_60m_pct,
+            )
+            if not verdict.passed:
+                log.info(f"🔪 [{symbol}] skipped by filter ({verdict.rule}): {verdict.reason}")
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, verdict.rule, verdict.reason,
+                                                features.to_dict())
+                return False, features.to_dict()
+            return True, features.to_dict()
+        except Exception as exc:
+            log.debug(f"falling_knife fetch failed for {symbol}: {exc}")
+            return True, None
 
     async def get_indicators(self, symbol: str):
         """Fetch data and compute indicators for a symbol."""
@@ -532,13 +607,26 @@ class MultiSymbolScalper:
         ticker_24h = await self._fetch_24h_ticker(symbol)
         should_buy, matrix = self.evaluate_entry(symbol, df, btc_df, ticker_24h=ticker_24h)
 
+        last_price = df.iloc[-1]['close'] if df is not None else 0
         # Broadcast detailed matrix
-        self.broadcast_signal(symbol, "BUY" if should_buy else "NEUTRAL", df.iloc[-1]['close'] if df is not None else 0, matrix)
+        self.broadcast_signal(symbol, "BUY" if should_buy else "NEUTRAL", last_price, matrix)
 
         if should_buy:
-            await self.execute_buy(symbol, df.iloc[-1]['close'])
+            # Layer the falling-knife filter on top of evaluate_entry. The
+            # built-in 24h filter already catches downtrend/illiquid coins;
+            # this catches buying a top after a recent pump.
+            ok, features = await self.passes_falling_knife(symbol)
+            if self.metrics is not None:
+                self.metrics.signal_evaluated(
+                    symbol, last_price,
+                    features=features,
+                    decision="pass" if ok else "skipped",
+                )
+            if not ok:
+                return
+            await self.execute_buy(symbol, last_price, features=features)
 
-    async def execute_buy(self, symbol, price):
+    async def execute_buy(self, symbol, price, features=None):
         if not self.auto_enabled:
             return
 
@@ -669,6 +757,13 @@ class MultiSymbolScalper:
             self._persist_position(symbol)  # mirror to Redis for restart safety
             mode_tag = f"oco={oco_list_id}" if oco_list_id else "oco=FAILED→polling"
             log.info(f"✅ [SCALPER] Bought {symbol} qty={sellable_qty} @ {exec_price} {mode_tag}")
+            if self.metrics is not None:
+                size_usdt = exec_price * sellable_qty
+                order_type = "limit" if self.limit_buy_offset_pct > 0 else "market"
+                self.metrics.buy_placed(symbol, exec_price, size_usdt,
+                                        features=features, order_type=order_type,
+                                        offset_pct=self.limit_buy_offset_pct)
+                self.metrics.fill_recorded(symbol, exec_price, sellable_qty)
         except Exception as e:
             log.error(f"❌ Buy {symbol} failed: {e}")
 
@@ -820,6 +915,17 @@ class MultiSymbolScalper:
                 "reason": "SCALPER_EXIT",
                 "exit_time": datetime.now().strftime("%H:%M:%S"),
             })
+
+            if self.metrics is not None:
+                # Tag wins/losses by sign of net PnL. We don't know whether
+                # the exit was triggered by OCO TP, OCO SL, trend reversal,
+                # or polling — mark as 'tp' only when net_pnl >= 0 so the
+                # dashboard's win/loss counters stay honest.
+                reason = "tp" if net_pnl >= 0 else "exit"
+                if reason == "tp":
+                    self.metrics.tp_hit(symbol, buy_price, exit_price)
+                self.metrics.exit_recorded(symbol, buy_price, exit_price,
+                                           reason=reason, pnl_usdt=net_pnl)
 
             self._drop_persisted_position(symbol)
             del self.active_positions[symbol]

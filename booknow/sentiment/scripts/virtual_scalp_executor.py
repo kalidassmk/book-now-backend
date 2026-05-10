@@ -15,6 +15,13 @@ except ImportError:  # pragma: no cover
 
 from booknow.util.trade_archive import archive_closed_trade
 
+# Metrics collector — captures every signal/skip/buy/fill/exit into Redis.
+# Optional import so older deploys without the helper still run.
+try:
+    from metrics_collector import make_collector
+except Exception:
+    make_collector = None  # type: ignore
+
 # --- CONFIGURATION ---
 # Read from env so Docker can point at the `redis` service while local
 # dev still defaults to 127.0.0.1. Compose sets REDIS_HOST=redis.
@@ -59,6 +66,16 @@ class VirtualScalpExecutor:
         self.client = None
         self.symbol_filters = {}     # symbol -> {step_size, tick_size, min_notional}
 
+        # Falling-knife filter knobs. Hot-reloaded by _sync_live_mode().
+        self.fk_enabled = True
+        self.fk_max_24h = 8.0
+        self.fk_max_1h_range = 6.0
+        self.fk_overbought_skip = True
+        self.fk_overbought_60m = 1.5
+
+        # Metrics collector — same Redis as everything else.
+        self.metrics = make_collector(self.r, enabled=True) if make_collector else None
+
         self._init_binance_client()
         print("🚀 [VIRTUAL SCALPER] Limit-buy + %-TP mode (1h patience).")
         print(f"   live_mode default = {self.live_mode}  client = {'ready' if self.client else 'unavailable'}")
@@ -89,14 +106,21 @@ class VirtualScalpExecutor:
             self.client = None
 
     def _sync_live_mode(self):
-        """Hot-reload live_mode flag from TRADING_CONFIG every iteration.
-        Default True — operator must explicitly set
-        ``virtualScalperLiveMode: false`` to pause live trading."""
+        """Hot-reload live_mode flag + falling-knife filter knobs from
+        TRADING_CONFIG every iteration. Default True — operator must
+        explicitly set ``virtualScalperLiveMode: false`` to pause live."""
         try:
             raw = self.r.get(TRADING_CONFIG_KEY)
             if raw:
                 cfg = json.loads(raw)
                 self.live_mode = bool(cfg.get("virtualScalperLiveMode", True))
+                self.fk_enabled = bool(cfg.get("fallingKnifeFilterEnabled", True))
+                self.fk_max_24h = float(cfg.get("maxChange24hPct", 8.0))
+                self.fk_max_1h_range = float(cfg.get("maxRange1hPct", 6.0))
+                self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
+                self.fk_overbought_60m = float(cfg.get("overbought60mPct", 1.5))
+                if self.metrics is not None:
+                    self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception:
             pass
 
@@ -146,6 +170,62 @@ class VirtualScalpExecutor:
         except Exception as e:
             print(f"⚠️ [VIRTUAL] filter fetch failed for {symbol}: {e}")
             return None
+
+    def passes_falling_knife(self, symbol, timeline):
+        """Apply the same 3 falling-knife rules used by the Fast Scalper,
+        but using the recent ANALYSIS_020_TIMELINE timeline points instead
+        of a Binance ticker. Returns ``(ok, features_dict)``.
+
+        Heuristic: timeline stores per-tick price+volume snapshots. We use
+        the last ~60 points as a 1h proxy and the entire timeline as a
+        24h proxy. Falls open (returns ok=True) if data is too sparse."""
+        if not self.fk_enabled or not timeline:
+            return True, None
+        try:
+            prices = [float(t.get("price", 0) or 0) for t in timeline]
+            prices = [p for p in prices if p > 0]
+            if len(prices) < 10:
+                return True, None
+
+            curr = prices[-1]
+            window = prices[-60:] if len(prices) >= 60 else prices
+            hi_1h = max(window); lo_1h = min(window)
+            range_1h_pct = (hi_1h - lo_1h) / lo_1h * 100 if lo_1h else 0
+            change_1h_pct = (curr - window[0]) / window[0] * 100 if window[0] else 0
+            origin = prices[0]
+            change_24h_pct = (curr - origin) / origin * 100 if origin else 0
+
+            features = {
+                "symbol": symbol, "price": curr,
+                "change_24h_pct": change_24h_pct,
+                "change_1h_pct": change_1h_pct,
+                "range_1h_pct": range_1h_pct,
+                "high_1h": hi_1h, "low_1h": lo_1h,
+            }
+
+            if change_24h_pct > self.fk_max_24h:
+                reason = f"24h change {change_24h_pct:+.2f}% > {self.fk_max_24h}%"
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "pump_24h", reason, features)
+                return False, features
+
+            if range_1h_pct > self.fk_max_1h_range:
+                reason = f"1h range {range_1h_pct:.2f}% > {self.fk_max_1h_range}%"
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "volatile_1h", reason, features)
+                return False, features
+
+            if (self.fk_overbought_skip and change_24h_pct > 0
+                    and change_1h_pct > self.fk_overbought_60m):
+                reason = (f"overbought (24h {change_24h_pct:+.2f}% AND "
+                          f"60m {change_1h_pct:+.2f}%)")
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "overbought", reason, features)
+                return False, features
+
+            return True, features
+        except Exception:
+            return True, None
 
     def _load_trading_config(self):
         """Read live TradingConfig from Redis at position-open time.
@@ -203,7 +283,16 @@ class VirtualScalpExecutor:
                         # or OPEN) for this symbol — prevents duplicate
                         # orders on hot signals.
                         if not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
-                            self.place_limit_order(symbol, curr_price)
+                            ok, features = self.passes_falling_knife(symbol, timeline)
+                            if self.metrics is not None:
+                                self.metrics.signal_evaluated(
+                                    symbol, curr_price, features=features,
+                                    decision="pass" if ok else "skipped",
+                                )
+                            if ok:
+                                self.place_limit_order(symbol, curr_price, features=features)
+                            else:
+                                print(f"🔪 [{symbol}] virtual buy skipped by filter")
 
                     self.monitor_positions(symbol, curr_price, signal, curr_vol)
 
@@ -212,7 +301,7 @@ class VirtualScalpExecutor:
                 print(f"❌ [VIRTUAL SCALPER ERROR] {e}")
                 time.sleep(5)
 
-    def place_limit_order(self, symbol, signal_price):
+    def place_limit_order(self, symbol, signal_price, features=None):
         """Place a limit-buy at limitBuyOffsetPct below signal price.
 
         In paper mode (default fallback): just stages a row in
@@ -253,6 +342,8 @@ class VirtualScalpExecutor:
             "order_id": None,
             "live_limit_price": None,
             "live_qty": None,
+            # Pre-signal market features that passed the falling-knife filter
+            "features": features or {},
         }
 
         # In live mode, place the real order BEFORE writing the position
@@ -450,6 +541,14 @@ class VirtualScalpExecutor:
         oco_tag = f" oco={pos['oco_list_id']}" if pos.get('oco_list_id') else (" oco=FAILED→polling" if pos.get('mode') == 'live' else "")
         print(f"✅ [{tag} FILLED] {symbol} fill={fill_price:.6f} qty={quantity:.6f} "
               f"(-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s{oco_tag}")
+
+        if self.metrics is not None:
+            order_type = ("virtual_live" if pos.get("mode") == "live" else "virtual_paper")
+            self.metrics.buy_placed(symbol, fill_price, pos.get('investment') or 0,
+                                    features=pos.get('features') or {},
+                                    order_type=order_type,
+                                    offset_pct=pos.get('limit_offset_pct') or 0)
+            self.metrics.fill_recorded(symbol, fill_price, quantity)
 
     # ── OCO helpers (mirror the Fast Scalper pattern) ────────────────────
 
@@ -685,6 +784,14 @@ class VirtualScalpExecutor:
         # Long-term archive on the analyse Redis (best-effort).
         kind = "VIRTUAL_LIVE" if mode == "live" else "VIRTUAL_PAPER"
         archive_closed_trade(symbol, kind, pos)
+
+        if self.metrics is not None:
+            entry_price = pos.get('entry_price', exit_price)
+            if reason == "TAKE_PROFIT":
+                latency_min = pos.get('hold_duration', 0) / 60.0
+                self.metrics.tp_hit(symbol, entry_price, exit_price, latency_min=latency_min)
+            self.metrics.exit_recorded(symbol, entry_price, exit_price,
+                                       reason=reason.lower(), pnl_usdt=net_pnl_usdt)
 
         color = "🟢" if net_pnl_usdt > 0 else "🔴"
         tag = "LIVE" if mode == "live" else "PAPER"
