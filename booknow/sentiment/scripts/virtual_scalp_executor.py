@@ -695,19 +695,38 @@ class VirtualScalpExecutor:
     def _place_real_aggressive_limit_sell(self, symbol: str, qty: float,
                                           max_wait_sec: int = 5, retries: int = 3):
         """Synchronous version of the aggressive-limit-sell pattern
-        (matches Fast Scalper's async helper).
+        (matches Fast Scalper's async helper, including the
+        partial-fill safety from the AAVE/PENGU bug).
 
-        Places a LIMIT SELL at the current best bid, waits up to
-        max_wait_sec for fill, retries up to `retries` times if
-        the bid moves. Replaces every market-sell path in Virtual
-        Scalper so we never accept unbounded slippage on exit.
+        Each attempt re-fetches the actual free balance for the base
+        asset and caps the order qty at that — so a partial fill on
+        attempt N doesn't cause attempt N+1 to be rejected with
+        "insufficient balance" (which would orphan the unsold
+        remainder in the wallet).
         """
         if self.client is None:
             return None
 
         ccxt_sym = self._to_ccxt_symbol(symbol)
+        base_asset = ccxt_sym.split('/')[0].upper()
+        f = self._get_filters(symbol) or {}
+        step_size = f.get('step_size') or 0.00000001
+
+        accumulated_filled = 0.0
+        last_avg_price = 0.0
+        remaining = qty
+
         for attempt in range(1, retries + 1):
             try:
+                # 1) Re-anchor qty to actual wallet balance (handles
+                #    partial fills from earlier attempts).
+                bal = self.client.fetch_balance()
+                free = float((bal.get(base_asset) or {}).get('free') or 0)
+                usable = self._round_step(min(remaining, free), step_size)
+                if usable <= 0:
+                    print(f"✅ [LIMIT-SELL] {symbol} nothing left to sell (free={free:.6f}) — done")
+                    break
+
                 book = self.client.fetch_order_book(ccxt_sym, limit=5)
                 bids = book.get('bids') or []
                 if not bids:
@@ -715,23 +734,43 @@ class VirtualScalpExecutor:
                     time.sleep(1)
                     continue
                 bid_price = float(bids[0][0])
-                print(f"⚡ [VIRTUAL] {symbol} attempt {attempt}/{retries}: LIMIT SELL {qty} @ {bid_price}")
-                order = self.client.create_limit_sell_order(ccxt_sym, qty, bid_price)
+                print(f"⚡ [VIRTUAL] {symbol} attempt {attempt}/{retries}: LIMIT SELL {usable} @ {bid_price} (free={free:.6f})")
+                order = self.client.create_limit_sell_order(ccxt_sym, usable, bid_price)
                 order_id = order.get('id')
                 if not order_id:
                     print(f"⚠️ [LIMIT-SELL] {symbol} placement returned no order id")
                     continue
 
                 deadline = time.time() + max_wait_sec
+                final = None
                 while time.time() < deadline:
                     time.sleep(1)
                     o = self.client.fetch_order(order_id, ccxt_sym)
                     if (o.get('status') or '').lower() == 'closed':
-                        avg = float(o.get('average') or bid_price)
-                        print(f"✅ [LIMIT-SELL] {symbol} filled @ {avg}")
-                        return {'price': avg, 'qty': qty}
+                        final = o
+                        break
 
-                # Not filled — cancel and retry with fresh bid.
+                if final is not None:
+                    just_filled = float(final.get('filled') or usable)
+                    avg = float(final.get('average') or bid_price)
+                    accumulated_filled += just_filled
+                    last_avg_price = avg
+                    print(f"✅ [LIMIT-SELL] {symbol} filled @ {avg} "
+                          f"(this attempt: {just_filled}, total: {accumulated_filled})")
+                    return {'price': avg, 'qty': accumulated_filled}
+
+                # Capture any partial fill before cancelling.
+                try:
+                    last = self.client.fetch_order(order_id, ccxt_sym)
+                    partial = float(last.get('filled') or 0)
+                    if partial > 0:
+                        accumulated_filled += partial
+                        last_avg_price = float(last.get('average') or bid_price)
+                        remaining = max(0.0, remaining - partial)
+                        print(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} partial-filled {partial}, "
+                              f"remaining={remaining}")
+                except Exception:
+                    pass
                 try:
                     self.client.cancel_order(order_id, ccxt_sym)
                 except Exception:
@@ -741,6 +780,10 @@ class VirtualScalpExecutor:
                 print(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt} error: {e}")
                 time.sleep(1)
 
+        if accumulated_filled > 0:
+            print(f"⚠️ [LIMIT-SELL] {symbol} exhausted retries with partial fills "
+                  f"({accumulated_filled} of {qty}) — returning partial result")
+            return {'price': last_avg_price, 'qty': accumulated_filled}
         return None
 
 if __name__ == "__main__":

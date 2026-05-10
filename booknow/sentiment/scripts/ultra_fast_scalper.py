@@ -710,9 +710,41 @@ class MultiSymbolScalper:
             worst-case fill is bounded by the limit price itself.
           - The 5 s wait gives Binance time to match; the retry handles
             the case where the bid moved between fetch and place.
+
+        Partial-fill safety (the AAVE/PENGU bug from this morning):
+        if attempt N partially fills and we cancel, the wallet now
+        owns LESS than the original `qty`. The next attempt MUST cap
+        its qty at the actual free balance, otherwise Binance rejects
+        with "insufficient balance" and the remainder ends up
+        orphaned in the wallet. Each iteration re-fetches the free
+        balance and rounds down to step_size before placing.
         """
+        base_asset = symbol.split('/')[0] if '/' in symbol else symbol[:-4]
+        base_asset = base_asset.upper()
+
+        # Pull symbol filters once so we can step-round per attempt.
+        if symbol not in self.filters:
+            await self.fetch_filters(symbol)
+        f = self.filters.get(symbol) or {}
+        step_size = f.get('step_size') or 0.00000001
+
+        accumulated_filled = 0.0
+        last_fill_order = None
+        remaining = qty
+
         for attempt in range(1, retries + 1):
             try:
+                # 1) Re-anchor qty to whatever we actually own. After a
+                #    partial fill on a previous attempt the wallet has
+                #    shrunk, so we must read the current balance.
+                bal = await self.client.fetch_balance()
+                free = float((bal.get(base_asset) or {}).get('free') or 0)
+                usable = self.round_step(min(remaining, free), step_size)
+                if usable <= 0:
+                    log.info(f"✅ [LIMIT-SELL] {symbol} nothing left to sell (free={free:.6f}) — done")
+                    break
+
+                # 2) Get the bid book and place the limit at best bid.
                 book = await self.client.fetch_order_book(symbol, limit=5)
                 bids = book.get('bids') or []
                 if not bids:
@@ -720,23 +752,47 @@ class MultiSymbolScalper:
                     await asyncio.sleep(1)
                     continue
                 bid_price = float(bids[0][0])
-                log.info(f"⚡ [SCALPER] {symbol} attempt {attempt}/{retries}: LIMIT SELL {qty} @ {bid_price}")
-                order = await self.client.create_limit_sell_order(symbol, qty, bid_price)
+                log.info(f"⚡ [SCALPER] {symbol} attempt {attempt}/{retries}: LIMIT SELL {usable} @ {bid_price} (free={free:.6f})")
+                order = await self.client.create_limit_sell_order(symbol, usable, bid_price)
                 order_id = order.get('id')
                 if not order_id:
                     log.warning(f"⚠️ [LIMIT-SELL] {symbol} placement returned no order id")
                     continue
 
-                # Poll for fill
+                # 3) Poll for fill.
                 deadline = time.time() + max_wait_sec
+                final = None
                 while time.time() < deadline:
                     await asyncio.sleep(1)
                     o = await self.client.fetch_order(order_id, symbol)
                     if (o.get('status') or '').lower() == 'closed':
-                        log.info(f"✅ [LIMIT-SELL] {symbol} filled @ {o.get('average') or bid_price}")
-                        return o
+                        final = o
+                        break
 
-                # Not filled — cancel and try again
+                if final is not None:
+                    # Fully filled this attempt. Combine with any prior
+                    # partial fills and return the latest order shape.
+                    just_filled = float(final.get('filled') or usable)
+                    accumulated_filled += just_filled
+                    last_fill_order = final
+                    log.info(f"✅ [LIMIT-SELL] {symbol} filled @ {final.get('average') or bid_price} "
+                             f"(this attempt: {just_filled}, total filled across attempts: {accumulated_filled})")
+                    return final
+
+                # 4) Timeout. Read current state of the order to capture
+                #    any partial fill before cancelling.
+                try:
+                    last = await self.client.fetch_order(order_id, symbol)
+                    partial = float(last.get('filled') or 0)
+                    if partial > 0:
+                        accumulated_filled += partial
+                        last_fill_order = last
+                        remaining = max(0.0, remaining - partial)
+                        log.warning(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} partial-filled {partial}, "
+                                    f"remaining={remaining}")
+                except Exception:
+                    pass
+                # Cancel whatever didn't fill.
                 try:
                     await self.client.cancel_order(order_id, symbol)
                 except Exception:
@@ -746,6 +802,12 @@ class MultiSymbolScalper:
                 log.warning(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt} error: {e}")
                 await asyncio.sleep(1)
 
+        # Loop finished without a clean full fill.
+        if accumulated_filled > 0:
+            log.warning(f"⚠️ [LIMIT-SELL] {symbol} exhausted retries with partial fills "
+                        f"({accumulated_filled} of {qty}). Returning last partial order — "
+                        f"caller should check actual balance.")
+            return last_fill_order
         return None
 
     def broadcast_signal(self, symbol, status, price, matrix=None):
