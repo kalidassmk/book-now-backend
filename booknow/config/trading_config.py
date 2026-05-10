@@ -97,9 +97,15 @@ class TradingConfig:
     # explosion (panic capitulation → bounce). This filter monitors price
     # + volume during the limit-buy wait and CANCELS the order if the
     # bad pattern fires — saving us from filling into a slow bleed.
+    #
+    # 2026-05-10 iteration 2: bumped threshold 0.5 → 0.7 after backtest
+    # (3 wrongly-cancelled winners — PLUME / BMT / SAHARA — all had only
+    # ~ -0.5 % dips in the first 3 min, while bad fills BIO / LUMIA / LUNC
+    # progressed deeper. 0.7 % keeps the bad-fill catches and lets shallow
+    # slow-drifters through. Will re-evaluate after a week of live data.
     fastDropFilterEnabled: bool = True
     fastDropDetectMinutes: int = 3        # how long after signal we watch
-    fastDropThresholdPct: float = 0.5     # price must dip >= this % below signal
+    fastDropThresholdPct: float = 0.7     # price must dip >= this % below signal
     volSurgeThresholdMultiplier: float = 2.0  # vol-1m / pre-baseline must exceed this to keep order
 
     # ── Metrics collection ───────────────────────────────────────────────
