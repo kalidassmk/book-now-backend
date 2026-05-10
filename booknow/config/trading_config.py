@@ -37,23 +37,35 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 100.0
+    buyAmountUsdt: float = 30.0      # 2026-05-10: aligned with operator's small-scalp config
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
-    # New default is percentage-based (profitPct=0.50, profitAmountUsdt=0.0)
-    # to match the user's scalping formula: buy at -0.50%, sell at +0.50%.
-    profitPct: float = 0.50
+    # 0.267 % = $0.08 gross / $0.02 net per win on a $30 buy.
+    profitPct: float = 0.267
     profitAmountUsdt: float = 0.0
 
+    # ── Stop loss (Fast Scalper consumes; Virtual Scalper too) ──────────
+    stopLossUsdt: float = 0.30       # exit when unrealized loss reaches this USDT
+
     # ── Order placement ──────────────────────────────────────────────────
-    limitBuyOffsetPct: float = 0.50  # buy this % below market
-    tslPct: float = 2.0              # trailing stop-loss
+    limitBuyOffsetPct: float = 0.09  # buy this % below market signal
+    limitBuyTimeoutSec: int = 60     # cancel limit-buy if not filled in this window
+    tslPct: float = 2.0              # trailing stop-loss (legacy)
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
     fastScalpMode: bool = True
     maxHoldSeconds: int = 3600
     marketExitOnTimeout: bool = True
+
+    # ── Virtual Scalper live mode ────────────────────────────────────────
+    virtualScalperLiveMode: bool = False   # set true to make Virtual Scalper trade real money
+
+    # ── 24h market-context filter (post-mortem-derived) ─────────────────
+    # Reject buy entries when the symbol's 24h ticker fails any of these.
+    minChange24hPct: float = -1.0    # skip falling-knife coins
+    minRange24hPct:  float = 5.0     # skip too-quiet coins
+    minVol24hUsd:    float = 2_000_000.0  # liquidity floor
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TradingConfig":
