@@ -99,6 +99,8 @@ class VirtualScalpExecutor:
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
+        self.ladder_target_net_usdt = 0.05
+        self.ladder_fee_rate_per_side = 0.00075
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
         self.ladder_cooldown_seconds = 14400  # 4 hours
@@ -168,6 +170,8 @@ class VirtualScalpExecutor:
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
+                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.05))
+                self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
                 self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
                 self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
@@ -312,7 +316,7 @@ class VirtualScalpExecutor:
             target_price=ref_price * (1 - self.ladder_buy3_offset_pct / 100.0),
             size_usdt=self.ladder_buy3_size, status="pending",
         )
-        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
         self._paper_ladder_save(state)
         print(f"🪜 [paper-ladder] {symbol} buy 1 filled @ {signal_price} "
               f"buy2@{state.buy_2.target_price:.6g} buy3@{state.buy_3.target_price:.6g} "
@@ -583,7 +587,7 @@ class VirtualScalpExecutor:
                 # Cancel buy 3 per operator rule
                 if state.buy_3:
                     state.buy_3.status = "cancelled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
                 state.state = ladder.ACTIVE_2
                 print(f"📥 [paper-ladder] {sym} buy 2 filled @ {state.buy_2.target_price:.6g} "
                       f"avg={state.weighted_avg():.6g} new TP={state.tp_target_price:.6g}; buy 3 cancelled")
@@ -596,7 +600,7 @@ class VirtualScalpExecutor:
                 state.buy_3.fill_price = state.buy_3.target_price
                 state.buy_3.fill_ts = now_ms
                 state.buy_3.status = "filled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
                 state.hard_stop_price = ladder.hard_stop_price(
                     state.buy_3.target_price, self.ladder_hard_stop_pct
                 )
@@ -614,7 +618,7 @@ class VirtualScalpExecutor:
                 state.buy_3.fill_price = state.buy_3.target_price
                 state.buy_3.fill_ts = now_ms
                 state.buy_3.status = "filled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
                 state.hard_stop_price = ladder.hard_stop_price(
                     state.buy_3.target_price, self.ladder_hard_stop_pct
                 )
@@ -788,10 +792,20 @@ class VirtualScalpExecutor:
                     state.recovered_to_break_even = True
         self._paper_ladder_save(state)
 
+    def _effective_tp_pct(self) -> float:
+        """Same semantics as Fast Scalper: dollar-target wins when set."""
+        if self.ladder_target_net_usdt > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                self.ladder_target_net_usdt,
+                self.ladder_fee_rate_per_side,
+            )
+        return self.ladder_tp_from_avg_pct
+
     def _ladder_place_tp_live(self, state, qty_total, f, tick):
         """Place a LIMIT SELL at avg × (1 + tp_pct) — real Binance."""
         avg = state.weighted_avg()
-        tp_p = ladder.tp_price(avg, self.ladder_tp_from_avg_pct, tick)
+        tp_p = ladder.tp_price(avg, self._effective_tp_pct(), tick)
         ccxt_sym = self._to_ccxt_symbol(state.symbol)
         try:
             placed = self.client.create_limit_sell_order(ccxt_sym, qty_total, tp_p)

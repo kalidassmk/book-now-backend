@@ -150,6 +150,8 @@ class MultiSymbolScalper:
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
+        self.ladder_target_net_usdt = 0.05      # 2026-05-11 iter 8
+        self.ladder_fee_rate_per_side = 0.00075 # 0.075% (BNB discount)
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
         self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
@@ -444,6 +446,8 @@ class MultiSymbolScalper:
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
+            self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.05))
+            self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
             self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
@@ -997,6 +1001,18 @@ class MultiSymbolScalper:
         except Exception as exc:
             log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
 
+    def _effective_tp_pct(self) -> float:
+        """Returns the TP % to use right now. If the operator set a
+        dollar-based target (ladderTargetNetProfitUsdt > 0), the TP is
+        dynamically computed from that. Otherwise the static % is used."""
+        if self.ladder_target_net_usdt > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                self.ladder_target_net_usdt,
+                self.ladder_fee_rate_per_side,
+            )
+        return self.ladder_tp_from_avg_pct
+
     async def _ladder_place_legs_after_buy1(self, state, f, tick):
         """Helper called once Buy 1 has confirmed-filled. Places Buy 2,
         Buy 3 limits and the initial TP order. Used by both the market
@@ -1037,9 +1053,11 @@ class MultiSymbolScalper:
         state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
                                  size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
 
-        tp_p = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct, tick)
+        tp_pct = self._effective_tp_pct()
+        tp_p = ladder.tp_price(state.weighted_avg(), tp_pct, tick)
         await self._ladder_place_tp(state, state.total_qty(), tp_p, f)
-        log.info(f"🪜 [ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} tp@{tp_p:.6g}")
+        log.info(f"🪜 [ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} "
+                 f"tp@{tp_p:.6g} (tp_pct={tp_pct:.3f}%)")
 
     async def _ladder_tick(self):
         """Called every loop iteration to drive ALL active ladders forward.
@@ -1129,7 +1147,7 @@ class MultiSymbolScalper:
             except Exception:
                 pass
         qty_total = state.total_qty()
-        new_tp = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct, tick)
+        new_tp = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(), tick)
         await self._ladder_place_tp(state, qty_total, new_tp, filters)
 
     async def _ladder_check_buy2_or_buy3(self, state, f, tick):

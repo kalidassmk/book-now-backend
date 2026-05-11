@@ -149,7 +149,16 @@ class TradingConfig:
     ladderBuy3SizeUsdt: float = 12.0
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
-    ladderTpFromAvgPct: float = 0.6     # TP at weighted_avg × 1.006 → net ~$0.05/leg
+    ladderTpFromAvgPct: float = 0.6     # static TP fallback when target-net not set
+    # 2026-05-11 iter 8: dynamic TP based on a $ net-profit target.
+    # When ladderTargetNetProfitUsdt > 0 the bot computes the TP %
+    # automatically: tp_pct = (target_net / buy_size) × 100 + 2 × fee_rate_pct
+    # which guarantees the configured net profit after BOTH sides' fees.
+    # Set to 0 to fall back to the static ladderTpFromAvgPct above.
+    ladderTargetNetProfitUsdt: float = 0.05
+    # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
+    # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
+    ladderFeeRatePerSide: float = 0.00075
     ladderHardStopBelowBuy3Pct: float = 1.0  # stop at buy3 × 0.99 if buy3 filled
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for

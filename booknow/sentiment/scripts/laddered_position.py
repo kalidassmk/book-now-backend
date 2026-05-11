@@ -166,6 +166,23 @@ def tp_price(avg: float, tp_pct: float, tick_size: float = 0.00000001) -> float:
     return raw
 
 
+def required_tp_pct_for_net_profit(buy_size_usdt: float, target_net_usdt: float,
+                                    fee_rate_per_side: float) -> float:
+    """Reverse-engineer the TP percentage that nets `target_net_usdt`
+    after both sides of fees at `fee_rate_per_side` (e.g. 0.00075 = 0.075%).
+
+    Formula: tp_pct = (target_net / buy_size) × 100 + 2 × fee_rate × 100
+
+    For target=$0.05, buy=$12, fee=0.075%:
+      = (0.05/12)×100 + 0.15 = 0.4167 + 0.15 = 0.567 %
+    """
+    if buy_size_usdt <= 0 or target_net_usdt <= 0:
+        return 0.0
+    profit_pct = (target_net_usdt / buy_size_usdt) * 100.0
+    fee_burden = 2 * fee_rate_per_side * 100.0
+    return profit_pct + fee_burden
+
+
 def hard_stop_price(buy_3_price: float, stop_pct: float, tick_size: float = 0.00000001) -> float:
     """Hard stop = buy_3 × (1 - stop_pct/100)."""
     raw = buy_3_price * (1 - stop_pct / 100.0)
