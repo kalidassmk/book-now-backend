@@ -170,7 +170,8 @@ class TradingConfig:
     # market order. Set to 0 to keep the current market-order behaviour.
     # When >0, ladderBuy1UseMarketOrder is ignored and Buy 1 waits up to
     # limitBuyTimeoutSec for fill.
-    ladderBuy1OffsetPct: float = 0.0
+    # 2026-05-11 iter 10: 0.0 → 0.09 (save spread, ~85% fill rate).
+    ladderBuy1OffsetPct: float = 0.09
     # 2026-05-11 iter 4: per-coin cooldown. After a ladder closes the
     # same symbol is blocked for N seconds so the bot doesn't immediately
     # re-enter the same trade.
