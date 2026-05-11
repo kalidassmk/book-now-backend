@@ -40,13 +40,12 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
-# 2026-05-10: switched to Option B sizing — $6 buys aiming at ~$0.05 NET
-# per win (gross $0.06 = 1 % of $6, fees consume ~$0.012 round-trip → net $0.05).
-# Limit-buy offset 0.65 % matches the backtest sweet spot (≈60 % fill rate).
-DEFAULT_BUY_AMOUNT_USDT = 6.0
-DEFAULT_PROFIT_TARGET_USDT = 0.06    # legacy USDT target — only used when profitPct == 0
-DEFAULT_PROFIT_PCT = 1.0             # % above entry → ≈$0.05 NET on $6 buy
-DEFAULT_LIMIT_OFFSET_PCT = 0.65      # % below signal price; matches Option B
+# 2026-05-11: bumped to $12 sizing (was 6.0) to match Fast Scalper.
+# Net per win at +1% TP: gross $0.12, fees ~$0.024 round-trip → net ≈ $0.10.
+DEFAULT_BUY_AMOUNT_USDT = 12.0
+DEFAULT_PROFIT_TARGET_USDT = 0.12    # legacy USDT target — only used when profitPct == 0
+DEFAULT_PROFIT_PCT = 1.0             # % above entry → ≈$0.10 NET on $12 buy
+DEFAULT_LIMIT_OFFSET_PCT = 0.65      # % below signal price; legacy strategy
 
 # Risk Settings for Virtual Scalper
 SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience
@@ -89,11 +88,13 @@ class VirtualScalpExecutor:
         self.fd_vol_surge_mult = 2.0
 
         # Laddered Recovery (paper mirror of Fast Scalper).
+        # 2026-05-11 iter 2: $6 → $12, max=3 concurrent.
         self.ladder_enabled = False
-        self.single_coin_mode = True
-        self.ladder_buy1_size = 6.0
-        self.ladder_buy2_size = 6.0
-        self.ladder_buy3_size = 6.0
+        self.max_concurrent_ladders = 3
+        self.single_coin_mode = False
+        self.ladder_buy1_size = 12.0
+        self.ladder_buy2_size = 12.0
+        self.ladder_buy3_size = 12.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 1.0
@@ -156,10 +157,11 @@ class VirtualScalpExecutor:
                 self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
                 # Laddered Recovery knobs.
                 self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-                self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", True))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 6.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 6.0))
-                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 6.0))
+                self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 3))
+                self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 12.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 12.0))
+                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
@@ -216,22 +218,23 @@ class VirtualScalpExecutor:
             print(f"⚠️ [VIRTUAL] filter fetch failed for {symbol}: {e}")
             return None
 
-    # ── Paper Laddered Recovery ─────────────────────────────────────────
+    # ── Paper Laddered Recovery (multi-ladder) ──────────────────────────
     # Mirrors Fast Scalper's logic but uses simulated fills (price ≤ limit
-    # = filled). Uses its own Redis key namespace so it doesn't collide
-    # with the real-money ladder state.
-    PAPER_LADDER_KEY = "VIRTUAL:LADDER_STATE"
-    PAPER_LADDER_ACTIVE = "VIRTUAL:LADDER_ACTIVE_SYMBOL"
+    # = filled). Separate Redis hash so paper + real state never collide.
+    PAPER_LADDERS_HASH = "VIRTUAL:LADDER_STATES"
 
-    def _paper_ladder_active(self) -> bool:
+    def _paper_ladder_count(self) -> int:
         try:
-            return bool(self.r.get(self.PAPER_LADDER_ACTIVE))
+            return self.r.hlen(self.PAPER_LADDERS_HASH) or 0
         except Exception:
-            return False
+            return 0
 
-    def _paper_ladder_load(self):
+    def _paper_ladder_can_open(self) -> bool:
+        return self._paper_ladder_count() < self.max_concurrent_ladders
+
+    def _paper_ladder_load(self, symbol: str):
         try:
-            raw = self.r.get(self.PAPER_LADDER_KEY)
+            raw = self.r.hget(self.PAPER_LADDERS_HASH, symbol)
             if not raw: return None
             return ladder.LadderState.from_dict(json.loads(raw))
         except Exception:
@@ -239,20 +242,35 @@ class VirtualScalpExecutor:
 
     def _paper_ladder_save(self, state):
         try:
-            self.r.set(self.PAPER_LADDER_KEY, json.dumps(state.to_dict()))
-            if state.state in (ladder.CLOSED, ladder.EXITING):
-                self.r.delete(self.PAPER_LADDER_ACTIVE)
+            if state.state == ladder.CLOSED:
+                self.r.hdel(self.PAPER_LADDERS_HASH, state.symbol)
             else:
-                self.r.set(self.PAPER_LADDER_ACTIVE, state.symbol)
+                self.r.hset(self.PAPER_LADDERS_HASH, state.symbol, json.dumps(state.to_dict()))
         except Exception:
             pass
 
-    def _paper_ladder_clear(self):
+    def _paper_ladder_clear(self, symbol: str):
         try:
-            self.r.delete(self.PAPER_LADDER_KEY)
-            self.r.delete(self.PAPER_LADDER_ACTIVE)
+            self.r.hdel(self.PAPER_LADDERS_HASH, symbol)
         except Exception:
             pass
+
+    def _paper_ladder_load_all(self):
+        try:
+            raw = self.r.hgetall(self.PAPER_LADDERS_HASH)
+        except Exception:
+            return []
+        out = []
+        for sym, val in (raw or {}).items():
+            try:
+                out.append(ladder.LadderState.from_dict(json.loads(val)))
+            except Exception:
+                try: self.r.hdel(self.PAPER_LADDERS_HASH, sym)
+                except Exception: pass
+        return out
+
+    def _paper_ladder_active_for_symbol(self, symbol: str) -> bool:
+        return self._paper_ladder_load(symbol) is not None
 
     def _paper_ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 (instant simulated fill at signal price)."""
@@ -290,13 +308,22 @@ class VirtualScalpExecutor:
             self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
 
     def _paper_ladder_tick(self, curr_price_by_symbol):
-        """Drive the paper ladder forward — called each loop iteration."""
-        state = self._paper_ladder_load()
-        if state is None or state.state == ladder.CLOSED: return
+        """Drive all paper ladders forward — called each loop iteration."""
+        states = self._paper_ladder_load_all()
+        if not states: return
+        for state in states:
+            if state.state == ladder.CLOSED: continue
+            sym = state.symbol
+            last = curr_price_by_symbol.get(sym) or self._current_price(sym) or 0
+            if last <= 0: continue
+            try:
+                self._paper_ladder_tick_one(state, last)
+            except Exception as exc:
+                print(f"⚠️ [paper-ladder] tick failed for {sym}: {exc}")
+
+    def _paper_ladder_tick_one(self, state, last):
+        """Per-ladder state transitions."""
         sym = state.symbol
-        # Find current price for this symbol from analyser timeline
-        last = curr_price_by_symbol.get(sym) or self._current_price(sym) or 0
-        if last <= 0: return
         now_ms = int(time.time() * 1000)
 
         # TP check
@@ -422,7 +449,7 @@ class VirtualScalpExecutor:
         print(f"{color}🪜 [paper-ladder] {state.symbol} CLOSED reason={reason} "
               f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
               f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
-        self._paper_ladder_clear()
+        self._paper_ladder_clear(state.symbol)
 
     def passes_falling_knife(self, symbol, timeline):
         """Apply the same 3 falling-knife rules used by the Fast Scalper,
@@ -533,10 +560,10 @@ class VirtualScalpExecutor:
                 # that drop out still get cleaned up.
                 self._sweep_pending_orders()
 
-                # Drive paper-ladder state machine (if enabled). Build a
-                # quick {symbol: latest_price} map so the ladder doesn't
+                # Drive paper-ladder state machines (if enabled). Build a
+                # quick {symbol: latest_price} map so each ladder doesn't
                 # need to refetch.
-                if self.ladder_enabled and self.single_coin_mode and ladder is not None:
+                if self.ladder_enabled and ladder is not None:
                     px_map = {}
                     for symbol, data_json in all_analysis.items():
                         try:
@@ -559,12 +586,15 @@ class VirtualScalpExecutor:
                     curr_vol = last.get('volume', 0)
 
                     if signal == 'SCALP_BUY_SIGNAL':
-                        # Laddered Recovery (paper): single-coin gate +
+                        # Laddered Recovery (paper): multi-coin gate +
                         # 3-tier averaging-down. Falls back to the legacy
-                        # single-limit path when not enabled.
-                        if (self.ladder_enabled and self.single_coin_mode
-                                and ladder is not None):
-                            if not self._paper_ladder_active():
+                        # single-limit path when ladder mode is off.
+                        if self.ladder_enabled and ladder is not None:
+                            if self._paper_ladder_active_for_symbol(symbol):
+                                pass  # already have a ladder for this coin
+                            elif not self._paper_ladder_can_open():
+                                pass  # at max concurrent capacity
+                            else:
                                 ok, features = self.passes_falling_knife(symbol, timeline)
                                 if self.metrics is not None:
                                     self.metrics.signal_evaluated(

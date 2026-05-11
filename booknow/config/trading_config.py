@@ -38,7 +38,7 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 6.0       # 2026-05-10: Option B sizing (was 30.0)
+    buyAmountUsdt: float = 12.0      # 2026-05-11: $12/leg (was 6.0)
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
@@ -52,7 +52,9 @@ class TradingConfig:
     # "patient hold" — wait for TP even on heavy paper losses. Set this to
     # a positive USDT amount to re-enable a stop-loss exit; both scalpers
     # treat 0 (or negative) as "no stop, no SL leg on the OCO".
-    stopLossUsdt: float = 0.0        # 0 = disabled (was 0.06)
+    # 2026-05-11: scale-aware default 0.12 (= 1 % of $12 buy) for clarity
+    # in the dataclass, but live Redis still keeps it disabled.
+    stopLossUsdt: float = 0.0        # 0 = disabled
 
     # ── Order placement ──────────────────────────────────────────────────
     # 2026-05-11 iter 3: offset 0.65 → 0.30 after P&L analysis showed only
@@ -133,12 +135,17 @@ class TradingConfig:
     #   • TP at weighted-avg × (1 + ladderTpFromAvgPct/100)
     #   • Hard stop activated ONLY after Buy 3 fills (gap scenario), at
     #     buy_3_price × (1 - ladderHardStopBelowBuy3Pct/100)
-    # Single-coin mode pauses auto-buy while a ladder is active; resumed on close.
+    # 2026-05-11 iter 2: replaced singleCoinModeEnabled with
+    # maxConcurrentLadders (operator wants 3). Per leg sizing bumped
+    # $6 → $12 so max total exposure per ladder = $36 (3 fills × $12);
+    # across 3 concurrent ladders, max $108 USDT in flight.
     ladderedRecoveryEnabled: bool = True
-    singleCoinModeEnabled: bool = True
-    ladderBuy1SizeUsdt: float = 6.0
-    ladderBuy2SizeUsdt: float = 6.0
-    ladderBuy3SizeUsdt: float = 6.0
+    maxConcurrentLadders: int = 3
+    # Legacy: kept for back-compat. Code now uses maxConcurrentLadders.
+    singleCoinModeEnabled: bool = False
+    ladderBuy1SizeUsdt: float = 12.0
+    ladderBuy2SizeUsdt: float = 12.0
+    ladderBuy3SizeUsdt: float = 12.0
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
     ladderTpFromAvgPct: float = 1.0     # TP at weighted_avg × 1.01

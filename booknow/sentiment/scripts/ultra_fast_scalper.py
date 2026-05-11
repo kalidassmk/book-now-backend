@@ -94,16 +94,13 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
-        # 2026-05-10: switched to Option B sizing — $6 buys aiming at
-        # $0.05 NET per win (gross $0.06 = 1 % of $6, after $0.012 in
-        # round-trip Binance fees). If Redis TRADING_CONFIG is ever wiped,
-        # these defaults take over — we never want a fallback to the old
-        # $100 / $0.20 settings that blindsided the operator on 2026-05-09,
-        # nor the intermediate $30 sizing the operator iterated past.
+        # 2026-05-11: $12/leg sizing (was $6). Net per win at +1 % TP:
+        # gross $0.12, fees ~$0.024 round-trip → net ≈ $0.10 per win.
+        # With 3 concurrent ladders × 3 fills × $12, max exposure $108.
         self.auto_enabled = True
-        self.buy_amount_usdt = 6.0
-        self.profit_target_usdt = 0.06
-        self.stop_loss_usdt = 0.06
+        self.buy_amount_usdt = 12.0
+        self.profit_target_usdt = 0.12
+        self.stop_loss_usdt = 0.0       # disabled by default (Option B legacy)
 
         # Market-context filters (derived from yesterday's P&L analysis).
         # Hot-reloaded from TRADING_CONFIG so thresholds can be tuned
@@ -141,14 +138,14 @@ class MultiSymbolScalper:
         # showed most "panic exits" hit TP later if held.
         self.trend_reversal_exit_enabled = True
 
-        # Laddered Recovery — single-coin, 3-tier averaging-down entry.
-        # When enabled, the bot trades ONE coin at a time using the
-        # ladder state machine in laddered_position.py.
+        # Laddered Recovery — multi-coin, 3-tier averaging-down entry.
+        # 2026-05-11 iter 2: max_concurrent_ladders replaces single-coin mode.
         self.ladder_enabled = False
-        self.single_coin_mode = True
-        self.ladder_buy1_size = 6.0
-        self.ladder_buy2_size = 6.0
-        self.ladder_buy3_size = 6.0
+        self.max_concurrent_ladders = 3
+        self.single_coin_mode = False     # legacy; kept for back-compat
+        self.ladder_buy1_size = 12.0
+        self.ladder_buy2_size = 12.0
+        self.ladder_buy3_size = 12.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 1.0
@@ -383,15 +380,15 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 6.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 12.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
-            # Defaults: profitPct = 1.0 % (Option B), legacy USDT = $0.05.
+            # Defaults: profitPct = 1.0 % (Option B), legacy USDT = $0.10.
             profit_pct = float(cfg.get("profitPct", 1.0) or 1.0)
             if profit_pct > 0:
                 self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
             else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.05))
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.10))
 
             # Stop loss: explicit USDT; 0 (or negative) disables both the
             # OCO SL leg and the polling SL exit. Default to 0 so older
@@ -434,12 +431,13 @@ class MultiSymbolScalper:
             # flip on/off without restart.
             self.trend_reversal_exit_enabled = bool(cfg.get("trendReversalExitEnabled", True))
 
-            # Laddered Recovery knobs (single-coin 3-tier).
+            # Laddered Recovery knobs (3-tier averaging-down).
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-            self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", True))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 6.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 6.0))
-            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 6.0))
+            self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 3))
+            self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 12.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 12.0))
+            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
@@ -679,14 +677,12 @@ class MultiSymbolScalper:
 
     async def process_symbol(self, symbol, btc_df):
         """Analyze and trade a single symbol."""
-        # Laddered Recovery: when in single-coin mode, skip ALL legacy work
-        # for any symbol that isn't the active ladder; the main loop's
-        # _ladder_tick() drives the live ladder.
-        if (self.ladder_enabled and self.single_coin_mode
-                and ladder is not None and ladder.is_active(self.redis)):
-            held = ladder.active_symbol(self.redis)
-            if held != symbol:
-                return  # ladder owns the floor
+        # Laddered Recovery: if THIS symbol has an active ladder, the
+        # ladder state machine owns it — skip the legacy position-management
+        # path. Other symbols are free to be evaluated for new entries.
+        if (self.ladder_enabled and ladder is not None
+                and ladder.load_state(self.redis, symbol) is not None):
+            return
 
         # 1. Manage existing position
         if symbol in self.active_positions:
@@ -772,19 +768,29 @@ class MultiSymbolScalper:
                 return
             await self.execute_buy(symbol, last_price, features=features)
 
-    # ── Laddered Recovery (single-coin 3-tier averaging-down) ──────────────
+    # ── Laddered Recovery (multi-coin 3-tier averaging-down) ──────────────
     async def _maybe_route_ladder(self, symbol, price, features=None):
-        """If ladder + single-coin mode are on, route the buy through the
-        ladder state machine. Returns True if the ladder handled the buy
-        (caller skips the legacy single-buy path)."""
-        if not (self.ladder_enabled and self.single_coin_mode and ladder is not None):
+        """If ladder mode is on, route the buy through the ladder state
+        machine. Returns True if the ladder handled the buy (caller skips
+        the legacy single-buy path).
+
+        Capacity rules (2026-05-11 iter 2):
+          • Per-symbol uniqueness: no second ladder on the same symbol
+          • Global cap: at most maxConcurrentLadders ladders in flight
+        """
+        if not (self.ladder_enabled and ladder is not None):
             return False
-        # If a ladder is already in flight, ignore new signals.
-        if ladder.is_active(self.redis):
-            held = ladder.active_symbol(self.redis)
-            log.info(f"⏸️  [{symbol}] ladder busy with {held}, ignoring signal")
+        # Already a ladder for this symbol?
+        if ladder.load_state(self.redis, symbol) is not None:
+            log.info(f"⏸️  [{symbol}] already has an active ladder; ignoring signal")
             return True
-        # Place the first leg now; subsequent legs and TP are placed on fill.
+        # Global capacity check
+        active_count = ladder.count_active(self.redis)
+        if active_count >= self.max_concurrent_ladders:
+            held = ladder.list_active_symbols(self.redis)
+            log.info(f"⏸️  [{symbol}] ladder cap reached "
+                     f"({active_count}/{self.max_concurrent_ladders}: {held}); ignoring")
+            return True
         await self._ladder_start(symbol, price, features=features)
         return True
 
@@ -850,33 +856,36 @@ class MultiSymbolScalper:
             log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
 
     async def _ladder_tick(self):
-        """Called every loop iteration to drive the active ladder forward.
-        Polls Binance for fills, places follow-up orders, manages TP/stop."""
+        """Called every loop iteration to drive ALL active ladders forward.
+        Multi-ladder version: iterates every symbol with an in-flight
+        state and runs the appropriate state-transition handler."""
         if ladder is None: return
-        state = ladder.load_state(self.redis)
-        if state is None or state.state == ladder.CLOSED: return
-        symbol = state.symbol
-        try:
-            f = self.filters.get(symbol)
-            if not f:
-                await self.fetch_filters(symbol)
+        states = ladder.load_all_states(self.redis)
+        if not states: return
+        for state in states:
+            if state.state == ladder.CLOSED: continue
+            symbol = state.symbol
+            try:
                 f = self.filters.get(symbol)
-            if not f:
-                return
-            tick = f.get("tick_size") or 0.00000001
+                if not f:
+                    await self.fetch_filters(symbol)
+                    f = self.filters.get(symbol)
+                if not f:
+                    continue
+                tick = f.get("tick_size") or 0.00000001
 
-            if state.state == ladder.PENDING_BUY_1:
-                await self._ladder_check_buy1_fill(state, f, tick)
-            elif state.state == ladder.ACTIVE_1:
-                await self._ladder_check_buy2_or_buy3(state, f, tick)
-            elif state.state == ladder.ACTIVE_2:
-                await self._ladder_check_buy3(state, f, tick)
-            elif state.state == ladder.ACTIVE_3:
-                await self._ladder_check_hard_stop_or_tp(state, f, tick)
-            # Update underwater accumulator on every tick (for TBE metric)
-            await self._ladder_update_underwater(state, f)
-        except Exception as exc:
-            log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
+                if state.state == ladder.PENDING_BUY_1:
+                    await self._ladder_check_buy1_fill(state, f, tick)
+                elif state.state == ladder.ACTIVE_1:
+                    await self._ladder_check_buy2_or_buy3(state, f, tick)
+                elif state.state == ladder.ACTIVE_2:
+                    await self._ladder_check_buy3(state, f, tick)
+                elif state.state == ladder.ACTIVE_3:
+                    await self._ladder_check_hard_stop_or_tp(state, f, tick)
+                # Update underwater accumulator (for TBE metric)
+                await self._ladder_update_underwater(state, f)
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
 
     async def _ladder_check_buy1_fill(self, state, f, tick):
         """Poll buy 1; once filled, place buys 2 & 3 + TP order."""
@@ -1195,7 +1204,7 @@ class MultiSymbolScalper:
         log.info(f"🪜✅ [ladder] {state.symbol} CLOSED reason={reason} "
                  f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
                  f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
-        ladder.clear_state(self.redis)
+        ladder.clear_state(self.redis, state.symbol)
 
     async def execute_buy(self, symbol, price, features=None):
         if not self.auto_enabled:
@@ -1833,10 +1842,10 @@ class MultiSymbolScalper:
                     await asyncio.sleep(5)
                     continue
 
-                # Drive the laddered-recovery state machine if one is in
+                # Drive the laddered-recovery state machine if any are in
                 # flight. Runs once per loop so order fills + TP/stop
                 # transitions are reacted to within ~1 s.
-                if self.ladder_enabled and self.single_coin_mode and ladder is not None:
+                if self.ladder_enabled and ladder is not None:
                     try:
                         await self._ladder_tick()
                     except Exception as exc:

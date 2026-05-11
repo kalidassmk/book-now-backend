@@ -49,9 +49,13 @@ EXIT_TP   = "tp_at_avg"
 EXIT_STOP = "hard_stop_buy3"
 EXIT_MANUAL = "manual"
 
-# Redis key
+# Redis keys — 2026-05-11 iter 2: switched from single-key to per-symbol
+# hash so up to N ladders can run concurrently (operator chose max=3).
+LADDER_STATES_HASH      = "SCALPER:LADDER_STATES"          # Redis HASH symbol → JSON state
+
+# Legacy single-key fallbacks kept for one-shot migration paths.
 LADDER_STATE_KEY        = "SCALPER:LADDER_STATE"
-LADDER_ACTIVE_SYMBOL    = "SCALPER:LADDER_ACTIVE_SYMBOL"   # single-coin lock
+LADDER_ACTIVE_SYMBOL    = "SCALPER:LADDER_ACTIVE_SYMBOL"   # legacy single-coin lock
 
 
 @dataclass
@@ -167,14 +171,14 @@ def _round_down(value: float, step: float) -> float:
     return (int(value / step)) * step
 
 
-# ── Redis persistence layer ──────────────────────────────────────────────
+# ── Redis persistence layer (multi-ladder hash storage) ──────────────────
 
-def load_state(redis_client) -> Optional[LadderState]:
-    """Fetch the active ladder from Redis, or None if there isn't one."""
-    if not redis_client:
+def load_state(redis_client, symbol: str) -> Optional[LadderState]:
+    """Fetch the ladder for one symbol, or None if not active."""
+    if not redis_client or not symbol:
         return None
     try:
-        raw = redis_client.get(LADDER_STATE_KEY)
+        raw = redis_client.hget(LADDER_STATES_HASH, symbol)
     except Exception as exc:
         logger.debug("ladder load failed: %s", exc)
         return None
@@ -182,44 +186,85 @@ def load_state(redis_client) -> Optional[LadderState]:
     try:
         return LadderState.from_dict(json.loads(raw))
     except Exception as exc:
-        logger.warning("corrupt ladder state, discarding: %s", exc)
+        logger.warning("corrupt ladder state for %s, discarding: %s", symbol, exc)
+        try:
+            redis_client.hdel(LADDER_STATES_HASH, symbol)
+        except Exception:
+            pass
         return None
 
 
 def save_state(redis_client, state: LadderState) -> None:
-    if not redis_client: return
+    if not redis_client or not state.symbol: return
     try:
-        redis_client.set(LADDER_STATE_KEY, json.dumps(state.to_dict()))
-        # Also mirror active symbol for fast lookup
-        if state.state not in (CLOSED, EXITING):
-            redis_client.set(LADDER_ACTIVE_SYMBOL, state.symbol)
+        if state.state == CLOSED:
+            redis_client.hdel(LADDER_STATES_HASH, state.symbol)
         else:
-            redis_client.delete(LADDER_ACTIVE_SYMBOL)
+            redis_client.hset(LADDER_STATES_HASH, state.symbol, json.dumps(state.to_dict()))
     except Exception as exc:
         logger.debug("ladder save failed: %s", exc)
 
 
-def clear_state(redis_client) -> None:
-    if not redis_client: return
+def clear_state(redis_client, symbol: str) -> None:
+    if not redis_client or not symbol: return
     try:
-        redis_client.delete(LADDER_STATE_KEY)
-        redis_client.delete(LADDER_ACTIVE_SYMBOL)
+        redis_client.hdel(LADDER_STATES_HASH, symbol)
     except Exception:
         pass
 
 
-def active_symbol(redis_client) -> Optional[str]:
-    """Cheap lookup: is a ladder currently in flight, and for what symbol?"""
-    if not redis_client: return None
+def list_active_symbols(redis_client) -> List[str]:
+    """All symbols with an active ladder right now."""
+    if not redis_client: return []
     try:
-        val = redis_client.get(LADDER_ACTIVE_SYMBOL)
-        return val if val else None
+        keys = redis_client.hkeys(LADDER_STATES_HASH)
+        return list(keys) if keys else []
     except Exception:
-        return None
+        return []
 
 
-def is_active(redis_client) -> bool:
-    return active_symbol(redis_client) is not None
+def count_active(redis_client) -> int:
+    if not redis_client: return 0
+    try:
+        return redis_client.hlen(LADDER_STATES_HASH) or 0
+    except Exception:
+        return 0
+
+
+def load_all_states(redis_client) -> List[LadderState]:
+    """All active LadderState records, ready to iterate per loop tick."""
+    if not redis_client: return []
+    try:
+        all_raw = redis_client.hgetall(LADDER_STATES_HASH)
+    except Exception:
+        return []
+    out: List[LadderState] = []
+    for sym, raw in (all_raw or {}).items():
+        try:
+            out.append(LadderState.from_dict(json.loads(raw)))
+        except Exception:
+            try:
+                redis_client.hdel(LADDER_STATES_HASH, sym)
+            except Exception:
+                pass
+    return out
+
+
+# ── Back-compat shims (callers in mid-update use these) ──────────────────
+
+def is_active(redis_client, symbol: Optional[str] = None) -> bool:
+    """If symbol is given, returns whether that symbol has an active ladder.
+    If omitted, returns whether ANY ladder is active."""
+    if symbol:
+        return load_state(redis_client, symbol) is not None
+    return count_active(redis_client) > 0
+
+
+def active_symbol(redis_client) -> Optional[str]:
+    """First active symbol — kept for backward-compatible callers that only
+    cared about presence/identity in single-coin mode."""
+    syms = list_active_symbols(redis_client)
+    return syms[0] if syms else None
 
 
 # ── Closed-trade summary for metrics ─────────────────────────────────────
