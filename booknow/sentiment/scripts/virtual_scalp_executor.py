@@ -317,6 +317,48 @@ class VirtualScalpExecutor:
                                     features=features, order_type="virtual_ladder_buy_1")
             self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
 
+    def _has_sufficient_usdt(self, required: float) -> bool:
+        """Pre-flight balance check (sync). Returns True if we can proceed."""
+        if self.client is None: return True
+        try:
+            bal = self.client.fetch_balance()
+            free = float((bal.get('USDT') or {}).get('free') or 0)
+        except Exception as e:
+            print(f"⚠️ [v-ladder] balance fetch failed ({e}); proceeding")
+            return True
+        margin = required * 0.10
+        if free < required + margin:
+            print(f"⚠️ [v-ladder] insufficient USDT: free=${free:.4f} need=${required:.4f} (+margin)")
+            return False
+        return True
+
+    def _handle_external_cancel_live(self, state, who: str):
+        """Manual cancel detected — cancel remaining orders, free slot,
+        set cooldown. Do NOT auto-sell any held qty (operator's call)."""
+        print(f"🛑 [v-ladder] {state.symbol} {who} cancelled externally; releasing slot + cooldown")
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        for leg in (state.buy_1, state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try: self.client.cancel_order(leg.order_id, ccxt_sym)
+                except Exception: pass
+                leg.status = "cancelled"
+                leg.order_id = None
+        if state.tp_order_id:
+            try: self.client.cancel_order(state.tp_order_id, ccxt_sym)
+            except Exception: pass
+            state.tp_order_id = None
+        state.state = ladder.CLOSED
+        state.exit_reason = "manual_cancel"
+        state.closed_ts = int(time.time() * 1000)
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, state.weighted_avg() or 0,
+                                           0, reason="manual_cancel", pnl_usdt=0)
+            except Exception:
+                pass
+        self._paper_ladder_clear(state.symbol)
+        ladder.set_cooldown(self.r, state.symbol, self.ladder_cooldown_seconds)
+
     def _ladder_start_live(self, symbol, signal_price, features=None):
         """Live start: place Buy 1 as MARKET (default) so Buy 2/3 limits
         can be placed in the same call. Falls back to aggressive-limit-
@@ -324,6 +366,12 @@ class VirtualScalpExecutor:
         f = self._get_filters(symbol)
         if f is None:
             print(f"⚠️ [v-ladder] {symbol} missing filters; skipping")
+            return
+        # Pre-flight balance check: full 3-leg total
+        total_needed = (self.ladder_buy1_size
+                        + self.ladder_buy2_size + self.ladder_buy3_size)
+        if not self._has_sufficient_usdt(total_needed):
+            print(f"⏸️  [v-ladder] {symbol} skipped — funds short for full ladder")
             return
         ccxt_sym = self._to_ccxt_symbol(symbol)
         tick = f['tick_size'] or 0.00000001
@@ -562,7 +610,11 @@ class VirtualScalpExecutor:
                 o = self.client.fetch_order(state.buy_1.order_id, ccxt_sym)
             except Exception:
                 return
-            if (o.get('status') or '').lower() != 'closed':
+            status = (o.get('status') or '').lower()
+            if status in ('canceled', 'cancelled', 'expired'):
+                self._handle_external_cancel_live(state, "buy 1")
+                return
+            if status != 'closed':
                 return
             filled_qty = float(o.get('filled') or 0)
             fill_price = float(o.get('average') or o.get('price') or state.buy_1.target_price)
@@ -587,9 +639,13 @@ class VirtualScalpExecutor:
         if state.tp_order_id:
             try:
                 tp_o = self.client.fetch_order(state.tp_order_id, ccxt_sym)
-                if (tp_o.get('status') or '').lower() == 'closed':
+                tp_status = (tp_o.get('status') or '').lower()
+                if tp_status == 'closed':
                     exit_price = float(tp_o.get('average') or tp_o.get('price') or state.tp_target_price)
                     self._paper_ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+                if tp_status in ('canceled', 'cancelled', 'expired'):
+                    self._handle_external_cancel_live(state, "TP")
                     return
             except Exception:
                 pass
@@ -601,7 +657,11 @@ class VirtualScalpExecutor:
                     o2 = self.client.fetch_order(state.buy_2.order_id, ccxt_sym)
                 except Exception:
                     o2 = None
-                if o2 and (o2.get('status') or '').lower() == 'closed':
+                o2_status = (o2.get('status') or '').lower() if o2 else ''
+                if o2_status in ('canceled', 'cancelled', 'expired'):
+                    self._handle_external_cancel_live(state, "buy 2")
+                    return
+                if o2 and o2_status == 'closed':
                     qty = float(o2.get('filled') or 0)
                     price = float(o2.get('average') or o2.get('price') or state.buy_2.target_price)
                     if qty > 0:
@@ -629,7 +689,14 @@ class VirtualScalpExecutor:
                     o3 = self.client.fetch_order(state.buy_3.order_id, ccxt_sym)
                 except Exception:
                     o3 = None
-                if o3 and (o3.get('status') or '').lower() == 'closed':
+                o3_status = (o3.get('status') or '').lower() if o3 else ''
+                if o3_status in ('canceled', 'cancelled', 'expired'):
+                    state.buy_3.status = "cancelled"
+                    state.buy_3.order_id = None
+                    self._paper_ladder_save(state)
+                    print(f"⚠️  [v-ladder] {sym} buy 3 cancelled externally; continuing")
+                    return
+                if o3 and o3_status == 'closed':
                     qty = float(o3.get('filled') or 0)
                     price = float(o3.get('average') or o3.get('price') or state.buy_3.target_price)
                     if qty > 0:
@@ -903,16 +970,16 @@ class VirtualScalpExecutor:
                     curr_vol = last.get('volume', 0)
 
                     if signal == 'SCALP_BUY_SIGNAL':
-                        # Laddered Recovery (paper): multi-coin gate +
-                        # 3-tier averaging-down. Falls back to the legacy
-                        # single-limit path when ladder mode is off.
+                        # Laddered Recovery (paper or live): multi-coin
+                        # gate + 3-tier averaging-down. Falls back to the
+                        # legacy single-limit path when ladder mode is off.
                         if self.ladder_enabled and ladder is not None:
-                            if self._paper_ladder_active_for_symbol(symbol):
-                                pass  # already have a ladder for this coin
+                            if ladder.is_active_anywhere(self.r, symbol):
+                                pass  # already in flight (either scalper)
                             elif ladder.is_on_cooldown(self.r, symbol):
                                 pass  # on per-coin cooldown
-                            elif not self._paper_ladder_can_open():
-                                pass  # at max concurrent capacity
+                            elif ladder.count_total_active(self.r) >= self.max_concurrent_ladders:
+                                pass  # GLOBAL cap reached across both scalpers
                             else:
                                 ok, features = self.passes_falling_knife(symbol, timeline)
                                 if self.metrics is not None:

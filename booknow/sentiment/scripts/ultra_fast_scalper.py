@@ -783,24 +783,77 @@ class MultiSymbolScalper:
         """
         if not (self.ladder_enabled and ladder is not None):
             return False
-        # Already a ladder for this symbol?
-        if ladder.load_state(self.redis, symbol) is not None:
-            log.info(f"⏸️  [{symbol}] already has an active ladder; ignoring signal")
+        # Already a ladder for this symbol (in EITHER scalper)?
+        if ladder.is_active_anywhere(self.redis, symbol):
+            log.info(f"⏸️  [{symbol}] already has an active ladder somewhere; ignoring signal")
             return True
         # Cooldown check
         if ladder.is_on_cooldown(self.redis, symbol):
             secs = ladder.cooldown_remaining_seconds(self.redis, symbol)
             log.info(f"⏸️  [{symbol}] on cooldown ({secs//60} min left); ignoring signal")
             return True
-        # Global capacity check
-        active_count = ladder.count_active(self.redis)
-        if active_count >= self.max_concurrent_ladders:
-            held = ladder.list_active_symbols(self.redis)
-            log.info(f"⏸️  [{symbol}] ladder cap reached "
-                     f"({active_count}/{self.max_concurrent_ladders}: {held}); ignoring")
+        # GLOBAL capacity check — combined across Fast + Virtual scalpers
+        # (2026-05-11 iter 5: cap of 3 applies to the whole system).
+        total_active = ladder.count_total_active(self.redis)
+        if total_active >= self.max_concurrent_ladders:
+            held = ladder.list_active_symbols_combined(self.redis)
+            log.info(f"⏸️  [{symbol}] global ladder cap reached "
+                     f"({total_active}/{self.max_concurrent_ladders} across all scalpers: {held})")
             return True
         await self._ladder_start(symbol, price, features=features)
         return True
+
+    async def _has_sufficient_usdt(self, required: float) -> bool:
+        """Pre-flight check: free USDT >= required. Returns True if we
+        should proceed, False to skip (with a warning log)."""
+        try:
+            bal = await self.client.fetch_balance()
+            free = float((bal.get('USDT') or {}).get('free') or 0)
+        except Exception as exc:
+            log.warning(f"⚠️ [ladder] balance fetch failed ({exc}); proceeding")
+            return True
+        # Add a tiny safety margin (10% of required) to absorb fees +
+        # races with other pending orders.
+        margin = required * 0.10
+        if free < required + margin:
+            log.warning(f"⚠️ [ladder] insufficient USDT: free=${free:.4f} need=${required:.4f} (+margin)")
+            return False
+        return True
+
+    async def _handle_external_cancel(self, state, who: str):
+        """A leg or TP order was cancelled outside the bot (operator did
+        it manually on Binance). Free the slot, set cooldown so we don't
+        immediately re-enter, but DON'T sell any held qty — that's the
+        operator's to manage now."""
+        log.info(f"🛑 [ladder] {state.symbol} {who} cancelled externally; releasing slot + cooldown")
+        # Cancel any remaining open orders for this ladder so we don't
+        # leave stragglers on the book that could fill later.
+        for leg in (state.buy_1, state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try:
+                    await self.client.cancel_order(leg.order_id, state.symbol)
+                except Exception:
+                    pass
+                leg.status = "cancelled"
+                leg.order_id = None
+        if state.tp_order_id:
+            try:
+                await self.client.cancel_order(state.tp_order_id, state.symbol)
+            except Exception:
+                pass
+            state.tp_order_id = None
+        # Record + free
+        state.state = ladder.CLOSED
+        state.exit_reason = "manual_cancel"
+        state.closed_ts = int(time.time() * 1000)
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, state.weighted_avg() or 0,
+                                           0, reason="manual_cancel", pnl_usdt=0)
+            except Exception:
+                pass
+        ladder.clear_state(self.redis, state.symbol)
+        ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
 
     async def _ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
@@ -821,6 +874,12 @@ class MultiSymbolScalper:
                 buy1_qty = self.round_step(self.ladder_buy1_size / signal_price, f["step_size"])
                 if (buy1_qty * signal_price) < f["min_notional"]:
                     log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                    return
+                # Pre-flight: enough USDT for all 3 legs ($36 by default).
+                total_needed = (self.ladder_buy1_size
+                                + self.ladder_buy2_size + self.ladder_buy3_size)
+                if not await self._has_sufficient_usdt(total_needed):
+                    log.info(f"⏸️  [ladder] {symbol} skipped — funds short for full ladder")
                     return
                 try:
                     placed = await self.client.create_market_buy_order(symbol, buy1_qty)
@@ -966,6 +1025,10 @@ class MultiSymbolScalper:
             log.debug(f"[ladder] fetch buy 1 {state.symbol} failed: {exc}")
             return
         status = (o.get("status") or "").lower()
+        # Manual cancel detection (operator cancelled on Binance UI)
+        if status in ("canceled", "cancelled", "expired"):
+            await self._handle_external_cancel(state, "buy 1")
+            return
         if status != "closed":
             return
         filled_qty = float(o.get("filled") or 0)
@@ -1015,14 +1078,19 @@ class MultiSymbolScalper:
         """In ACTIVE_1 we watch both buy 2 and buy 3 limits and the TP order.
         - If TP fires → close out
         - If buy 2 fills → cancel buy 3, refresh TP, transition to ACTIVE_2
-        - If buy 3 fills before buy 2 (gap) → transition to ACTIVE_3"""
+        - If buy 3 fills before buy 2 (gap) → transition to ACTIVE_3
+        - If TP is manually cancelled → free slot, set cooldown"""
         # Check TP first
         if state.tp_order_id:
             try:
                 tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
-                if (tp_o.get("status") or "").lower() == "closed":
+                tp_status = (tp_o.get("status") or "").lower()
+                if tp_status == "closed":
                     exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
                     await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+                if tp_status in ("canceled", "cancelled", "expired"):
+                    await self._handle_external_cancel(state, "TP")
                     return
             except Exception:
                 pass
@@ -1033,7 +1101,11 @@ class MultiSymbolScalper:
                 o2 = await self.client.fetch_order(state.buy_2.order_id, state.symbol)
             except Exception:
                 o2 = None
-            if o2 and (o2.get("status") or "").lower() == "closed":
+            o2_status = (o2.get("status") or "").lower() if o2 else ""
+            if o2_status in ("canceled", "cancelled", "expired"):
+                await self._handle_external_cancel(state, "buy 2")
+                return
+            if o2 and o2_status == "closed":
                 qty = float(o2.get("filled") or 0)
                 price = float(o2.get("average") or o2.get("price") or state.buy_2.target_price)
                 if qty > 0:
@@ -1065,7 +1137,17 @@ class MultiSymbolScalper:
                 o3 = await self.client.fetch_order(state.buy_3.order_id, state.symbol)
             except Exception:
                 o3 = None
-            if o3 and (o3.get("status") or "").lower() == "closed":
+            o3_status = (o3.get("status") or "").lower() if o3 else ""
+            if o3_status in ("canceled", "cancelled", "expired"):
+                # Buy 3 only cancelled — that's fine, we can keep going on
+                # the buy 1 (+ maybe buy 2) position. Mark it dead so we
+                # don't poll it again.
+                state.buy_3.status = "cancelled"
+                state.buy_3.order_id = None
+                ladder.save_state(self.redis, state)
+                log.info(f"⚠️  [ladder] {state.symbol} buy 3 cancelled externally; continuing")
+                return
+            if o3 and o3_status == "closed":
                 qty = float(o3.get("filled") or 0)
                 price = float(o3.get("average") or o3.get("price") or state.buy_3.target_price)
                 if qty > 0:
@@ -1094,9 +1176,13 @@ class MultiSymbolScalper:
         if state.tp_order_id:
             try:
                 tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
-                if (tp_o.get("status") or "").lower() == "closed":
+                tp_status = (tp_o.get("status") or "").lower()
+                if tp_status == "closed":
                     exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
                     await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+                if tp_status in ("canceled", "cancelled", "expired"):
+                    await self._handle_external_cancel(state, "TP (ACTIVE_2)")
                     return
             except Exception:
                 pass
@@ -1129,9 +1215,13 @@ class MultiSymbolScalper:
         if state.tp_order_id:
             try:
                 tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
-                if (tp_o.get("status") or "").lower() == "closed":
+                tp_status = (tp_o.get("status") or "").lower()
+                if tp_status == "closed":
                     exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
                     await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+                if tp_status in ("canceled", "cancelled", "expired"):
+                    await self._handle_external_cancel(state, "TP (ACTIVE_3)")
                     return
             except Exception:
                 pass

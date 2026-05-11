@@ -51,7 +51,10 @@ EXIT_MANUAL = "manual"
 
 # Redis keys — 2026-05-11 iter 2: switched from single-key to per-symbol
 # hash so up to N ladders can run concurrently (operator chose max=3).
-LADDER_STATES_HASH      = "SCALPER:LADDER_STATES"          # Redis HASH symbol → JSON state
+LADDER_STATES_HASH       = "SCALPER:LADDER_STATES"         # Fast Scalper hash
+VIRTUAL_LADDER_STATES_HASH = "VIRTUAL:LADDER_STATES"       # Virtual Scalper hash
+# Both hashes are treated together for global capacity decisions.
+ALL_LADDER_HASHES        = (LADDER_STATES_HASH, VIRTUAL_LADDER_STATES_HASH)
 
 # Legacy single-key fallbacks kept for one-shot migration paths.
 LADDER_STATE_KEY        = "SCALPER:LADDER_STATE"
@@ -353,3 +356,30 @@ def cooldown_remaining_seconds(redis_client, symbol: str) -> int:
         return max(0, int(ttl)) if ttl is not None else 0
     except Exception:
         return 0
+
+
+# ── Combined (Fast + Virtual) helpers for global capacity decisions ──────
+
+def list_active_symbols_combined(redis_client) -> List[str]:
+    """Symbols with an active ladder in EITHER scalper's hash. Used for the
+    global concurrent-trade cap (2026-05-11 iter 5: cap is now total
+    across the whole system, not per-scalper)."""
+    if not redis_client: return []
+    out = set()
+    for hash_name in ALL_LADDER_HASHES:
+        try:
+            keys = redis_client.hkeys(hash_name) or []
+            out.update(keys)
+        except Exception:
+            pass
+    return list(out)
+
+
+def count_total_active(redis_client) -> int:
+    """Total ladders in flight across both Fast and Virtual Scalpers."""
+    return len(list_active_symbols_combined(redis_client))
+
+
+def is_active_anywhere(redis_client, symbol: str) -> bool:
+    """True if either scalper currently has a ladder for this symbol."""
+    return symbol in list_active_symbols_combined(redis_client)
