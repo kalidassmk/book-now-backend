@@ -154,7 +154,15 @@ class TradingConfig:
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.
+    # NOTE: when ladderBuy1OffsetPct > 0 below, Buy 1 is a LIMIT at the
+    # configured offset (this flag is ignored).
     ladderBuy1UseMarketOrder: bool = True
+    # 2026-05-11 iter 7: lets operator place Buy 1 as a LIMIT below the
+    # signal price (e.g. 0.1 % → Buy 1 at signal × 0.999) instead of a
+    # market order. Set to 0 to keep the current market-order behaviour.
+    # When >0, ladderBuy1UseMarketOrder is ignored and Buy 1 waits up to
+    # limitBuyTimeoutSec for fill.
+    ladderBuy1OffsetPct: float = 0.0
     # 2026-05-11 iter 4: per-coin cooldown. After a ladder closes the
     # same symbol is blocked for N seconds so the bot doesn't immediately
     # re-enter the same trade.

@@ -100,6 +100,7 @@ class VirtualScalpExecutor:
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
         self.ladder_hard_stop_pct = 1.0
+        self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
         self.ladder_cooldown_seconds = 14400  # 4 hours
 
         # Metrics collector — same Redis as everything else.
@@ -168,6 +169,7 @@ class VirtualScalpExecutor:
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
+                self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
                 self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -380,7 +382,7 @@ class VirtualScalpExecutor:
         tick = f['tick_size'] or 0.00000001
         now_ms = int(time.time() * 1000)
 
-        # Determine whether to use market or limit for buy 1
+        # Determine routing: offset > 0 takes priority over market flag
         cfg = {}
         try:
             raw = self.r.get(TRADING_CONFIG_KEY)
@@ -388,6 +390,38 @@ class VirtualScalpExecutor:
         except Exception:
             pass
         use_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
+        buy1_offset = float(cfg.get("ladderBuy1OffsetPct", 0.0))
+
+        # If offset > 0: place LIMIT BUY at signal × (1 - offset/100)
+        if buy1_offset > 0:
+            buy1_price = self._round_step(signal_price * (1 - buy1_offset / 100.0), tick)
+            buy1_qty = self._round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f['step_size'])
+            if buy1_qty * buy1_price < f['min_notional']:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
+                return
+            try:
+                placed = self.client.create_limit_buy_order(ccxt_sym, buy1_qty, buy1_price)
+            except Exception as e:
+                print(f"❌ [v-ladder] {symbol} limit buy failed: {e}")
+                return
+            order_id = str(placed.get("id") or "")
+            if not order_id:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 returned no order id")
+                return
+            state = ladder.LadderState(
+                symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                state=ladder.PENDING_BUY_1,
+                buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
+                                 size_usdt=self.ladder_buy1_size, order_id=order_id),
+            )
+            self._paper_ladder_save(state)
+            print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
+                  f"(-{buy1_offset}% from signal {signal_price}) qty={buy1_qty}")
+            if self.metrics is not None:
+                self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
+                                        features=features, order_type="virtual_ladder_buy_1_offset_limit",
+                                        offset_pct=buy1_offset)
+            return
 
         if use_market:
             # MARKET PATH — fast-path: legs 2/3 + TP go on the book immediately

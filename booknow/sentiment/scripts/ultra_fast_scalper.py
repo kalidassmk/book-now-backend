@@ -152,6 +152,7 @@ class MultiSymbolScalper:
         self.ladder_tp_from_avg_pct = 0.6
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
+        self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
         self.ladder_cooldown_seconds = 14400   # 4 hours
 
         # Metrics collector — bound after Redis connects.
@@ -445,6 +446,7 @@ class MultiSymbolScalper:
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
+            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
             self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
 
             if self.metrics is not None:
@@ -867,6 +869,53 @@ class MultiSymbolScalper:
                 return
 
             tick = f.get("tick_size") or 0.00000001
+
+            # Routing priority:
+            #   1. ladderBuy1OffsetPct > 0  → LIMIT at signal × (1 - X%)
+            #   2. ladderBuy1UseMarketOrder → MARKET (current default)
+            #   3. else                     → aggressive-limit-at-ask
+            use_offset_limit = self.ladder_buy1_offset_pct > 0
+
+            if use_offset_limit:
+                # LIMIT BUY at a specific offset below signal price.
+                buy1_price = self.round_step(
+                    signal_price * (1 - self.ladder_buy1_offset_pct / 100.0), tick
+                )
+                buy1_qty = self.round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f["step_size"])
+                if (buy1_qty * buy1_price) < f["min_notional"]:
+                    log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                    return
+                total_needed = (self.ladder_buy1_size
+                                + self.ladder_buy2_size + self.ladder_buy3_size)
+                if not await self._has_sufficient_usdt(total_needed):
+                    log.info(f"⏸️  [ladder] {symbol} skipped — funds short")
+                    return
+                try:
+                    placed = await self.client.create_limit_buy_order(symbol, buy1_qty, buy1_price)
+                except Exception as exc:
+                    log.error(f"❌ [ladder] {symbol} limit buy failed: {exc}")
+                    return
+                order_id = placed.get("id")
+                if not order_id:
+                    log.warning(f"⚠️ [ladder] {symbol} buy 1 returned no order id")
+                    return
+                now_ms = int(time.time() * 1000)
+                state = ladder.LadderState(
+                    symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                    state=ladder.PENDING_BUY_1,
+                    buy_1=ladder.Leg(
+                        label="buy_1", target_price=buy1_price,
+                        size_usdt=self.ladder_buy1_size, order_id=str(order_id),
+                    ),
+                )
+                ladder.save_state(self.redis, state)
+                log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
+                         f"(-{self.ladder_buy1_offset_pct}% from signal {signal_price}) qty={buy1_qty}")
+                if self.metrics is not None:
+                    self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
+                                            features=features, order_type="ladder_buy_1_offset_limit",
+                                            offset_pct=self.ladder_buy1_offset_pct)
+                return
 
             if self.ladder_buy1_market:
                 # Fast-path: market order returns synchronously with fill
