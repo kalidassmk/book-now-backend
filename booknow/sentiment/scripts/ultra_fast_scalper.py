@@ -1190,7 +1190,14 @@ class MultiSymbolScalper:
         if state.buy_3 and state.buy_3.order_id:
             try:
                 o3 = await self.client.fetch_order(state.buy_3.order_id, state.symbol)
-                if (o3.get("status") or "").lower() == "closed":
+                o3_status = (o3.get("status") or "").lower()
+                if o3_status in ("canceled", "cancelled", "expired"):
+                    state.buy_3.status = "cancelled"
+                    state.buy_3.order_id = None
+                    ladder.save_state(self.redis, state)
+                    log.info(f"⚠️  [ladder] {state.symbol} buy 3 (ACTIVE_2) cancelled externally")
+                    return
+                if o3_status == "closed":
                     qty = float(o3.get("filled") or 0)
                     price = float(o3.get("average") or o3.get("price") or state.buy_3.target_price)
                     if qty > 0:
