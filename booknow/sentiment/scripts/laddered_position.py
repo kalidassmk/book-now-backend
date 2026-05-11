@@ -57,6 +57,12 @@ LADDER_STATES_HASH      = "SCALPER:LADDER_STATES"          # Redis HASH symbol �
 LADDER_STATE_KEY        = "SCALPER:LADDER_STATE"
 LADDER_ACTIVE_SYMBOL    = "SCALPER:LADDER_ACTIVE_SYMBOL"   # legacy single-coin lock
 
+# Cooldown — after a ladder closes (TP or hard stop), the same coin is
+# blocked for COOLDOWN_SECONDS so the bot doesn't immediately re-enter
+# the same trade. Implemented as a Redis key with TTL.
+COOLDOWN_KEY_PREFIX     = "SCALPER:LADDER_COOLDOWN:"
+DEFAULT_COOLDOWN_SECONDS = 4 * 3600   # 4 hours
+
 
 @dataclass
 class Leg:
@@ -313,3 +319,37 @@ def summarise_closed_trade(state: LadderState, exit_price: float) -> Dict[str, A
         "tbe_minutes": tbe_min,
         "drawdown_multiplier": dm,
     }
+
+
+# ── Per-symbol cooldown helpers ──────────────────────────────────────────
+
+def set_cooldown(redis_client, symbol: str, seconds: int = DEFAULT_COOLDOWN_SECONDS) -> None:
+    """Mark this symbol as 'just-traded' — block new ladders for `seconds`."""
+    if not redis_client or not symbol or seconds <= 0:
+        return
+    try:
+        key = COOLDOWN_KEY_PREFIX + symbol
+        redis_client.set(key, "1", ex=seconds)
+    except Exception:
+        pass
+
+
+def is_on_cooldown(redis_client, symbol: str) -> bool:
+    """True if the symbol's cooldown is still active."""
+    if not redis_client or not symbol:
+        return False
+    try:
+        return bool(redis_client.exists(COOLDOWN_KEY_PREFIX + symbol))
+    except Exception:
+        return False
+
+
+def cooldown_remaining_seconds(redis_client, symbol: str) -> int:
+    """Seconds left on the cooldown (0 if not active or unknown)."""
+    if not redis_client or not symbol:
+        return 0
+    try:
+        ttl = redis_client.ttl(COOLDOWN_KEY_PREFIX + symbol)
+        return max(0, int(ttl)) if ttl is not None else 0
+    except Exception:
+        return 0

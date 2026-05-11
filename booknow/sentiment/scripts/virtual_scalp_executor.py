@@ -99,6 +99,7 @@ class VirtualScalpExecutor:
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 1.0
         self.ladder_hard_stop_pct = 1.0
+        self.ladder_cooldown_seconds = 14400  # 4 hours
 
         # Metrics collector — same Redis as everything else.
         self.metrics = make_collector(self.r, enabled=True) if make_collector else None
@@ -166,6 +167,7 @@ class VirtualScalpExecutor:
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
+                self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception:
@@ -762,6 +764,8 @@ class VirtualScalpExecutor:
               f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
               f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
         self._paper_ladder_clear(state.symbol)
+        # Per-coin cooldown to prevent immediate re-entry
+        ladder.set_cooldown(self.r, state.symbol, self.ladder_cooldown_seconds)
 
     def passes_falling_knife(self, symbol, timeline):
         """Apply the same 3 falling-knife rules used by the Fast Scalper,
@@ -904,6 +908,8 @@ class VirtualScalpExecutor:
                         if self.ladder_enabled and ladder is not None:
                             if self._paper_ladder_active_for_symbol(symbol):
                                 pass  # already have a ladder for this coin
+                            elif ladder.is_on_cooldown(self.r, symbol):
+                                pass  # on per-coin cooldown
                             elif not self._paper_ladder_can_open():
                                 pass  # at max concurrent capacity
                             else:

@@ -150,7 +150,8 @@ class MultiSymbolScalper:
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 1.0
         self.ladder_hard_stop_pct = 1.0
-        self.ladder_buy1_market = False
+        self.ladder_buy1_market = True
+        self.ladder_cooldown_seconds = 14400   # 4 hours
 
         # Metrics collector — bound after Redis connects.
         self.metrics = None
@@ -442,7 +443,8 @@ class MultiSymbolScalper:
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
-            self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", False))
+            self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
+            self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
 
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -783,6 +785,11 @@ class MultiSymbolScalper:
         # Already a ladder for this symbol?
         if ladder.load_state(self.redis, symbol) is not None:
             log.info(f"⏸️  [{symbol}] already has an active ladder; ignoring signal")
+            return True
+        # Cooldown check
+        if ladder.is_on_cooldown(self.redis, symbol):
+            secs = ladder.cooldown_remaining_seconds(self.redis, symbol)
+            log.info(f"⏸️  [{symbol}] on cooldown ({secs//60} min left); ignoring signal")
             return True
         # Global capacity check
         active_count = ladder.count_active(self.redis)
@@ -1245,6 +1252,8 @@ class MultiSymbolScalper:
                  f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
                  f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
         ladder.clear_state(self.redis, state.symbol)
+        # Per-coin cooldown — block re-entry on the same symbol
+        ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
 
     async def execute_buy(self, symbol, price, features=None):
         if not self.auto_enabled:

@@ -154,6 +154,10 @@ class TradingConfig:
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.
     ladderBuy1UseMarketOrder: bool = True
+    # 2026-05-11 iter 4: per-coin cooldown. After a ladder closes the
+    # same symbol is blocked for N seconds so the bot doesn't immediately
+    # re-enter the same trade.
+    ladderCooldownSeconds: int = 14400   # 4 hours
 
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
