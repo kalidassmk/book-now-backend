@@ -43,8 +43,9 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 # 2026-05-11: bumped to $12 sizing (was 6.0) to match Fast Scalper.
 # Net per win at +1% TP: gross $0.12, fees ~$0.024 round-trip → net ≈ $0.10.
 DEFAULT_BUY_AMOUNT_USDT = 12.0
-DEFAULT_PROFIT_TARGET_USDT = 0.12    # legacy USDT target — only used when profitPct == 0
-DEFAULT_PROFIT_PCT = 1.0             # % above entry → ≈$0.10 NET on $12 buy
+# 2026-05-11 iter 4: TP tuned for ~$0.05 net per $12 leg.
+DEFAULT_PROFIT_TARGET_USDT = 0.05    # legacy USDT target — only used when profitPct == 0
+DEFAULT_PROFIT_PCT = 0.6             # % above entry → ≈$0.05 NET on $12 buy
 DEFAULT_LIMIT_OFFSET_PCT = 0.65      # % below signal price; legacy strategy
 
 # Risk Settings for Virtual Scalper
@@ -97,7 +98,7 @@ class VirtualScalpExecutor:
         self.ladder_buy3_size = 12.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
-        self.ladder_tp_from_avg_pct = 1.0
+        self.ladder_tp_from_avg_pct = 0.6
         self.ladder_hard_stop_pct = 1.0
         self.ladder_cooldown_seconds = 14400  # 4 hours
 
@@ -165,7 +166,7 @@ class VirtualScalpExecutor:
                 self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
-                self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
+                self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
                 self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
                 if self.metrics is not None:

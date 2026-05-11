@@ -42,9 +42,10 @@ class TradingConfig:
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
-    # 1.0 % = $0.06 gross / ≈$0.05 net per win on a $6 buy after 0.2 %
-    # round-trip Binance fees.
-    profitPct: float = 1.0
+    # 2026-05-11 iter 4: TP 1.0 → 0.6 % so a $12 Buy 1 sell nets ~$0.05
+    # (gross $0.072 - $0.024 fees). Multi-leg fills scale linearly
+    # (~$0.05 per filled $12 leg).
+    profitPct: float = 0.6
     profitAmountUsdt: float = 0.0
 
     # ── Stop loss (Fast Scalper consumes; Virtual Scalper too) ──────────
@@ -148,7 +149,7 @@ class TradingConfig:
     ladderBuy3SizeUsdt: float = 12.0
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
-    ladderTpFromAvgPct: float = 1.0     # TP at weighted_avg × 1.01
+    ladderTpFromAvgPct: float = 0.6     # TP at weighted_avg × 1.006 → net ~$0.05/leg
     ladderHardStopBelowBuy3Pct: float = 1.0  # stop at buy3 × 0.99 if buy3 filled
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for

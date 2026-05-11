@@ -99,7 +99,8 @@ class MultiSymbolScalper:
         # With 3 concurrent ladders × 3 fills × $12, max exposure $108.
         self.auto_enabled = True
         self.buy_amount_usdt = 12.0
-        self.profit_target_usdt = 0.12
+        # 2026-05-11 iter 4: TP target tuned for ~$0.05 net per $12 leg.
+        self.profit_target_usdt = 0.05
         self.stop_loss_usdt = 0.0       # disabled by default (Option B legacy)
 
         # Market-context filters (derived from yesterday's P&L analysis).
@@ -148,7 +149,7 @@ class MultiSymbolScalper:
         self.ladder_buy3_size = 12.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
-        self.ladder_tp_from_avg_pct = 1.0
+        self.ladder_tp_from_avg_pct = 0.6
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
         self.ladder_cooldown_seconds = 14400   # 4 hours
@@ -384,12 +385,12 @@ class MultiSymbolScalper:
             self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 12.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
-            # Defaults: profitPct = 1.0 % (Option B), legacy USDT = $0.10.
-            profit_pct = float(cfg.get("profitPct", 1.0) or 1.0)
+            # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
+            profit_pct = float(cfg.get("profitPct", 0.6) or 0.6)
             if profit_pct > 0:
                 self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
             else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.10))
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.05))
 
             # Stop loss: explicit USDT; 0 (or negative) disables both the
             # OCO SL leg and the polling SL exit. Default to 0 so older
@@ -441,7 +442,7 @@ class MultiSymbolScalper:
             self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
-            self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
+            self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
             self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
