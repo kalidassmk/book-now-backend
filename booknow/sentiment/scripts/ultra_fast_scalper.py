@@ -35,6 +35,12 @@ try:
 except Exception:
     make_collector = None  # type: ignore
 
+# Laddered Recovery state machine
+try:
+    import laddered_position as ladder  # type: ignore
+except Exception:
+    ladder = None  # type: ignore
+
 def manual_load_dotenv(path):
     if not os.path.exists(path): return
     with open(path, 'r') as f:
@@ -134,6 +140,20 @@ class MultiSymbolScalper:
         # the +1% TP / patient hold strategy. 2026-05-11 P&L analysis
         # showed most "panic exits" hit TP later if held.
         self.trend_reversal_exit_enabled = True
+
+        # Laddered Recovery — single-coin, 3-tier averaging-down entry.
+        # When enabled, the bot trades ONE coin at a time using the
+        # ladder state machine in laddered_position.py.
+        self.ladder_enabled = False
+        self.single_coin_mode = True
+        self.ladder_buy1_size = 6.0
+        self.ladder_buy2_size = 6.0
+        self.ladder_buy3_size = 6.0
+        self.ladder_buy2_offset_pct = 0.5
+        self.ladder_buy3_offset_pct = 1.0
+        self.ladder_tp_from_avg_pct = 1.0
+        self.ladder_hard_stop_pct = 1.0
+        self.ladder_buy1_market = False
 
         # Metrics collector — bound after Redis connects.
         self.metrics = None
@@ -414,6 +434,18 @@ class MultiSymbolScalper:
             # flip on/off without restart.
             self.trend_reversal_exit_enabled = bool(cfg.get("trendReversalExitEnabled", True))
 
+            # Laddered Recovery knobs (single-coin 3-tier).
+            self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
+            self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", True))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 6.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 6.0))
+            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 6.0))
+            self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
+            self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
+            self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
+            self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
+            self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", False))
+
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception as e:
@@ -647,6 +679,15 @@ class MultiSymbolScalper:
 
     async def process_symbol(self, symbol, btc_df):
         """Analyze and trade a single symbol."""
+        # Laddered Recovery: when in single-coin mode, skip ALL legacy work
+        # for any symbol that isn't the active ladder; the main loop's
+        # _ladder_tick() drives the live ladder.
+        if (self.ladder_enabled and self.single_coin_mode
+                and ladder is not None and ladder.is_active(self.redis)):
+            held = ladder.active_symbol(self.redis)
+            if held != symbol:
+                return  # ladder owns the floor
+
         # 1. Manage existing position
         if symbol in self.active_positions:
             pos = self.active_positions[symbol]
@@ -731,8 +772,437 @@ class MultiSymbolScalper:
                 return
             await self.execute_buy(symbol, last_price, features=features)
 
+    # ── Laddered Recovery (single-coin 3-tier averaging-down) ──────────────
+    async def _maybe_route_ladder(self, symbol, price, features=None):
+        """If ladder + single-coin mode are on, route the buy through the
+        ladder state machine. Returns True if the ladder handled the buy
+        (caller skips the legacy single-buy path)."""
+        if not (self.ladder_enabled and self.single_coin_mode and ladder is not None):
+            return False
+        # If a ladder is already in flight, ignore new signals.
+        if ladder.is_active(self.redis):
+            held = ladder.active_symbol(self.redis)
+            log.info(f"⏸️  [{symbol}] ladder busy with {held}, ignoring signal")
+            return True
+        # Place the first leg now; subsequent legs and TP are placed on fill.
+        await self._ladder_start(symbol, price, features=features)
+        return True
+
+    async def _ladder_start(self, symbol, signal_price, features=None):
+        """Place buy 1 (aggressive-limit-at-ask or market), persist state."""
+        try:
+            if symbol not in self.filters: await self.fetch_filters(symbol)
+            f = self.filters.get(symbol)
+            if not f:
+                log.warning(f"⚠️ [ladder] {symbol} missing market filters; skipping")
+                return
+
+            tick = f.get("tick_size") or 0.00000001
+
+            # Buy 1 price: aggressive limit at current best ask = fast fill
+            # without paying the full spread on a market order.
+            if self.ladder_buy1_market:
+                buy1_price = signal_price
+                buy1_qty = self.round_step(self.ladder_buy1_size / signal_price, f["step_size"])
+                if (buy1_qty * signal_price) < f["min_notional"]:
+                    log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                    return
+                placed = await self.client.create_market_buy_order(symbol, buy1_qty)
+            else:
+                # Fetch best ask via orderbook
+                try:
+                    book = await self.client.fetch_order_book(symbol, limit=5)
+                    best_ask = float(book["asks"][0][0]) if book.get("asks") else signal_price
+                except Exception:
+                    best_ask = signal_price
+                buy1_price = self.round_step(best_ask, tick)
+                buy1_qty = self.round_step(self.ladder_buy1_size / buy1_price, f["step_size"])
+                if (buy1_qty * buy1_price) < f["min_notional"]:
+                    log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                    return
+                placed = await self.client.create_limit_buy_order(symbol, buy1_qty, buy1_price)
+
+            order_id = placed.get("id")
+            if not order_id:
+                log.warning(f"⚠️ [ladder] {symbol} buy 1 returned no order id")
+                return
+
+            now_ms = int(time.time() * 1000)
+            state = ladder.LadderState(
+                symbol=symbol,
+                signal_price=signal_price,
+                signal_ts=now_ms,
+                state=ladder.PENDING_BUY_1,
+                buy_1=ladder.Leg(
+                    label="buy_1", target_price=buy1_price,
+                    size_usdt=self.ladder_buy1_size, order_id=str(order_id),
+                ),
+            )
+            ladder.save_state(self.redis, state)
+            log.info(f"🪜 [ladder] {symbol} buy 1 placed @ {buy1_price} qty={buy1_qty} (order={order_id})")
+            if self.metrics is not None:
+                self.metrics.buy_placed(
+                    symbol, buy1_price, self.ladder_buy1_size,
+                    features=features, order_type="ladder_buy_1",
+                    offset_pct=0.0,
+                )
+        except Exception as exc:
+            log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
+
+    async def _ladder_tick(self):
+        """Called every loop iteration to drive the active ladder forward.
+        Polls Binance for fills, places follow-up orders, manages TP/stop."""
+        if ladder is None: return
+        state = ladder.load_state(self.redis)
+        if state is None or state.state == ladder.CLOSED: return
+        symbol = state.symbol
+        try:
+            f = self.filters.get(symbol)
+            if not f:
+                await self.fetch_filters(symbol)
+                f = self.filters.get(symbol)
+            if not f:
+                return
+            tick = f.get("tick_size") or 0.00000001
+
+            if state.state == ladder.PENDING_BUY_1:
+                await self._ladder_check_buy1_fill(state, f, tick)
+            elif state.state == ladder.ACTIVE_1:
+                await self._ladder_check_buy2_or_buy3(state, f, tick)
+            elif state.state == ladder.ACTIVE_2:
+                await self._ladder_check_buy3(state, f, tick)
+            elif state.state == ladder.ACTIVE_3:
+                await self._ladder_check_hard_stop_or_tp(state, f, tick)
+            # Update underwater accumulator on every tick (for TBE metric)
+            await self._ladder_update_underwater(state, f)
+        except Exception as exc:
+            log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
+
+    async def _ladder_check_buy1_fill(self, state, f, tick):
+        """Poll buy 1; once filled, place buys 2 & 3 + TP order."""
+        if not state.buy_1 or not state.buy_1.order_id: return
+        try:
+            o = await self.client.fetch_order(state.buy_1.order_id, state.symbol)
+        except Exception as exc:
+            log.debug(f"[ladder] fetch buy 1 {state.symbol} failed: {exc}")
+            return
+        status = (o.get("status") or "").lower()
+        if status != "closed":
+            return
+        filled_qty = float(o.get("filled") or 0)
+        fill_price = float(o.get("average") or o.get("price") or state.buy_1.target_price)
+        if filled_qty <= 0:
+            log.warning(f"⚠️ [ladder] {state.symbol} buy 1 closed with zero qty")
+            ladder.clear_state(self.redis)
+            return
+
+        # Apply fee floor: subtract 0.1 % from filled qty (Binance fee in base)
+        base_qty = self.round_step(filled_qty * 0.999, f["step_size"])
+        state.buy_1.qty_filled = base_qty
+        state.buy_1.fill_price = fill_price
+        state.buy_1.fill_ts = int(time.time() * 1000)
+        state.buy_1.status = "filled"
+
+        # Place buys 2 & 3 limits
+        signal = state.signal_price
+        buy2_price = self.round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        buy3_price = self.round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        buy2_qty = self.round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f["step_size"])
+        buy3_qty = self.round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f["step_size"])
+
+        buy2_oid = buy3_oid = None
+        if (buy2_qty * buy2_price) >= f["min_notional"]:
+            try:
+                o2 = await self.client.create_limit_buy_order(state.symbol, buy2_qty, buy2_price)
+                buy2_oid = str(o2.get("id"))
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] {state.symbol} buy 2 placement failed: {exc}")
+        if (buy3_qty * buy3_price) >= f["min_notional"]:
+            try:
+                o3 = await self.client.create_limit_buy_order(state.symbol, buy3_qty, buy3_price)
+                buy3_oid = str(o3.get("id"))
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] {state.symbol} buy 3 placement failed: {exc}")
+
+        state.buy_2 = ladder.Leg(
+            label="buy_2", target_price=buy2_price, size_usdt=self.ladder_buy2_size,
+            order_id=buy2_oid,
+        )
+        state.buy_3 = ladder.Leg(
+            label="buy_3", target_price=buy3_price, size_usdt=self.ladder_buy3_size,
+            order_id=buy3_oid,
+        )
+
+        # TP at avg × (1 + tp_pct)
+        avg = state.weighted_avg()
+        tp_price = ladder.tp_price(avg, self.ladder_tp_from_avg_pct, tick)
+        await self._ladder_place_tp(state, base_qty, tp_price, f)
+
+        state.state = ladder.ACTIVE_1
+        ladder.save_state(self.redis, state)
+        log.info(f"✅ [ladder] {state.symbol} buy 1 filled qty={base_qty} @ {fill_price}; "
+                 f"buy2@{buy2_price} buy3@{buy3_price} tp@{tp_price}")
+        if self.metrics is not None:
+            self.metrics.fill_recorded(state.symbol, fill_price, base_qty)
+
+    async def _ladder_place_tp(self, state, qty_total, tp_price, filters):
+        """Place a LIMIT SELL for entire filled qty at tp_price."""
+        try:
+            placed = await self.client.create_limit_sell_order(state.symbol, qty_total, tp_price)
+            tp_oid = placed.get("id")
+            state.tp_order_id = str(tp_oid) if tp_oid else None
+            state.tp_target_price = tp_price
+        except Exception as exc:
+            log.warning(f"⚠️ [ladder] {state.symbol} TP placement failed: {exc}")
+            state.tp_order_id = None
+            state.tp_target_price = tp_price
+
+    async def _ladder_refresh_tp(self, state, filters, tick):
+        """Cancel old TP + place new TP at updated avg × (1 + tp_pct)."""
+        if state.tp_order_id:
+            try:
+                await self.client.cancel_order(state.tp_order_id, state.symbol)
+            except Exception:
+                pass
+        qty_total = state.total_qty()
+        new_tp = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct, tick)
+        await self._ladder_place_tp(state, qty_total, new_tp, filters)
+
+    async def _ladder_check_buy2_or_buy3(self, state, f, tick):
+        """In ACTIVE_1 we watch both buy 2 and buy 3 limits and the TP order.
+        - If TP fires → close out
+        - If buy 2 fills → cancel buy 3, refresh TP, transition to ACTIVE_2
+        - If buy 3 fills before buy 2 (gap) → transition to ACTIVE_3"""
+        # Check TP first
+        if state.tp_order_id:
+            try:
+                tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
+                if (tp_o.get("status") or "").lower() == "closed":
+                    exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
+                    await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+            except Exception:
+                pass
+
+        # Check buy 2
+        if state.buy_2 and state.buy_2.order_id:
+            try:
+                o2 = await self.client.fetch_order(state.buy_2.order_id, state.symbol)
+            except Exception:
+                o2 = None
+            if o2 and (o2.get("status") or "").lower() == "closed":
+                qty = float(o2.get("filled") or 0)
+                price = float(o2.get("average") or o2.get("price") or state.buy_2.target_price)
+                if qty > 0:
+                    state.buy_2.qty_filled = self.round_step(qty * 0.999, f["step_size"])
+                    state.buy_2.fill_price = price
+                    state.buy_2.fill_ts = int(time.time() * 1000)
+                    state.buy_2.status = "filled"
+                    # CANCEL buy 3 per operator rule
+                    if state.buy_3 and state.buy_3.order_id:
+                        try:
+                            await self.client.cancel_order(state.buy_3.order_id, state.symbol)
+                        except Exception:
+                            pass
+                        state.buy_3.status = "cancelled"
+                        state.buy_3.order_id = None
+                    # Refresh TP at new avg
+                    await self._ladder_refresh_tp(state, f, tick)
+                    state.state = ladder.ACTIVE_2
+                    ladder.save_state(self.redis, state)
+                    log.info(f"📥 [ladder] {state.symbol} buy 2 filled @ {price} avg={state.weighted_avg():.6g} "
+                             f"new TP={state.tp_target_price:.6g}; buy 3 cancelled")
+                    if self.metrics is not None:
+                        self.metrics.fill_recorded(state.symbol, price, state.buy_2.qty_filled)
+                    return
+
+        # Check buy 3 (gap scenario)
+        if state.buy_3 and state.buy_3.order_id:
+            try:
+                o3 = await self.client.fetch_order(state.buy_3.order_id, state.symbol)
+            except Exception:
+                o3 = None
+            if o3 and (o3.get("status") or "").lower() == "closed":
+                qty = float(o3.get("filled") or 0)
+                price = float(o3.get("average") or o3.get("price") or state.buy_3.target_price)
+                if qty > 0:
+                    state.buy_3.qty_filled = self.round_step(qty * 0.999, f["step_size"])
+                    state.buy_3.fill_price = price
+                    state.buy_3.fill_ts = int(time.time() * 1000)
+                    state.buy_3.status = "filled"
+                    await self._ladder_refresh_tp(state, f, tick)
+                    state.hard_stop_price = ladder.hard_stop_price(
+                        price, self.ladder_hard_stop_pct, tick
+                    )
+                    state.state = ladder.ACTIVE_3
+                    ladder.save_state(self.redis, state)
+                    log.info(f"📥 [ladder] {state.symbol} buy 3 filled @ {price} (gap) avg={state.weighted_avg():.6g} "
+                             f"new TP={state.tp_target_price:.6g} hard_stop={state.hard_stop_price:.6g}")
+                    if self.metrics is not None:
+                        self.metrics.fill_recorded(state.symbol, price, state.buy_3.qty_filled)
+                    return
+
+        ladder.save_state(self.redis, state)
+
+    async def _ladder_check_buy3(self, state, f, tick):
+        """In ACTIVE_2 we still watch the TP and buy 3 (in case it fills
+        before we manage to cancel — race condition safety)."""
+        # TP check
+        if state.tp_order_id:
+            try:
+                tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
+                if (tp_o.get("status") or "").lower() == "closed":
+                    exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
+                    await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+            except Exception:
+                pass
+        # Defensive: buy 3 lingering open
+        if state.buy_3 and state.buy_3.order_id:
+            try:
+                o3 = await self.client.fetch_order(state.buy_3.order_id, state.symbol)
+                if (o3.get("status") or "").lower() == "closed":
+                    qty = float(o3.get("filled") or 0)
+                    price = float(o3.get("average") or o3.get("price") or state.buy_3.target_price)
+                    if qty > 0:
+                        state.buy_3.qty_filled = self.round_step(qty * 0.999, f["step_size"])
+                        state.buy_3.fill_price = price
+                        state.buy_3.fill_ts = int(time.time() * 1000)
+                        state.buy_3.status = "filled"
+                        await self._ladder_refresh_tp(state, f, tick)
+                        state.hard_stop_price = ladder.hard_stop_price(
+                            price, self.ladder_hard_stop_pct, tick
+                        )
+                        state.state = ladder.ACTIVE_3
+                        ladder.save_state(self.redis, state)
+                        log.info(f"📥 [ladder] {state.symbol} buy 3 race-filled @ {price} avg={state.weighted_avg():.6g}")
+                        return
+            except Exception:
+                pass
+        ladder.save_state(self.redis, state)
+
+    async def _ladder_check_hard_stop_or_tp(self, state, f, tick):
+        """In ACTIVE_3 we watch both TP order and hard-stop threshold."""
+        if state.tp_order_id:
+            try:
+                tp_o = await self.client.fetch_order(state.tp_order_id, state.symbol)
+                if (tp_o.get("status") or "").lower() == "closed":
+                    exit_price = float(tp_o.get("average") or tp_o.get("price") or state.tp_target_price)
+                    await self._ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+            except Exception:
+                pass
+        # Hard stop check (live ticker vs threshold)
+        try:
+            tk = await self.client.fetch_ticker(state.symbol)
+            last = float(tk.get("last") or 0)
+        except Exception:
+            last = 0
+        if last > 0 and state.hard_stop_price > 0 and last <= state.hard_stop_price:
+            log.info(f"🛡️ [ladder] {state.symbol} HARD STOP @ {last:.6g} "
+                     f"(threshold={state.hard_stop_price:.6g}, avg={state.weighted_avg():.6g})")
+            # Cancel TP, market-sell everything
+            if state.tp_order_id:
+                try: await self.client.cancel_order(state.tp_order_id, state.symbol)
+                except Exception: pass
+            qty = state.total_qty()
+            try:
+                # Aggressive limit-at-bid sell for known price
+                book = await self.client.fetch_order_book(state.symbol, limit=5)
+                bid = float(book["bids"][0][0]) if book.get("bids") else last
+                bid = self.round_step(bid, tick)
+                sell = await self.client.create_limit_sell_order(state.symbol, qty, bid)
+                exit_price = float(sell.get("average") or sell.get("price") or bid)
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] hard-stop sell failed for {state.symbol}: {exc}")
+                exit_price = last
+            await self._ladder_close(state, exit_price, ladder.EXIT_STOP)
+
+    async def _ladder_update_underwater(self, state, filters):
+        """Track time spent below weighted-avg for the TBE metric."""
+        if state.state not in (ladder.ACTIVE_1, ladder.ACTIVE_2, ladder.ACTIVE_3):
+            return
+        if not state.filled_legs():
+            return
+        try:
+            tk = await self.client.fetch_ticker(state.symbol)
+            last = float(tk.get("last") or 0)
+        except Exception:
+            return
+        if last <= 0: return
+        avg = state.weighted_avg()
+        now = int(time.time() * 1000)
+        if last < avg:
+            if state.below_avg_started_ts == 0:
+                state.below_avg_started_ts = now
+        else:
+            # Recovered to break-even
+            if state.below_avg_started_ts > 0:
+                state.total_underwater_ms += (now - state.below_avg_started_ts)
+                state.below_avg_started_ts = 0
+                state.recovered_to_break_even = True
+        ladder.save_state(self.redis, state)
+
+    async def _ladder_close(self, state, exit_price, reason):
+        """Finalise the ladder: record metrics, clear state, free auto-buy."""
+        # Flush any remaining underwater time
+        if state.below_avg_started_ts > 0:
+            state.total_underwater_ms += int(time.time() * 1000) - state.below_avg_started_ts
+            state.below_avg_started_ts = 0
+        state.state = ladder.CLOSED
+        state.exit_reason = reason
+        state.closed_ts = int(time.time() * 1000)
+        summary = ladder.summarise_closed_trade(state, exit_price)
+
+        # Standard metrics events
+        if self.metrics is not None:
+            avg = summary["weighted_avg"]
+            net = summary["net_pnl_usdt"]
+            if reason == ladder.EXIT_TP:
+                self.metrics.tp_hit(state.symbol, avg, exit_price)
+            self.metrics.exit_recorded(state.symbol, avg, exit_price,
+                                       reason=reason, pnl_usdt=net)
+
+        # Ladder-specific persistent record
+        try:
+            from datetime import datetime as _dt
+            date = _dt.utcnow().strftime("%Y-%m-%d")
+            key = f"METRICS:LADDER:{date}"
+            self.redis.lpush(key, json.dumps(summary))
+            self.redis.ltrim(key, 0, 999)
+            self.redis.expire(key, 30 * 24 * 3600)
+        except Exception:
+            pass
+
+        # Long-term archive
+        try:
+            archive_closed_trade(state.symbol, "FAST_LADDER", {
+                "entry_price": summary["weighted_avg"],
+                "exit_price": exit_price,
+                "qty": summary["qty"],
+                "investment": summary["invested_usdt"],
+                "pnl_usdt": summary["net_pnl_usdt"],
+                "pnl_pct": (
+                    (exit_price - summary["weighted_avg"]) / summary["weighted_avg"] * 100.0
+                ) if summary["weighted_avg"] else 0.0,
+                "fees_paid": summary["fees_usdt"],
+                "reason": f"LADDER_{reason.upper()}",
+                "exit_time": datetime.now().strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
+
+        log.info(f"🪜✅ [ladder] {state.symbol} CLOSED reason={reason} "
+                 f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
+                 f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
+        ladder.clear_state(self.redis)
+
     async def execute_buy(self, symbol, price, features=None):
         if not self.auto_enabled:
+            return
+
+        # Route through the laddered recovery state machine when enabled.
+        if await self._maybe_route_ladder(symbol, price, features=features):
             return
 
         if len(self.active_positions) >= 5: # Safety limit: Max 5 concurrent scalps
@@ -1359,9 +1829,18 @@ class MultiSymbolScalper:
                     last_symbol_refresh = time.time()
 
                 btc_df = await self.get_indicators("BTC/USDT")
-                if btc_df is None: 
+                if btc_df is None:
                     await asyncio.sleep(5)
                     continue
+
+                # Drive the laddered-recovery state machine if one is in
+                # flight. Runs once per loop so order fills + TP/stop
+                # transitions are reacted to within ~1 s.
+                if self.ladder_enabled and self.single_coin_mode and ladder is not None:
+                    try:
+                        await self._ladder_tick()
+                    except Exception as exc:
+                        log.warning(f"⚠️ ladder_tick raised: {exc}")
 
                 # Process in small batches to avoid Binance Rate Limits
                 batch_size = 5

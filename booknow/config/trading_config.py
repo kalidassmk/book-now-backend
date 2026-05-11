@@ -124,6 +124,27 @@ class TradingConfig:
     fastDropThresholdPct: float = 0.7     # price must dip >= this % below signal
     volSurgeThresholdMultiplier: float = 2.0  # vol-1m / pre-baseline must exceed this to keep order
 
+    # ── Laddered Recovery strategy (2026-05-11) ──────────────────────────
+    # 3-tier averaging-down entry pattern, single coin at a time:
+    #   1. Buy 1: aggressive-limit at current ask (instant fill, no spread surprise)
+    #   2. Buy 2: limit at signal × (1 - ladderBuy2OffsetPct/100)
+    #   3. Buy 3: limit at signal × (1 - ladderBuy3OffsetPct/100)  — cancelled when Buy 2 fills
+    # Exit:
+    #   • TP at weighted-avg × (1 + ladderTpFromAvgPct/100)
+    #   • Hard stop activated ONLY after Buy 3 fills (gap scenario), at
+    #     buy_3_price × (1 - ladderHardStopBelowBuy3Pct/100)
+    # Single-coin mode pauses auto-buy while a ladder is active; resumed on close.
+    ladderedRecoveryEnabled: bool = True
+    singleCoinModeEnabled: bool = True
+    ladderBuy1SizeUsdt: float = 6.0
+    ladderBuy2SizeUsdt: float = 6.0
+    ladderBuy3SizeUsdt: float = 6.0
+    ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
+    ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
+    ladderTpFromAvgPct: float = 1.0     # TP at weighted_avg × 1.01
+    ladderHardStopBelowBuy3Pct: float = 1.0  # stop at buy3 × 0.99 if buy3 filled
+    ladderBuy1UseMarketOrder: bool = False  # False = aggressive limit; True = market
+
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
 

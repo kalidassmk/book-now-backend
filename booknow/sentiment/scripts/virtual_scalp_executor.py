@@ -22,6 +22,12 @@ try:
 except Exception:
     make_collector = None  # type: ignore
 
+# Laddered Recovery state machine.
+try:
+    import laddered_position as ladder  # type: ignore
+except Exception:
+    ladder = None  # type: ignore
+
 # --- CONFIGURATION ---
 # Read from env so Docker can point at the `redis` service while local
 # dev still defaults to 127.0.0.1. Compose sets REDIS_HOST=redis.
@@ -82,6 +88,17 @@ class VirtualScalpExecutor:
         self.fd_threshold_pct = 0.5
         self.fd_vol_surge_mult = 2.0
 
+        # Laddered Recovery (paper mirror of Fast Scalper).
+        self.ladder_enabled = False
+        self.single_coin_mode = True
+        self.ladder_buy1_size = 6.0
+        self.ladder_buy2_size = 6.0
+        self.ladder_buy3_size = 6.0
+        self.ladder_buy2_offset_pct = 0.5
+        self.ladder_buy3_offset_pct = 1.0
+        self.ladder_tp_from_avg_pct = 1.0
+        self.ladder_hard_stop_pct = 1.0
+
         # Metrics collector — same Redis as everything else.
         self.metrics = make_collector(self.r, enabled=True) if make_collector else None
 
@@ -137,6 +154,16 @@ class VirtualScalpExecutor:
                 self.fd_detect_minutes = int(cfg.get("fastDropDetectMinutes", 3))
                 self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
                 self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
+                # Laddered Recovery knobs.
+                self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
+                self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", True))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 6.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 6.0))
+                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 6.0))
+                self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
+                self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
+                self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 1.0))
+                self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception:
@@ -188,6 +215,214 @@ class VirtualScalpExecutor:
         except Exception as e:
             print(f"⚠️ [VIRTUAL] filter fetch failed for {symbol}: {e}")
             return None
+
+    # ── Paper Laddered Recovery ─────────────────────────────────────────
+    # Mirrors Fast Scalper's logic but uses simulated fills (price ≤ limit
+    # = filled). Uses its own Redis key namespace so it doesn't collide
+    # with the real-money ladder state.
+    PAPER_LADDER_KEY = "VIRTUAL:LADDER_STATE"
+    PAPER_LADDER_ACTIVE = "VIRTUAL:LADDER_ACTIVE_SYMBOL"
+
+    def _paper_ladder_active(self) -> bool:
+        try:
+            return bool(self.r.get(self.PAPER_LADDER_ACTIVE))
+        except Exception:
+            return False
+
+    def _paper_ladder_load(self):
+        try:
+            raw = self.r.get(self.PAPER_LADDER_KEY)
+            if not raw: return None
+            return ladder.LadderState.from_dict(json.loads(raw))
+        except Exception:
+            return None
+
+    def _paper_ladder_save(self, state):
+        try:
+            self.r.set(self.PAPER_LADDER_KEY, json.dumps(state.to_dict()))
+            if state.state in (ladder.CLOSED, ladder.EXITING):
+                self.r.delete(self.PAPER_LADDER_ACTIVE)
+            else:
+                self.r.set(self.PAPER_LADDER_ACTIVE, state.symbol)
+        except Exception:
+            pass
+
+    def _paper_ladder_clear(self):
+        try:
+            self.r.delete(self.PAPER_LADDER_KEY)
+            self.r.delete(self.PAPER_LADDER_ACTIVE)
+        except Exception:
+            pass
+
+    def _paper_ladder_start(self, symbol, signal_price, features=None):
+        """Place buy 1 (instant simulated fill at signal price)."""
+        now_ms = int(time.time() * 1000)
+        buy1_qty = self.ladder_buy1_size / max(signal_price, 1e-12)
+        state = ladder.LadderState(
+            symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+            state=ladder.ACTIVE_1,
+            buy_1=ladder.Leg(
+                label="buy_1", target_price=signal_price,
+                size_usdt=self.ladder_buy1_size,
+                qty_filled=buy1_qty * 0.999,  # 0.1% fee floor
+                fill_price=signal_price, fill_ts=now_ms, status="filled",
+            ),
+        )
+        # Initialise buy 2 + buy 3 paper limits (no exchange call)
+        state.buy_2 = ladder.Leg(
+            label="buy_2",
+            target_price=signal_price * (1 - self.ladder_buy2_offset_pct / 100.0),
+            size_usdt=self.ladder_buy2_size, status="pending",
+        )
+        state.buy_3 = ladder.Leg(
+            label="buy_3",
+            target_price=signal_price * (1 - self.ladder_buy3_offset_pct / 100.0),
+            size_usdt=self.ladder_buy3_size, status="pending",
+        )
+        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+        self._paper_ladder_save(state)
+        print(f"🪜 [paper-ladder] {symbol} buy 1 filled @ {signal_price} "
+              f"buy2@{state.buy_2.target_price:.6g} buy3@{state.buy_3.target_price:.6g} "
+              f"tp@{state.tp_target_price:.6g}")
+        if self.metrics is not None:
+            self.metrics.buy_placed(symbol, signal_price, self.ladder_buy1_size,
+                                    features=features, order_type="virtual_ladder_buy_1")
+            self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
+
+    def _paper_ladder_tick(self, curr_price_by_symbol):
+        """Drive the paper ladder forward — called each loop iteration."""
+        state = self._paper_ladder_load()
+        if state is None or state.state == ladder.CLOSED: return
+        sym = state.symbol
+        # Find current price for this symbol from analyser timeline
+        last = curr_price_by_symbol.get(sym) or self._current_price(sym) or 0
+        if last <= 0: return
+        now_ms = int(time.time() * 1000)
+
+        # TP check
+        if state.tp_target_price > 0 and last >= state.tp_target_price:
+            self._paper_ladder_close(state, last, ladder.EXIT_TP)
+            return
+
+        # Hard stop (only when buy 3 filled)
+        if state.state == ladder.ACTIVE_3 and state.hard_stop_price > 0 and last <= state.hard_stop_price:
+            self._paper_ladder_close(state, last, ladder.EXIT_STOP)
+            return
+
+        # ACTIVE_1: watch buy 2 and buy 3 limits
+        if state.state == ladder.ACTIVE_1:
+            if state.buy_2 and state.buy_2.status == "pending" and last <= state.buy_2.target_price:
+                qty = state.buy_2.size_usdt / max(state.buy_2.target_price, 1e-12)
+                state.buy_2.qty_filled = qty * 0.999
+                state.buy_2.fill_price = state.buy_2.target_price
+                state.buy_2.fill_ts = now_ms
+                state.buy_2.status = "filled"
+                # Cancel buy 3 per operator rule
+                if state.buy_3:
+                    state.buy_3.status = "cancelled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.state = ladder.ACTIVE_2
+                print(f"📥 [paper-ladder] {sym} buy 2 filled @ {state.buy_2.target_price:.6g} "
+                      f"avg={state.weighted_avg():.6g} new TP={state.tp_target_price:.6g}; buy 3 cancelled")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_2.target_price, state.buy_2.qty_filled)
+            elif state.buy_3 and state.buy_3.status == "pending" and last <= state.buy_3.target_price:
+                # Gap-down: buy 3 fills first
+                qty = state.buy_3.size_usdt / max(state.buy_3.target_price, 1e-12)
+                state.buy_3.qty_filled = qty * 0.999
+                state.buy_3.fill_price = state.buy_3.target_price
+                state.buy_3.fill_ts = now_ms
+                state.buy_3.status = "filled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.hard_stop_price = ladder.hard_stop_price(
+                    state.buy_3.target_price, self.ladder_hard_stop_pct
+                )
+                state.state = ladder.ACTIVE_3
+                print(f"📥 [paper-ladder] {sym} buy 3 filled (gap) @ {state.buy_3.target_price:.6g} "
+                      f"avg={state.weighted_avg():.6g} hard_stop={state.hard_stop_price:.6g}")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_3.target_price, state.buy_3.qty_filled)
+
+        elif state.state == ladder.ACTIVE_2:
+            if state.buy_3 and state.buy_3.status == "pending" and last <= state.buy_3.target_price:
+                # Race condition: cancel didn't beat fill. Honour the fill.
+                qty = state.buy_3.size_usdt / max(state.buy_3.target_price, 1e-12)
+                state.buy_3.qty_filled = qty * 0.999
+                state.buy_3.fill_price = state.buy_3.target_price
+                state.buy_3.fill_ts = now_ms
+                state.buy_3.status = "filled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
+                state.hard_stop_price = ladder.hard_stop_price(
+                    state.buy_3.target_price, self.ladder_hard_stop_pct
+                )
+                state.state = ladder.ACTIVE_3
+                print(f"📥 [paper-ladder] {sym} buy 3 race-filled @ {state.buy_3.target_price:.6g}")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_3.target_price, state.buy_3.qty_filled)
+
+        # Underwater tracking for TBE
+        if state.filled_legs():
+            avg = state.weighted_avg()
+            if last < avg:
+                if state.below_avg_started_ts == 0:
+                    state.below_avg_started_ts = now_ms
+            else:
+                if state.below_avg_started_ts > 0:
+                    state.total_underwater_ms += (now_ms - state.below_avg_started_ts)
+                    state.below_avg_started_ts = 0
+                    state.recovered_to_break_even = True
+
+        self._paper_ladder_save(state)
+
+    def _paper_ladder_close(self, state, exit_price, reason):
+        """Finalise a paper ladder — record metrics + clear state."""
+        if state.below_avg_started_ts > 0:
+            state.total_underwater_ms += int(time.time() * 1000) - state.below_avg_started_ts
+            state.below_avg_started_ts = 0
+        state.state = ladder.CLOSED
+        state.exit_reason = reason
+        state.closed_ts = int(time.time() * 1000)
+        summary = ladder.summarise_closed_trade(state, exit_price)
+
+        if self.metrics is not None:
+            avg = summary["weighted_avg"]
+            net = summary["net_pnl_usdt"]
+            if reason == ladder.EXIT_TP:
+                self.metrics.tp_hit(state.symbol, avg, exit_price)
+            self.metrics.exit_recorded(state.symbol, avg, exit_price,
+                                       reason=f"paper_{reason}", pnl_usdt=net)
+
+        try:
+            date = datetime.now().strftime("%Y-%m-%d")
+            key = f"METRICS:LADDER_PAPER:{date}"
+            self.r.lpush(key, json.dumps(summary))
+            self.r.ltrim(key, 0, 999)
+            self.r.expire(key, 30 * 24 * 3600)
+        except Exception:
+            pass
+
+        try:
+            archive_closed_trade(state.symbol, "VIRTUAL_LADDER", {
+                "entry_price": summary["weighted_avg"],
+                "exit_price": exit_price,
+                "qty": summary["qty"],
+                "investment": summary["invested_usdt"],
+                "pnl_usdt": summary["net_pnl_usdt"],
+                "pnl_pct": (
+                    (exit_price - summary["weighted_avg"]) / summary["weighted_avg"] * 100.0
+                ) if summary["weighted_avg"] else 0.0,
+                "fees_paid": summary["fees_usdt"],
+                "reason": f"VIRTUAL_LADDER_{reason.upper()}",
+                "exit_time": datetime.now().strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
+
+        color = "🟢" if summary["net_pnl_usdt"] > 0 else "🔴"
+        print(f"{color}🪜 [paper-ladder] {state.symbol} CLOSED reason={reason} "
+              f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
+              f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
+        self._paper_ladder_clear()
 
     def passes_falling_knife(self, symbol, timeline):
         """Apply the same 3 falling-knife rules used by the Fast Scalper,
@@ -298,6 +533,22 @@ class VirtualScalpExecutor:
                 # that drop out still get cleaned up.
                 self._sweep_pending_orders()
 
+                # Drive paper-ladder state machine (if enabled). Build a
+                # quick {symbol: latest_price} map so the ladder doesn't
+                # need to refetch.
+                if self.ladder_enabled and self.single_coin_mode and ladder is not None:
+                    px_map = {}
+                    for symbol, data_json in all_analysis.items():
+                        try:
+                            tl = json.loads(data_json)
+                            if tl: px_map[symbol] = float(tl[-1].get("price") or 0)
+                        except Exception:
+                            pass
+                    try:
+                        self._paper_ladder_tick(px_map)
+                    except Exception as exc:
+                        print(f"⚠️ paper-ladder tick failed: {exc}")
+
                 for symbol, data_json in all_analysis.items():
                     timeline = json.loads(data_json)
                     if not timeline: continue
@@ -308,10 +559,25 @@ class VirtualScalpExecutor:
                     curr_vol = last.get('volume', 0)
 
                     if signal == 'SCALP_BUY_SIGNAL':
-                        # Skip if there's already any state (PENDING_LIMIT
-                        # or OPEN) for this symbol — prevents duplicate
-                        # orders on hot signals.
-                        if not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
+                        # Laddered Recovery (paper): single-coin gate +
+                        # 3-tier averaging-down. Falls back to the legacy
+                        # single-limit path when not enabled.
+                        if (self.ladder_enabled and self.single_coin_mode
+                                and ladder is not None):
+                            if not self._paper_ladder_active():
+                                ok, features = self.passes_falling_knife(symbol, timeline)
+                                if self.metrics is not None:
+                                    self.metrics.signal_evaluated(
+                                        symbol, curr_price, features=features,
+                                        decision="pass" if ok else "skipped",
+                                    )
+                                if ok:
+                                    self._paper_ladder_start(symbol, curr_price, features=features)
+                                else:
+                                    print(f"🔪 [{symbol}] virtual buy skipped by filter")
+                        # Legacy single-limit path: still honoured when
+                        # ladder is off.
+                        elif not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
                             ok, features = self.passes_falling_knife(symbol, timeline)
                             if self.metrics is not None:
                                 self.metrics.signal_evaluated(
