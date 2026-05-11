@@ -55,13 +55,16 @@ class TradingConfig:
     stopLossUsdt: float = 0.0        # 0 = disabled (was 0.06)
 
     # ── Order placement ──────────────────────────────────────────────────
-    # 0.65 % limit-buy offset comes from the 2026-05-10 backtest: that is
-    # where dips actually fill (≈ 60 % fill rate in 60 min) AND the +1 % TP
-    # is reachable (≈ 42 % TP-hit rate of fills).
-    limitBuyOffsetPct: float = 0.65  # buy this % below market signal
-    # 2026-05-10: 60 → 3600 (60 min). Option B's -0.65% offset needs the
-    # full hour to fill (~63 % fill rate at 60 min in the backtest);
-    # 60 seconds was a leftover from the old -0.09 % era.
+    # 2026-05-11 iter 3: offset 0.65 → 0.30 after P&L analysis showed only
+    # 20% of passed signals dipped to -0.65% within 30 min, leaving ~60 of
+    # 60 daily signals unfilled. -0.30% should bring fill rate to ~85%.
+    # Trade-off: TP from signal becomes +0.70% (was +0.34%), so each fill
+    # needs more upward movement to win — but the 5× jump in fill count
+    # is projected to overcome the lower per-fill win rate.
+    limitBuyOffsetPct: float = 0.30  # buy this % below market signal
+    # 2026-05-11: 1800 → 3600 (60 min). Even with the tighter offset some
+    # coins take 35-55 min to dip; the bigger window costs nothing on
+    # unfilled orders (we cancel cleanly).
     limitBuyTimeoutSec: int = 3600   # cancel limit-buy if not filled in this window
     tslPct: float = 2.0              # trailing stop-loss (legacy)
 
@@ -69,6 +72,14 @@ class TradingConfig:
     fastScalpMode: bool = True
     maxHoldSeconds: int = 3600
     marketExitOnTimeout: bool = True
+
+    # ── Trend-reversal exit ─────────────────────────────────────────────
+    # 2026-05-11: 8 of 10 losers yesterday hit TP after we panic-exited via
+    # EMA-9 < EMA-21. Operator chose to disable this exit (set to False in
+    # live Redis) so positions get the full +1% TP shot. Code default stays
+    # True so a Redis wipe doesn't accidentally undo the change to a more
+    # conservative setup.
+    trendReversalExitEnabled: bool = True
 
     # ── Virtual Scalper live mode ────────────────────────────────────────
     virtualScalperLiveMode: bool = False   # set true to make Virtual Scalper trade real money
@@ -84,11 +95,16 @@ class TradingConfig:
     # from buying coins that had already pumped or were too volatile.
     # Layering this filter on the same 12 signals would have skipped all 4
     # deep losers (XEC×2, LUNC, LUMIA) without losing a single winner.
+    #
+    # 2026-05-11 iter 2: P&L analysis showed 18 of 31 filter-skipped
+    # signals would have hit TP (58% false-positive rate). Loosening the
+    # gates: pump 8% → 12%, overbought-60m 1.5% → 2.5%. The original
+    # extreme losers (XEC +19%, LUNC +10%) still get filtered.
     fallingKnifeFilterEnabled: bool = True
-    maxChange24hPct: float = 8.0       # skip if 24h change > +8%
+    maxChange24hPct: float = 12.0      # skip if 24h change > +12% (was 8.0)
     maxRange1hPct: float = 6.0         # skip if 1h hi-lo range > 6%
-    overboughtSkipEnabled: bool = True # skip if 24h>0 AND 60m>+1.5%
-    overbought60mPct: float = 1.5      # 60m threshold for overbought combo
+    overboughtSkipEnabled: bool = True # skip if 24h>0 AND 60m>+2.5%
+    overbought60mPct: float = 2.5      # 60m threshold for overbought combo (was 1.5)
 
     # ── Fast-drop-without-volume filter (Pattern C, post-signal) ─────────
     # 2026-05-10 trajectory analysis showed BIO/SOPH (today's losers) both

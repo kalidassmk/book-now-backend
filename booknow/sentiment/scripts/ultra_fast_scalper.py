@@ -129,6 +129,12 @@ class MultiSymbolScalper:
         self.fd_threshold_pct = 0.5
         self.fd_vol_surge_mult = 2.0
 
+        # Trend-reversal exit (EMA-9 < EMA-21). When False the bot won't
+        # panic-exit a held position on a momentum reversal — relies on
+        # the +1% TP / patient hold strategy. 2026-05-11 P&L analysis
+        # showed most "panic exits" hit TP later if held.
+        self.trend_reversal_exit_enabled = True
+
         # Metrics collector — bound after Redis connects.
         self.metrics = None
 
@@ -404,6 +410,10 @@ class MultiSymbolScalper:
             self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
             self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
 
+            # Trend-reversal exit toggle. Hot-reloaded so operator can
+            # flip on/off without restart.
+            self.trend_reversal_exit_enabled = bool(cfg.get("trendReversalExitEnabled", True))
+
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
         except Exception as e:
@@ -670,10 +680,11 @@ class MultiSymbolScalper:
             # the most recent vol-1m / pre-baseline ratio.
             self._update_trajectory_metrics(symbol, pos, curr)
 
-            # 1b. Trend reversal exit always wins — even when OCO is
-            # active. We cancel the resting orders so a later TP/SL fill
-            # doesn't double-sell, then market-sell.
-            if curr['ema9'] < curr['ema21']:
+            # 1b. Trend reversal exit — only when the operator has it
+            # enabled. 2026-05-11 P&L showed most "panic exits" via this
+            # path hit TP later if held, so default-live is False even
+            # though code default is True (safety on Redis wipe).
+            if self.trend_reversal_exit_enabled and curr['ema9'] < curr['ema21']:
                 log.info(f"🔄 [{symbol}] Trend Reversal")
                 await self.execute_sell(symbol, curr['close'])
                 return
