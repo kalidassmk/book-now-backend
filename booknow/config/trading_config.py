@@ -38,7 +38,7 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 12.0      # 2026-05-11: $12/leg (was 6.0)
+    buyAmountUsdt: float = 30.0      # 2026-05-11 iter 9: $30/leg (was 12)
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
@@ -89,9 +89,10 @@ class TradingConfig:
 
     # ── 24h market-context filter (post-mortem-derived) ─────────────────
     # Reject buy entries when the symbol's 24h ticker fails any of these.
+    # 2026-05-11 iter 9: bumped volume floor to $5M for liquidity safety.
     minChange24hPct: float = -1.0    # skip falling-knife coins
     minRange24hPct:  float = 5.0     # skip too-quiet coins
-    minVol24hUsd:    float = 2_000_000.0  # liquidity floor
+    minVol24hUsd:    float = 5_000_000.0  # liquidity floor (was 2M)
 
     # ── Falling-knife filter (skip top-of-pump buys) ─────────────────────
     # Derived from 2026-05-10 backtest: XEC/LUNC/LUMIA/etc deep losses came
@@ -136,17 +137,15 @@ class TradingConfig:
     #   • TP at weighted-avg × (1 + ladderTpFromAvgPct/100)
     #   • Hard stop activated ONLY after Buy 3 fills (gap scenario), at
     #     buy_3_price × (1 - ladderHardStopBelowBuy3Pct/100)
-    # 2026-05-11 iter 2: replaced singleCoinModeEnabled with
-    # maxConcurrentLadders (operator wants 3). Per leg sizing bumped
-    # $6 → $12 so max total exposure per ladder = $36 (3 fills × $12);
-    # across 3 concurrent ladders, max $108 USDT in flight.
+    # 2026-05-11 iter 9: single coin / 3 legs / $30/leg.
+    # Max exposure per ladder: $90 (3 × $30). Only 1 ladder at a time.
     ladderedRecoveryEnabled: bool = True
-    maxConcurrentLadders: int = 3
+    maxConcurrentLadders: int = 1     # was 3
     # Legacy: kept for back-compat. Code now uses maxConcurrentLadders.
-    singleCoinModeEnabled: bool = False
-    ladderBuy1SizeUsdt: float = 12.0
-    ladderBuy2SizeUsdt: float = 12.0
-    ladderBuy3SizeUsdt: float = 12.0
+    singleCoinModeEnabled: bool = True   # mirrors max=1
+    ladderBuy1SizeUsdt: float = 30.0      # was 12
+    ladderBuy2SizeUsdt: float = 30.0
+    ladderBuy3SizeUsdt: float = 30.0
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
     ladderTpFromAvgPct: float = 0.6     # static TP fallback when target-net not set
@@ -155,7 +154,7 @@ class TradingConfig:
     # automatically: tp_pct = (target_net / buy_size) × 100 + 2 × fee_rate_pct
     # which guarantees the configured net profit after BOTH sides' fees.
     # Set to 0 to fall back to the static ladderTpFromAvgPct above.
-    ladderTargetNetProfitUsdt: float = 0.05
+    ladderTargetNetProfitUsdt: float = 0.15   # was 0.05
     # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075

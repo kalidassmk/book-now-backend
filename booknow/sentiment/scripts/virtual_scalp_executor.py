@@ -40,12 +40,10 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
-# 2026-05-11: bumped to $12 sizing (was 6.0) to match Fast Scalper.
-# Net per win at +1% TP: gross $0.12, fees ~$0.024 round-trip → net ≈ $0.10.
-DEFAULT_BUY_AMOUNT_USDT = 12.0
-# 2026-05-11 iter 4: TP tuned for ~$0.05 net per $12 leg.
-DEFAULT_PROFIT_TARGET_USDT = 0.05    # legacy USDT target — only used when profitPct == 0
-DEFAULT_PROFIT_PCT = 0.6             # % above entry → ≈$0.05 NET on $12 buy
+# 2026-05-11 iter 9: $30/leg, $0.15 net target, max 1 ladder concurrent.
+DEFAULT_BUY_AMOUNT_USDT = 30.0
+DEFAULT_PROFIT_TARGET_USDT = 0.15
+DEFAULT_PROFIT_PCT = 0.7             # % above entry → ≈$0.15 NET on $30 buy after 0.2% fees
 DEFAULT_LIMIT_OFFSET_PCT = 0.65      # % below signal price; legacy strategy
 
 # Risk Settings for Virtual Scalper
@@ -88,18 +86,18 @@ class VirtualScalpExecutor:
         self.fd_threshold_pct = 0.5
         self.fd_vol_surge_mult = 2.0
 
-        # Laddered Recovery (paper mirror of Fast Scalper).
-        # 2026-05-11 iter 2: $6 → $12, max=3 concurrent.
+        # Laddered Recovery (paper or live, mirrors Fast Scalper).
+        # 2026-05-11 iter 9: $30/leg, max 1 concurrent.
         self.ladder_enabled = False
-        self.max_concurrent_ladders = 3
-        self.single_coin_mode = False
-        self.ladder_buy1_size = 12.0
-        self.ladder_buy2_size = 12.0
-        self.ladder_buy3_size = 12.0
+        self.max_concurrent_ladders = 1
+        self.single_coin_mode = True
+        self.ladder_buy1_size = 30.0
+        self.ladder_buy2_size = 30.0
+        self.ladder_buy3_size = 30.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
-        self.ladder_target_net_usdt = 0.05
+        self.ladder_target_net_usdt = 0.15
         self.ladder_fee_rate_per_side = 0.00075
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
@@ -162,15 +160,15 @@ class VirtualScalpExecutor:
                 self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
                 # Laddered Recovery knobs.
                 self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-                self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 3))
+                self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
                 self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 12.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 12.0))
-                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 30.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 30.0))
+                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 30.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
-                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.05))
+                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.15))
                 self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
                 self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
@@ -898,9 +896,31 @@ class VirtualScalpExecutor:
 
         Heuristic: timeline stores per-tick price+volume snapshots. We use
         the last ~60 points as a 1h proxy and the entire timeline as a
-        24h proxy. Falls open (returns ok=True) if data is too sparse."""
+        24h proxy. Falls open (returns ok=True) if data is too sparse.
+
+        2026-05-11 iter 9: also enforces the 24h-volume floor (Fast Scalper
+        applies this in evaluate_entry; mirroring here for parity)."""
         if not self.fk_enabled or not timeline:
             return True, None
+
+        # 24h volume gate — uses Binance ticker (cached briefly).
+        try:
+            min_vol = float(self.r.get('TRADING_CONFIG') and __import__('json').loads(self.r.get('TRADING_CONFIG') or '{}').get('minVol24hUsd', 5_000_000) or 5_000_000)
+        except Exception:
+            min_vol = 5_000_000
+        if self.client is not None and min_vol > 0:
+            try:
+                tk = self.client.fetch_ticker(self._to_ccxt_symbol(symbol))
+                vol_24h = float(tk.get('quoteVolume') or 0)
+                if vol_24h < min_vol:
+                    reason = f"24h vol ${vol_24h/1_000_000:.2f}M < ${min_vol/1_000_000:.0f}M floor"
+                    if self.metrics is not None:
+                        self.metrics.signal_skipped(symbol, "low_volume_24h", reason,
+                                                    {"symbol": symbol, "vol_24h_usd": vol_24h})
+                    return False, {"symbol": symbol, "vol_24h_usd": vol_24h, "reason": reason}
+            except Exception:
+                pass
+
         try:
             prices = [float(t.get("price", 0) or 0) for t in timeline]
             prices = [p for p in prices if p > 0]

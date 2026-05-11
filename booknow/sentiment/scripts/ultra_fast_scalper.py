@@ -94,13 +94,11 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
-        # 2026-05-11: $12/leg sizing (was $6). Net per win at +1 % TP:
-        # gross $0.12, fees ~$0.024 round-trip → net ≈ $0.10 per win.
-        # With 3 concurrent ladders × 3 fills × $12, max exposure $108.
+        # 2026-05-11 iter 9: $30/leg sizing (was $12). 1 ladder concurrent,
+        # 3 legs each → max $90 in flight. Target $0.15 net per Buy 1.
         self.auto_enabled = True
-        self.buy_amount_usdt = 12.0
-        # 2026-05-11 iter 4: TP target tuned for ~$0.05 net per $12 leg.
-        self.profit_target_usdt = 0.05
+        self.buy_amount_usdt = 30.0
+        self.profit_target_usdt = 0.15
         self.stop_loss_usdt = 0.0       # disabled by default (Option B legacy)
 
         # Market-context filters (derived from yesterday's P&L analysis).
@@ -139,18 +137,18 @@ class MultiSymbolScalper:
         # showed most "panic exits" hit TP later if held.
         self.trend_reversal_exit_enabled = True
 
-        # Laddered Recovery — multi-coin, 3-tier averaging-down entry.
-        # 2026-05-11 iter 2: max_concurrent_ladders replaces single-coin mode.
+        # Laddered Recovery — 1 ladder concurrent, 3-tier averaging-down.
+        # 2026-05-11 iter 9: $30/leg + max 1 concurrent.
         self.ladder_enabled = False
-        self.max_concurrent_ladders = 3
-        self.single_coin_mode = False     # legacy; kept for back-compat
-        self.ladder_buy1_size = 12.0
-        self.ladder_buy2_size = 12.0
-        self.ladder_buy3_size = 12.0
+        self.max_concurrent_ladders = 1
+        self.single_coin_mode = True
+        self.ladder_buy1_size = 30.0
+        self.ladder_buy2_size = 30.0
+        self.ladder_buy3_size = 30.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
-        self.ladder_target_net_usdt = 0.05      # 2026-05-11 iter 8
+        self.ladder_target_net_usdt = 0.15      # 2026-05-11 iter 9
         self.ladder_fee_rate_per_side = 0.00075 # 0.075% (BNB discount)
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
@@ -385,7 +383,7 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 12.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 30.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
             # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
@@ -393,7 +391,7 @@ class MultiSymbolScalper:
             if profit_pct > 0:
                 self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
             else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.05))
+                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.15))
 
             # Stop loss: explicit USDT; 0 (or negative) disables both the
             # OCO SL leg and the polling SL exit. Default to 0 so older
@@ -405,7 +403,7 @@ class MultiSymbolScalper:
             # 24h downtrends). Set any to None / 0 to disable a filter.
             self.min_change_24h_pct = float(cfg.get("minChange24hPct", -1.0))
             self.min_range_24h_pct  = float(cfg.get("minRange24hPct", 5.0))
-            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 2_000_000))
+            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 5_000_000))
 
             # Limit-buy entry params (set offset to 0 or negative to fall
             # back to market buys). Same Redis key the dashboard already
@@ -438,15 +436,15 @@ class MultiSymbolScalper:
 
             # Laddered Recovery knobs (3-tier averaging-down).
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-            self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 3))
+            self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
             self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 12.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 12.0))
-            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 12.0))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 30.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 30.0))
+            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 30.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
-            self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.05))
+            self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.15))
             self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
