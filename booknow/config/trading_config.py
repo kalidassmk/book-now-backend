@@ -150,7 +150,10 @@ class TradingConfig:
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
     ladderTpFromAvgPct: float = 1.0     # TP at weighted_avg × 1.01
     ladderHardStopBelowBuy3Pct: float = 1.0  # stop at buy3 × 0.99 if buy3 filled
-    ladderBuy1UseMarketOrder: bool = False  # False = aggressive limit; True = market
+    # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
+    # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
+    # an aggressive limit to fill before placing the averaging-down legs.
+    ladderBuy1UseMarketOrder: bool = True
 
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True

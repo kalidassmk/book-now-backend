@@ -315,22 +315,69 @@ class VirtualScalpExecutor:
             self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
 
     def _ladder_start_live(self, symbol, signal_price, features=None):
-        """Live start: place a real Binance LIMIT BUY for leg 1 at the
-        current best ask (aggressive limit = near-instant fill without
-        paying the full spread). Buys 2 & 3 + TP are placed once buy 1
-        actually fills (in _ladder_check_buy1_fill_live)."""
+        """Live start: place Buy 1 as MARKET (default) so Buy 2/3 limits
+        can be placed in the same call. Falls back to aggressive-limit-
+        at-ask when ladderBuy1UseMarketOrder is False."""
         f = self._get_filters(symbol)
         if f is None:
             print(f"⚠️ [v-ladder] {symbol} missing filters; skipping")
             return
         ccxt_sym = self._to_ccxt_symbol(symbol)
-        # Fetch best ask
+        tick = f['tick_size'] or 0.00000001
+        now_ms = int(time.time() * 1000)
+
+        # Determine whether to use market or limit for buy 1
+        cfg = {}
+        try:
+            raw = self.r.get(TRADING_CONFIG_KEY)
+            if raw: cfg = json.loads(raw)
+        except Exception:
+            pass
+        use_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
+
+        if use_market:
+            # MARKET PATH — fast-path: legs 2/3 + TP go on the book immediately
+            buy1_qty = self._round_step(self.ladder_buy1_size / max(signal_price, 1e-12), f['step_size'])
+            if buy1_qty * signal_price < f['min_notional']:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
+                return
+            try:
+                placed = self.client.create_market_buy_order(ccxt_sym, buy1_qty)
+            except Exception as e:
+                print(f"❌ [v-ladder] {symbol} market buy failed: {e}")
+                return
+            filled_qty = float(placed.get("filled") or buy1_qty)
+            fill_price = float(placed.get("average") or placed.get("price") or signal_price)
+            if filled_qty <= 0:
+                print(f"⚠️ [v-ladder] {symbol} market buy returned filled=0")
+                return
+            base_qty = self._round_step(filled_qty * 0.999, f['step_size'])
+            state = ladder.LadderState(
+                symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                state=ladder.ACTIVE_1,
+                buy_1=ladder.Leg(
+                    label="buy_1", target_price=fill_price,
+                    size_usdt=self.ladder_buy1_size, order_id=str(placed.get("id") or ""),
+                    qty_filled=base_qty, fill_price=fill_price, fill_ts=now_ms,
+                    status="filled",
+                ),
+            )
+            print(f"🪜 [v-ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
+            if self.metrics is not None:
+                self.metrics.buy_placed(symbol, fill_price, self.ladder_buy1_size,
+                                        features=features, order_type="virtual_ladder_buy_1_market")
+                self.metrics.fill_recorded(symbol, fill_price, base_qty)
+            self._ladder_place_legs_after_buy1_live(state, f, tick)
+            self._paper_ladder_save(state)
+            return
+
+        # LIMIT PATH (legacy) — wait for fill before placing legs 2/3
         try:
             book = self.client.fetch_order_book(ccxt_sym, limit=5)
             best_ask = float(book["asks"][0][0]) if book.get("asks") else signal_price
         except Exception:
             best_ask = signal_price
-        buy1_price = self._round_step(best_ask, f['tick_size'])
+        buy1_price = self._round_step(best_ask, tick)
         buy1_qty = self._round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f['step_size'])
         if buy1_qty * buy1_price < f['min_notional']:
             print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
@@ -344,20 +391,50 @@ class VirtualScalpExecutor:
         if not order_id:
             print(f"⚠️ [v-ladder] {symbol} buy 1 returned no order id")
             return
-        now_ms = int(time.time() * 1000)
         state = ladder.LadderState(
             symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
             state=ladder.PENDING_BUY_1,
-            buy_1=ladder.Leg(
-                label="buy_1", target_price=buy1_price,
-                size_usdt=self.ladder_buy1_size, order_id=order_id,
-            ),
+            buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
+                             size_usdt=self.ladder_buy1_size, order_id=order_id),
         )
         self._paper_ladder_save(state)
-        print(f"🪜 [v-ladder] {symbol} buy 1 placed @ {buy1_price} qty={buy1_qty} (order={order_id})")
+        print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
         if self.metrics is not None:
             self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
-                                    features=features, order_type="virtual_live_ladder_buy_1")
+                                    features=features, order_type="virtual_ladder_buy_1_limit")
+
+    def _ladder_place_legs_after_buy1_live(self, state, f, tick):
+        """Shared helper: places Buy 2/3 limits + TP once buy 1 is filled.
+        Called by both the market fast-path and the polling slow-path."""
+        signal = state.signal_price
+        symbol = state.symbol
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        buy2_price = self._round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        buy3_price = self._round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        buy2_qty = self._round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f['step_size'])
+        buy3_qty = self._round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f['step_size'])
+
+        buy2_oid = buy3_oid = None
+        if buy2_qty * buy2_price >= f['min_notional']:
+            try:
+                o2 = self.client.create_limit_buy_order(ccxt_sym, buy2_qty, buy2_price)
+                buy2_oid = str(o2.get('id') or '')
+            except Exception as e:
+                print(f"⚠️ [v-ladder] {symbol} buy 2 placement failed: {e}")
+        if buy3_qty * buy3_price >= f['min_notional']:
+            try:
+                o3 = self.client.create_limit_buy_order(ccxt_sym, buy3_qty, buy3_price)
+                buy3_oid = str(o3.get('id') or '')
+            except Exception as e:
+                print(f"⚠️ [v-ladder] {symbol} buy 3 placement failed: {e}")
+
+        state.buy_2 = ladder.Leg(label="buy_2", target_price=buy2_price,
+                                 size_usdt=self.ladder_buy2_size, order_id=buy2_oid)
+        state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
+                                 size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
+        self._ladder_place_tp_live(state, state.total_qty(), f, tick)
+        print(f"🪜 [v-ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} "
+              f"tp@{state.tp_target_price:.6g}")
 
     def _paper_ladder_tick(self, curr_price_by_symbol):
         """Drive all paper ladders forward — called each loop iteration."""
@@ -476,7 +553,7 @@ class VirtualScalpExecutor:
         tick = f.get('tick_size') or 0.00000001
         now_ms = int(time.time() * 1000)
 
-        # 1. PENDING_BUY_1: poll buy 1 for fill; once filled place 2/3 + TP
+        # 1. PENDING_BUY_1 (slow-path limit): poll Buy 1, then place legs
         if state.state == ladder.PENDING_BUY_1 and state.buy_1 and state.buy_1.order_id:
             try:
                 o = self.client.fetch_order(state.buy_1.order_id, ccxt_sym)
@@ -494,39 +571,10 @@ class VirtualScalpExecutor:
             state.buy_1.fill_price = fill_price
             state.buy_1.fill_ts = now_ms
             state.buy_1.status = "filled"
-
-            # Place buys 2 & 3 limits
-            signal = state.signal_price
-            buy2_price = self._round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
-            buy3_price = self._round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
-            buy2_qty = self._round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f['step_size'])
-            buy3_qty = self._round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f['step_size'])
-
-            buy2_oid = buy3_oid = None
-            if buy2_qty * buy2_price >= f['min_notional']:
-                try:
-                    o2 = self.client.create_limit_buy_order(ccxt_sym, buy2_qty, buy2_price)
-                    buy2_oid = str(o2.get('id') or '')
-                except Exception as e:
-                    print(f"⚠️ [v-ladder] {sym} buy 2 placement failed: {e}")
-            if buy3_qty * buy3_price >= f['min_notional']:
-                try:
-                    o3 = self.client.create_limit_buy_order(ccxt_sym, buy3_qty, buy3_price)
-                    buy3_oid = str(o3.get('id') or '')
-                except Exception as e:
-                    print(f"⚠️ [v-ladder] {sym} buy 3 placement failed: {e}")
-
-            state.buy_2 = ladder.Leg(label="buy_2", target_price=buy2_price,
-                                     size_usdt=self.ladder_buy2_size, order_id=buy2_oid)
-            state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
-                                     size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
-
-            # Place TP at avg × (1 + tp_pct)
-            self._ladder_place_tp_live(state, base_qty, f, tick)
             state.state = ladder.ACTIVE_1
+            self._ladder_place_legs_after_buy1_live(state, f, tick)
             self._paper_ladder_save(state)
-            print(f"✅ [v-ladder] {sym} buy 1 filled qty={base_qty} @ {fill_price}; "
-                  f"buy2@{buy2_price} buy3@{buy3_price} tp@{state.tp_target_price:.6g}")
+            print(f"✅ [v-ladder] {sym} buy 1 (limit) filled qty={base_qty} @ {fill_price}")
             if self.metrics is not None:
                 self.metrics.fill_recorded(sym, fill_price, base_qty)
             return
@@ -652,7 +700,21 @@ class VirtualScalpExecutor:
         self._ladder_place_tp_live(state, qty_total, f, tick)
 
     def _paper_ladder_close(self, state, exit_price, reason):
-        """Finalise a paper ladder — record metrics + clear state."""
+        """Finalise a ladder — cancel pending legs, record metrics, clear."""
+        # When in live mode, cancel any still-pending Buy 2 / Buy 3 limit
+        # orders on Binance so they don't fill after we've already exited.
+        if self._is_live() and self.client is not None:
+            ccxt_sym = self._to_ccxt_symbol(state.symbol)
+            for leg in (state.buy_2, state.buy_3):
+                if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                    try:
+                        self.client.cancel_order(leg.order_id, ccxt_sym)
+                        leg.status = "cancelled"
+                        leg.order_id = None
+                        print(f"🚫 [v-ladder] {state.symbol} cancelled pending {leg.label} on close")
+                    except Exception:
+                        pass
+
         if state.below_avg_started_ts > 0:
             state.total_underwater_ms += int(time.time() * 1000) - state.below_avg_started_ts
             state.below_avg_started_ts = 0

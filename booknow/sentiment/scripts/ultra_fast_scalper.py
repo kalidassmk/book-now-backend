@@ -795,7 +795,9 @@ class MultiSymbolScalper:
         return True
 
     async def _ladder_start(self, symbol, signal_price, features=None):
-        """Place buy 1 (aggressive-limit-at-ask or market), persist state."""
+        """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
+        whole ladder (legs 2/3 + TP) is on the book within microseconds
+        of buy 1's fill — no waiting state."""
         try:
             if symbol not in self.filters: await self.fetch_filters(symbol)
             f = self.filters.get(symbol)
@@ -805,29 +807,58 @@ class MultiSymbolScalper:
 
             tick = f.get("tick_size") or 0.00000001
 
-            # Buy 1 price: aggressive limit at current best ask = fast fill
-            # without paying the full spread on a market order.
             if self.ladder_buy1_market:
-                buy1_price = signal_price
+                # Fast-path: market order returns synchronously with fill
+                # details, so we can place buys 2/3 + TP in the same call.
                 buy1_qty = self.round_step(self.ladder_buy1_size / signal_price, f["step_size"])
                 if (buy1_qty * signal_price) < f["min_notional"]:
                     log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
                     return
-                placed = await self.client.create_market_buy_order(symbol, buy1_qty)
-            else:
-                # Fetch best ask via orderbook
                 try:
-                    book = await self.client.fetch_order_book(symbol, limit=5)
-                    best_ask = float(book["asks"][0][0]) if book.get("asks") else signal_price
-                except Exception:
-                    best_ask = signal_price
-                buy1_price = self.round_step(best_ask, tick)
-                buy1_qty = self.round_step(self.ladder_buy1_size / buy1_price, f["step_size"])
-                if (buy1_qty * buy1_price) < f["min_notional"]:
-                    log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                    placed = await self.client.create_market_buy_order(symbol, buy1_qty)
+                except Exception as exc:
+                    log.error(f"❌ [ladder] {symbol} market buy failed: {exc}")
                     return
-                placed = await self.client.create_limit_buy_order(symbol, buy1_qty, buy1_price)
+                filled_qty = float(placed.get("filled") or buy1_qty)
+                fill_price = float(placed.get("average") or placed.get("price") or signal_price)
+                if filled_qty <= 0:
+                    log.warning(f"⚠️ [ladder] {symbol} market buy returned filled=0")
+                    return
+                base_qty = self.round_step(filled_qty * 0.999, f["step_size"])
+                now_ms = int(time.time() * 1000)
+                state = ladder.LadderState(
+                    symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                    state=ladder.ACTIVE_1,
+                    buy_1=ladder.Leg(
+                        label="buy_1", target_price=fill_price,
+                        size_usdt=self.ladder_buy1_size, order_id=str(placed.get("id") or ""),
+                        qty_filled=base_qty, fill_price=fill_price, fill_ts=now_ms,
+                        status="filled",
+                    ),
+                )
+                log.info(f"🪜 [ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
+                if self.metrics is not None:
+                    self.metrics.buy_placed(symbol, fill_price, self.ladder_buy1_size,
+                                            features=features, order_type="ladder_buy_1_market")
+                    self.metrics.fill_recorded(symbol, fill_price, base_qty)
+                # Place legs 2, 3, and TP simultaneously
+                await self._ladder_place_legs_after_buy1(state, f, tick)
+                ladder.save_state(self.redis, state)
+                return
 
+            # Slow-path (aggressive limit at best ask) — kept for the case
+            # where the operator wants spread protection.
+            try:
+                book = await self.client.fetch_order_book(symbol, limit=5)
+                best_ask = float(book["asks"][0][0]) if book.get("asks") else signal_price
+            except Exception:
+                best_ask = signal_price
+            buy1_price = self.round_step(best_ask, tick)
+            buy1_qty = self.round_step(self.ladder_buy1_size / buy1_price, f["step_size"])
+            if (buy1_qty * buy1_price) < f["min_notional"]:
+                log.info(f"⏸️  [ladder] {symbol} buy 1 notional too low")
+                return
+            placed = await self.client.create_limit_buy_order(symbol, buy1_qty, buy1_price)
             order_id = placed.get("id")
             if not order_id:
                 log.warning(f"⚠️ [ladder] {symbol} buy 1 returned no order id")
@@ -835,9 +866,7 @@ class MultiSymbolScalper:
 
             now_ms = int(time.time() * 1000)
             state = ladder.LadderState(
-                symbol=symbol,
-                signal_price=signal_price,
-                signal_ts=now_ms,
+                symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
                 state=ladder.PENDING_BUY_1,
                 buy_1=ladder.Leg(
                     label="buy_1", target_price=buy1_price,
@@ -845,15 +874,47 @@ class MultiSymbolScalper:
                 ),
             )
             ladder.save_state(self.redis, state)
-            log.info(f"🪜 [ladder] {symbol} buy 1 placed @ {buy1_price} qty={buy1_qty} (order={order_id})")
+            log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
             if self.metrics is not None:
-                self.metrics.buy_placed(
-                    symbol, buy1_price, self.ladder_buy1_size,
-                    features=features, order_type="ladder_buy_1",
-                    offset_pct=0.0,
-                )
+                self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
+                                        features=features, order_type="ladder_buy_1_limit")
         except Exception as exc:
             log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
+
+    async def _ladder_place_legs_after_buy1(self, state, f, tick):
+        """Helper called once Buy 1 has confirmed-filled. Places Buy 2,
+        Buy 3 limits and the initial TP order. Used by both the market
+        fast-path (in _ladder_start) and the polling slow-path (in
+        _ladder_check_buy1_fill)."""
+        signal = state.signal_price
+        symbol = state.symbol
+        buy2_price = self.round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        buy3_price = self.round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        buy2_qty = self.round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f["step_size"])
+        buy3_qty = self.round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f["step_size"])
+
+        buy2_oid = buy3_oid = None
+        if (buy2_qty * buy2_price) >= f["min_notional"]:
+            try:
+                o2 = await self.client.create_limit_buy_order(symbol, buy2_qty, buy2_price)
+                buy2_oid = str(o2.get("id"))
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] {symbol} buy 2 placement failed: {exc}")
+        if (buy3_qty * buy3_price) >= f["min_notional"]:
+            try:
+                o3 = await self.client.create_limit_buy_order(symbol, buy3_qty, buy3_price)
+                buy3_oid = str(o3.get("id"))
+            except Exception as exc:
+                log.warning(f"⚠️ [ladder] {symbol} buy 3 placement failed: {exc}")
+
+        state.buy_2 = ladder.Leg(label="buy_2", target_price=buy2_price,
+                                 size_usdt=self.ladder_buy2_size, order_id=buy2_oid)
+        state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
+                                 size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
+
+        tp_p = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct, tick)
+        await self._ladder_place_tp(state, state.total_qty(), tp_p, f)
+        log.info(f"🪜 [ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} tp@{tp_p:.6g}")
 
     async def _ladder_tick(self):
         """Called every loop iteration to drive ALL active ladders forward.
@@ -888,7 +949,8 @@ class MultiSymbolScalper:
                 log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
 
     async def _ladder_check_buy1_fill(self, state, f, tick):
-        """Poll buy 1; once filled, place buys 2 & 3 + TP order."""
+        """Slow-path: when Buy 1 was placed as a limit, poll for its fill.
+        Once filled, delegate to the shared helper that places Buy 2/3 + TP."""
         if not state.buy_1 or not state.buy_1.order_id: return
         try:
             o = await self.client.fetch_order(state.buy_1.order_id, state.symbol)
@@ -902,55 +964,19 @@ class MultiSymbolScalper:
         fill_price = float(o.get("average") or o.get("price") or state.buy_1.target_price)
         if filled_qty <= 0:
             log.warning(f"⚠️ [ladder] {state.symbol} buy 1 closed with zero qty")
-            ladder.clear_state(self.redis)
+            ladder.clear_state(self.redis, state.symbol)
             return
 
-        # Apply fee floor: subtract 0.1 % from filled qty (Binance fee in base)
         base_qty = self.round_step(filled_qty * 0.999, f["step_size"])
         state.buy_1.qty_filled = base_qty
         state.buy_1.fill_price = fill_price
         state.buy_1.fill_ts = int(time.time() * 1000)
         state.buy_1.status = "filled"
-
-        # Place buys 2 & 3 limits
-        signal = state.signal_price
-        buy2_price = self.round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
-        buy3_price = self.round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
-        buy2_qty = self.round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f["step_size"])
-        buy3_qty = self.round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f["step_size"])
-
-        buy2_oid = buy3_oid = None
-        if (buy2_qty * buy2_price) >= f["min_notional"]:
-            try:
-                o2 = await self.client.create_limit_buy_order(state.symbol, buy2_qty, buy2_price)
-                buy2_oid = str(o2.get("id"))
-            except Exception as exc:
-                log.warning(f"⚠️ [ladder] {state.symbol} buy 2 placement failed: {exc}")
-        if (buy3_qty * buy3_price) >= f["min_notional"]:
-            try:
-                o3 = await self.client.create_limit_buy_order(state.symbol, buy3_qty, buy3_price)
-                buy3_oid = str(o3.get("id"))
-            except Exception as exc:
-                log.warning(f"⚠️ [ladder] {state.symbol} buy 3 placement failed: {exc}")
-
-        state.buy_2 = ladder.Leg(
-            label="buy_2", target_price=buy2_price, size_usdt=self.ladder_buy2_size,
-            order_id=buy2_oid,
-        )
-        state.buy_3 = ladder.Leg(
-            label="buy_3", target_price=buy3_price, size_usdt=self.ladder_buy3_size,
-            order_id=buy3_oid,
-        )
-
-        # TP at avg × (1 + tp_pct)
-        avg = state.weighted_avg()
-        tp_price = ladder.tp_price(avg, self.ladder_tp_from_avg_pct, tick)
-        await self._ladder_place_tp(state, base_qty, tp_price, f)
-
         state.state = ladder.ACTIVE_1
+
+        await self._ladder_place_legs_after_buy1(state, f, tick)
         ladder.save_state(self.redis, state)
-        log.info(f"✅ [ladder] {state.symbol} buy 1 filled qty={base_qty} @ {fill_price}; "
-                 f"buy2@{buy2_price} buy3@{buy3_price} tp@{tp_price}")
+        log.info(f"✅ [ladder] {state.symbol} buy 1 (limit) filled qty={base_qty} @ {fill_price}")
         if self.metrics is not None:
             self.metrics.fill_recorded(state.symbol, fill_price, base_qty)
 
@@ -1153,7 +1179,21 @@ class MultiSymbolScalper:
         ladder.save_state(self.redis, state)
 
     async def _ladder_close(self, state, exit_price, reason):
-        """Finalise the ladder: record metrics, clear state, free auto-buy."""
+        """Finalise the ladder: record metrics, cancel pending limit-buys,
+        clear state, free a slot."""
+        # Cancel any still-pending Buy 2 / Buy 3 limit orders so they
+        # don't fill after we've already exited (would leave us holding
+        # naked qty with no TP/stop).
+        for leg in (state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try:
+                    await self.client.cancel_order(leg.order_id, state.symbol)
+                    leg.status = "cancelled"
+                    leg.order_id = None
+                    log.info(f"🚫 [ladder] {state.symbol} cancelled pending {leg.label} on close")
+                except Exception:
+                    pass
+
         # Flush any remaining underwater time
         if state.below_avg_started_ts > 0:
             state.total_underwater_ms += int(time.time() * 1000) - state.below_avg_started_ts
