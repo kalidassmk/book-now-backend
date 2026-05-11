@@ -952,11 +952,20 @@ class MultiSymbolScalper:
         """Helper called once Buy 1 has confirmed-filled. Places Buy 2,
         Buy 3 limits and the initial TP order. Used by both the market
         fast-path (in _ladder_start) and the polling slow-path (in
-        _ladder_check_buy1_fill)."""
-        signal = state.signal_price
+        _ladder_check_buy1_fill).
+
+        2026-05-11 iter 6: reference price is now Buy 1's *actual fill*
+        price, not the signal price. Buy 1 is a market order so it pays
+        the spread — offsets calculated from the signal would be
+        slightly off the actual entry. Using fill_price means the
+        -0.5%/-1.0% offsets are exact relative to where we entered."""
         symbol = state.symbol
-        buy2_price = self.round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
-        buy3_price = self.round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        # Reference = actual Buy 1 fill price (falls back to signal if
+        # for some reason the fill price wasn't captured).
+        ref_price = (state.buy_1.fill_price if state.buy_1 and state.buy_1.fill_price
+                     else state.signal_price)
+        buy2_price = self.round_step(ref_price * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        buy3_price = self.round_step(ref_price * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
         buy2_qty = self.round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f["step_size"])
         buy3_qty = self.round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f["step_size"])
 

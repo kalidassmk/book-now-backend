@@ -297,14 +297,17 @@ class VirtualScalpExecutor:
                 fill_price=signal_price, fill_ts=now_ms, status="filled",
             ),
         )
+        # 2026-05-11 iter 6: reference price = Buy 1 fill price (= signal
+        # in paper since no spread). Keeps semantics identical to live.
+        ref_price = state.buy_1.fill_price if state.buy_1 else signal_price
         state.buy_2 = ladder.Leg(
             label="buy_2",
-            target_price=signal_price * (1 - self.ladder_buy2_offset_pct / 100.0),
+            target_price=ref_price * (1 - self.ladder_buy2_offset_pct / 100.0),
             size_usdt=self.ladder_buy2_size, status="pending",
         )
         state.buy_3 = ladder.Leg(
             label="buy_3",
-            target_price=signal_price * (1 - self.ladder_buy3_offset_pct / 100.0),
+            target_price=ref_price * (1 - self.ladder_buy3_offset_pct / 100.0),
             size_usdt=self.ladder_buy3_size, status="pending",
         )
         state.tp_target_price = ladder.tp_price(state.weighted_avg(), self.ladder_tp_from_avg_pct)
@@ -456,12 +459,17 @@ class VirtualScalpExecutor:
 
     def _ladder_place_legs_after_buy1_live(self, state, f, tick):
         """Shared helper: places Buy 2/3 limits + TP once buy 1 is filled.
-        Called by both the market fast-path and the polling slow-path."""
-        signal = state.signal_price
+        Called by both the market fast-path and the polling slow-path.
+
+        2026-05-11 iter 6: reference price is Buy 1's actual fill (was
+        signal_price). Market orders pay the spread; offsets measured
+        from the real entry price are more accurate for DCA logic."""
         symbol = state.symbol
         ccxt_sym = self._to_ccxt_symbol(symbol)
-        buy2_price = self._round_step(signal * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
-        buy3_price = self._round_step(signal * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        ref_price = (state.buy_1.fill_price if state.buy_1 and state.buy_1.fill_price
+                     else state.signal_price)
+        buy2_price = self._round_step(ref_price * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        buy3_price = self._round_step(ref_price * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
         buy2_qty = self._round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f['step_size'])
         buy3_qty = self._round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f['step_size'])
 
