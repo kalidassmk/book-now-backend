@@ -163,8 +163,14 @@ class TradingConfig:
     ladderedRecoveryEnabled: bool = True
     maxConcurrentLadders: int = 1
     singleCoinModeEnabled: bool = True
-    ladderBuy1SizeUsdt: float = 50.0     # iter 12: $50/leg
-    ladderBuy2SizeUsdt: float = 50.0
+    # 2026-05-12 iter 14: $50/leg → $25/leg. Reasoning: operator wallet is
+    # ~$100-200 and $50/leg ($100/ladder) puts ~80% of wallet at risk per
+    # trade. A 1% adverse move = $1 unrealized loss = 1% of wallet. At
+    # $25/leg ($50/ladder) the same 1% move = $0.50 = 0.5%, half the
+    # psychological pain. Smaller positions also let the bot run more
+    # ladders sequentially per BNB top-up.
+    ladderBuy1SizeUsdt: float = 25.0     # iter 14: $25/leg (was 50)
+    ladderBuy2SizeUsdt: float = 25.0
     ladderBuy3SizeUsdt: float = 0.0      # 0 = Buy 3 disabled
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
@@ -179,6 +185,25 @@ class TradingConfig:
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075
     ladderHardStopBelowBuy3Pct: float = 1.0  # stop at buy3 × 0.99 if buy3 filled
+
+    # ── Time-based ladder exit (iter 14) ─────────────────────────────────
+    # Root cause for the operator's bigger losses: they were panic-selling
+    # underwater ladders manually because there was no time-based exit.
+    # These two knobs cap the maximum time a ladder can sit without TP
+    # firing, so the bot makes the close decision (not the operator).
+    #
+    #   ladderTimeExitEnabled:       master switch
+    #   ladderMaxHoldSeconds:        force market-sell after this many seconds
+    #                                regardless of P&L (default 4h)
+    #   ladderBreakevenExitEnabled:  smarter early exit — if ladder ever went
+    #                                underwater AND price returns to break-even
+    #                                (+ buffer), exit immediately at market
+    #   ladderBreakevenBufferPct:    buffer above avg (default 0.05% — covers
+    #                                spread + a sliver of profit)
+    ladderTimeExitEnabled: bool = True
+    ladderMaxHoldSeconds: int = 14400         # 4 hours
+    ladderBreakevenExitEnabled: bool = True
+    ladderBreakevenBufferPct: float = 0.05
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.

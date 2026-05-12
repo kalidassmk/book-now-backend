@@ -156,12 +156,14 @@ class MultiSymbolScalper:
         self.trend_reversal_exit_enabled = True
 
         # Laddered Recovery — 1 ladder concurrent, 2-leg averaging-down.
-        # 2026-05-12 iter 12: $50/leg, Buy 3 disabled.
+        # 2026-05-12 iter 14: $25/leg (was $50). Smaller positions = half
+        # the drawdown per adverse % move = less psychological pressure
+        # to panic-sell underwater.
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 50.0
-        self.ladder_buy2_size = 50.0
+        self.ladder_buy1_size = 25.0
+        self.ladder_buy2_size = 25.0
         self.ladder_buy3_size = 0.0       # Buy 3 disabled
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
@@ -172,6 +174,25 @@ class MultiSymbolScalper:
         self.ladder_buy1_market = True
         self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
         self.ladder_cooldown_seconds = 14400   # 4 hours
+
+        # ── Time-based ladder exit (added 2026-05-12 iter 14) ─────────
+        # Operator was manually panic-selling underwater positions because
+        # the bot has no time-based exit — a ladder could sit underwater
+        # indefinitely waiting for TP. That manual panic-sell is the
+        # single biggest source of realized loss (not visible in metrics
+        # because it shows up as "manual_cancel" → pnl_usdt=0).
+        #
+        # Strategy: cap the underwater hold time. Two exit paths:
+        #   (a) Break-even recovery: as soon as price returns to >=
+        #       weighted_avg × (1 + 2× fee_rate) after going underwater,
+        #       exit immediately at market. Locks in ~$0 net instead of
+        #       waiting hours for full TP.
+        #   (b) Hard time exit: after ladder_max_hold_seconds, force-sell
+        #       at market regardless of price. Caps maximum hold time.
+        self.ladder_time_exit_enabled = True
+        self.ladder_max_hold_seconds = 14400        # 4h max hold
+        self.ladder_breakeven_exit_enabled = True
+        self.ladder_breakeven_buffer_pct = 0.05     # exit at avg × (1 + 0.05%) once recovered
 
         # Metrics collector — bound after Redis connects.
         self.metrics = None
@@ -464,8 +485,8 @@ class MultiSymbolScalper:
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
             self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
             self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 50.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 50.0))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 25.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 25.0))
             self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
@@ -476,6 +497,11 @@ class MultiSymbolScalper:
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
             self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
             self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
+            # Time-based exit knobs (iter 14).
+            self.ladder_time_exit_enabled = bool(cfg.get("ladderTimeExitEnabled", True))
+            self.ladder_max_hold_seconds = int(cfg.get("ladderMaxHoldSeconds", 14400))
+            self.ladder_breakeven_exit_enabled = bool(cfg.get("ladderBreakevenExitEnabled", True))
+            self.ladder_breakeven_buffer_pct = float(cfg.get("ladderBreakevenBufferPct", 0.05))
 
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -1291,6 +1317,12 @@ class MultiSymbolScalper:
                     continue
                 tick = f.get("tick_size") or 0.00000001
 
+                # iter 14: time-based + break-even exit checks run BEFORE
+                # the state-specific handlers so a stale ladder gets out
+                # before another loop wastes a tick on TP polling.
+                if await self._maybe_force_exit_ladder(state, f):
+                    continue
+
                 if state.state == ladder.PENDING_BUY_1:
                     await self._ladder_check_buy1_fill(state, f, tick)
                 elif state.state == ladder.ACTIVE_1:
@@ -1303,6 +1335,139 @@ class MultiSymbolScalper:
                 await self._ladder_update_underwater(state, f)
             except Exception as exc:
                 log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
+
+    async def _maybe_force_exit_ladder(self, state, f):
+        """Iter 14 time-based + break-even exit logic.
+
+        Two conditions trigger a force exit at market on whatever has
+        already been bought (buy_1 ± buy_2 ± buy_3 filled qty):
+
+          1. BREAK-EVEN RECOVERY (ladderBreakevenExitEnabled):
+             If the ladder went underwater at any point AND price has
+             returned to weighted_avg × (1 + breakeven_buffer_pct/100)
+             — exit now. Locks in ~$0 net rather than waiting hours
+             for full TP which may never come.
+
+          2. TIME EXIT (ladderTimeExitEnabled):
+             If the ladder is older than ladderMaxHoldSeconds (default
+             4h), force-sell at market regardless of P&L. Prevents
+             positions sitting indefinitely while operator panic-sells.
+
+        Returns True iff a force exit was executed (caller should
+        ``continue`` to the next state). Returns False when the ladder
+        is still in a normal state and the regular handlers should run.
+        Best-effort: any unexpected error is swallowed.
+        """
+        if state is None or state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return False
+        if not (self.ladder_time_exit_enabled or self.ladder_breakeven_exit_enabled):
+            return False
+
+        now_ms = int(time.time() * 1000)
+        signal_ts = int(state.signal_ts or 0)
+        age_sec = (now_ms - signal_ts) / 1000.0 if signal_ts else 0
+
+        # Compute weighted avg from filled legs only.
+        filled_legs = [L for L in (state.buy_1, state.buy_2, state.buy_3)
+                       if L and L.qty_filled and L.fill_price]
+        if not filled_legs:
+            return False
+        total_qty = sum(L.qty_filled for L in filled_legs)
+        total_cost = sum(L.qty_filled * L.fill_price for L in filled_legs)
+        avg = total_cost / total_qty if total_qty > 0 else 0
+        if avg <= 0:
+            return False
+
+        # Current price — cheap ticker fetch.
+        try:
+            tk = await self.client.fetch_ticker(state.symbol)
+            current_price = float(tk.get("last") or tk.get("close") or 0)
+        except Exception:
+            return False
+        if current_price <= 0:
+            return False
+
+        # Break-even threshold: avg × (1 + buffer%). Covers spread + slippage.
+        be_threshold = avg * (1 + self.ladder_breakeven_buffer_pct / 100.0)
+
+        force_reason = None
+        # Path 1: break-even recovery. Only fires when we've gone
+        # underwater AT ANY POINT in this ladder's life. The state flag
+        # below_avg_started_ts is "currently underwater"; the more
+        # interesting flag is "ever went underwater" — covered by
+        # total_underwater_ms > 0 OR currently underwater.
+        ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+        if self.ladder_breakeven_exit_enabled and ever_underwater:
+            if current_price >= be_threshold:
+                force_reason = "breakeven_recovery"
+
+        # Path 2: hard time exit. Always wins over break-even path
+        # because at this point we've waited long enough that whatever
+        # P&L exists is what we get.
+        if force_reason is None and self.ladder_time_exit_enabled:
+            if age_sec >= self.ladder_max_hold_seconds:
+                force_reason = "time_exit"
+
+        if force_reason is None:
+            return False
+
+        # Cancel TP order if any
+        if state.tp_order_id:
+            try:
+                await self.client.cancel_order(state.tp_order_id, state.symbol)
+            except Exception:
+                pass
+            state.tp_order_id = None
+
+        # Cancel any unfilled buy legs (buy_2/buy_3 limit orders)
+        for leg in (state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try:
+                    await self.client.cancel_order(leg.order_id, state.symbol)
+                except Exception:
+                    pass
+                leg.status = "cancelled"
+                leg.order_id = None
+
+        # Market-sell the entire filled qty (rounded down)
+        sell_qty = self.round_step(total_qty * 0.999, f["step_size"])
+        if sell_qty <= 0:
+            log.warning(f"⚠️ [ladder] {state.symbol} force-exit qty rounded to 0; abandoning state")
+            state.state = ladder.CLOSED
+            state.exit_reason = force_reason
+            state.closed_ts = now_ms
+            ladder.clear_state(self.redis, state.symbol)
+            ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
+            return True
+
+        exit_price = current_price
+        try:
+            sold = await self.client.create_market_sell_order(state.symbol, sell_qty)
+            exit_price = float(sold.get("average") or sold.get("price") or current_price)
+            log.info(f"🚪 [ladder] {state.symbol} {force_reason} — sold {sell_qty} @ ~${exit_price:.6f}")
+        except Exception as exc:
+            log.error(f"❌ [ladder] {state.symbol} force-exit market sell failed: {exc}; clearing state anyway")
+
+        # Compute P&L (gross — fees are deducted elsewhere by Binance)
+        pnl = (exit_price - avg) * total_qty
+        # Apply rough fee adjustment (2 × 0.075% BNB-discounted, both sides)
+        pnl -= 2 * self.ladder_fee_rate_per_side * total_cost
+
+        state.state = ladder.CLOSED
+        state.exit_reason = force_reason
+        state.closed_ts = now_ms
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, exit_price, sell_qty,
+                                           reason=force_reason, pnl_usdt=pnl)
+            except Exception:
+                pass
+
+        log.info(f"🪜 [ladder] {state.symbol} CLOSED reason={force_reason} "
+                 f"net=${pnl:+.4f} age={age_sec/60:.1f}m avg=${avg:.6f} exit=${exit_price:.6f}")
+        ladder.clear_state(self.redis, state.symbol)
+        ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
+        return True
 
     async def _ladder_check_buy1_fill(self, state, f, tick):
         """Slow-path: when Buy 1 was placed as a limit, poll for its fill.
