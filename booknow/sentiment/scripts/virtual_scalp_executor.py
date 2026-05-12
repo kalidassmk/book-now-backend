@@ -76,6 +76,18 @@ class VirtualScalpExecutor:
         self.fk_overbought_skip = True
         self.fk_overbought_60m = 1.5
 
+        # Post-pump-bleed filter (daily timeframe, added 2026-05-12 after
+        # JTO loss). Mirrors the Fast Scalper algorithm. See spec in
+        # _passes_post_pump_filter() below.
+        self.pp_enabled = True
+        self.pp_threshold_pct = 30.0
+        self.pp_off_peak_min_pct = 10.0
+        self.pp_min_days_since_peak = 2
+        self.pp_lookback_days = 14
+        self.pp_baseline_days = 7
+        self._d1_cache: dict = {}
+        self._d1_cache_ttl_sec = 600
+
         # Stop-loss USDT — when 0/negative, SOFT_STOP_LOSS_USDT and
         # MAX_VIRTUAL_LOSS_USDT below are bypassed (Option B patient hold).
         self.stop_loss_usdt = 0.0
@@ -151,6 +163,13 @@ class VirtualScalpExecutor:
                 self.fk_max_1h_range = float(cfg.get("maxRange1hPct", 6.0))
                 self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
                 self.fk_overbought_60m = float(cfg.get("overbought60mPct", 1.5))
+                # Post-pump-bleed (daily) filter knobs (added 2026-05-12).
+                self.pp_enabled = bool(cfg.get("postPumpFilterEnabled", True))
+                self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
+                self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
+                self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
+                self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 14))
+                self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 7))
                 # Stop-loss config (0 = disabled, matches Fast Scalper).
                 self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
                 # Fast-drop-without-volume filter knobs.
@@ -1044,6 +1063,96 @@ class VirtualScalpExecutor:
         except Exception:
             return True, None
 
+    def _fetch_d1_klines(self, symbol):
+        """Cached fetch of daily klines (sync). One Binance REST call per
+        symbol per 10 minutes. Returns None if data unavailable."""
+        if self.client is None:
+            return None
+        now = time.time()
+        cached = self._d1_cache.get(symbol)
+        if cached and (now - cached["_ts"]) < self._d1_cache_ttl_sec:
+            return cached["data"]
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            limit = self.pp_lookback_days + self.pp_baseline_days + 2
+            data = self.client.fetch_ohlcv(ccxt_sym, "1d", limit=limit)
+        except Exception:
+            return None
+        if data:
+            self._d1_cache[symbol] = {"_ts": now, "data": data}
+        return data
+
+    def _passes_post_pump_filter(self, symbol):
+        """Daily-timeframe post-pump-bleed filter (mirrors Fast Scalper).
+
+        The 24h/1h falling-knife filter cannot see multi-day pumps. This
+        filter looks at the last (lookback + baseline) daily candles to
+        catch coins that pumped hard a few days ago and are now bleeding
+        off the peak — JTO is the canonical case (2026-05-12 loss).
+
+        Returns (ok, features_dict). On any data error returns (True, None)
+        so a Binance hiccup does not silently disable the filter.
+        """
+        if not self.pp_enabled:
+            return True, None
+        data = self._fetch_d1_klines(symbol)
+        if not data or len(data) < (self.pp_lookback_days + 2):
+            return True, None
+        try:
+            closes = [float(c[4]) for c in data]
+            highs  = [float(c[2]) for c in data]
+        except Exception:
+            return True, None
+
+        L = self.pp_lookback_days
+        B = self.pp_baseline_days
+        current_price = closes[-1]
+        ma7 = sum(closes[-7:]) / 7 if len(closes) >= 7 else current_price
+
+        pump_window = highs[-(L + 1):-1]
+        if not pump_window:
+            return True, None
+        peak = max(pump_window)
+        peak_idx = pump_window.index(peak)
+        days_since_peak = (len(pump_window) - 1) - peak_idx
+
+        baseline_slice = closes[-(L + 1 + B):-(L + 1)]
+        if not baseline_slice:
+            return True, None
+        baseline = sum(baseline_slice) / len(baseline_slice)
+        if baseline <= 0:
+            return True, None
+
+        pump_pct = (peak - baseline) / baseline * 100.0
+        off_peak_pct = (peak - current_price) / peak * 100.0 if peak > 0 else 0.0
+
+        features = {
+            "filter": "post_pump_bleed",
+            "current_price": round(current_price, 8),
+            "ma7": round(ma7, 8),
+            "peak_14d": round(peak, 8),
+            "baseline_7d_pre_pump": round(baseline, 8),
+            "pump_pct": round(pump_pct, 2),
+            "off_peak_pct": round(off_peak_pct, 2),
+            "days_since_peak": int(days_since_peak),
+        }
+
+        rejected = (
+            pump_pct        >= self.pp_threshold_pct       and
+            off_peak_pct    >= self.pp_off_peak_min_pct    and
+            current_price   <  ma7                          and
+            days_since_peak >= self.pp_min_days_since_peak
+        )
+        if rejected:
+            reason = (f"post-pump bleed: pumped +{pump_pct:.0f}% to {peak:.4f} "
+                      f"{days_since_peak}d ago, now {current_price:.4f} "
+                      f"(-{off_peak_pct:.1f}% off peak, < MA7 {ma7:.4f})")
+            print(f"📉 [{symbol}] virtual skip post_pump_bleed: {reason}")
+            if self.metrics is not None:
+                self.metrics.signal_skipped(symbol, "post_pump_bleed", reason, features)
+            return False, features
+        return True, features
+
     def _load_trading_config(self):
         """Read live TradingConfig from Redis at position-open time.
         Returns (buy_amount_usdt, profit_target_usdt, profit_pct,
@@ -1130,7 +1239,10 @@ class VirtualScalpExecutor:
                                         decision="pass" if ok else "skipped",
                                     )
                                 if ok:
-                                    self._paper_ladder_start(symbol, curr_price, features=features)
+                                    # Daily-timeframe post-pump gate (2026-05-12).
+                                    pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                    if pp_ok:
+                                        self._paper_ladder_start(symbol, curr_price, features=features)
                                 else:
                                     print(f"🔪 [{symbol}] virtual buy skipped by filter")
                         # Legacy single-limit path: still honoured when
@@ -1143,7 +1255,10 @@ class VirtualScalpExecutor:
                                     decision="pass" if ok else "skipped",
                                 )
                             if ok:
-                                self.place_limit_order(symbol, curr_price, features=features)
+                                # Daily-timeframe post-pump gate (2026-05-12).
+                                pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                if pp_ok:
+                                    self.place_limit_order(symbol, curr_price, features=features)
                             else:
                                 print(f"🔪 [{symbol}] virtual buy skipped by filter")
 

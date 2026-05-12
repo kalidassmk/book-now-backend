@@ -123,6 +123,20 @@ class MultiSymbolScalper:
         self.fk_overbought_skip = True
         self.fk_overbought_60m_pct = 1.5
 
+        # Post-pump-bleed filter (daily-timeframe, added 2026-05-12 after
+        # JTO loss). Catches coins that pumped 30%+ in the last 14 days
+        # and are now bleeding off the peak — a multi-day downtrend that
+        # the 1m/24h falling-knife filter cannot see. See the algorithm
+        # spec in _passes_post_pump_filter().
+        self.pp_enabled = True
+        self.pp_threshold_pct = 30.0          # pump = +30% over pre-pump baseline
+        self.pp_off_peak_min_pct = 10.0       # current ≥ 10% below pump peak
+        self.pp_min_days_since_peak = 2       # peak was at least 2 days ago
+        self.pp_lookback_days = 14            # window to scan for pump
+        self.pp_baseline_days = 7             # 7-day pre-pump baseline window
+        self._d1_cache: dict = {}             # symbol -> {data, ts}
+        self._d1_cache_ttl_sec = 600          # 10 min — daily candle, fine
+
         # Fast-drop-without-volume filter (Pattern C). Watches price +
         # volume during the limit-buy wait window and cancels the order
         # if the coin is bleeding without capitulation volume.
@@ -422,6 +436,14 @@ class MultiSymbolScalper:
             self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
             self.fk_overbought_60m_pct = float(cfg.get("overbought60mPct", 1.5))
 
+            # Post-pump-bleed (daily-timeframe) filter knobs.
+            self.pp_enabled = bool(cfg.get("postPumpFilterEnabled", True))
+            self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
+            self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
+            self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
+            self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 14))
+            self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 7))
+
             # Fast-drop-without-volume filter (Pattern C). Cancels the
             # limit-buy if price falls fast in the first few minutes
             # without a corresponding volume surge.
@@ -544,6 +566,115 @@ class MultiSymbolScalper:
         except Exception as exc:
             log.debug(f"falling_knife fetch failed for {symbol}: {exc}")
             return True, None
+
+    async def _fetch_d1_klines(self, symbol: str):
+        """Cached fetch of daily klines. One Binance REST call per symbol
+        per 10 minutes — cheap enough at signal-rate (~50/day)."""
+        now = time.time()
+        cached = self._d1_cache.get(symbol)
+        if cached and (now - cached["_ts"]) < self._d1_cache_ttl_sec:
+            return cached["data"]
+        try:
+            limit = self.pp_lookback_days + self.pp_baseline_days + 2
+            data = await self.client.fetch_ohlcv(symbol, "1d", limit=limit)
+        except Exception:
+            return None
+        if data:
+            self._d1_cache[symbol] = {"_ts": now, "data": data}
+        return data
+
+    async def _passes_post_pump_filter(self, symbol: str):
+        """Daily-timeframe post-pump-bleed filter (added 2026-05-12).
+
+        The 24h/1h falling-knife filter cannot see multi-day pumps. JTO
+        pumped from ~$0.32 → $0.70 (+118%) about a week ago, then bled
+        back to $0.50. Every shorter-timeframe filter saw a calm market
+        and the bot bought into the downtrend — small but recurring loss.
+
+        Algorithm (operates on the last (lookback + baseline) daily candles):
+
+          1. Split history into two windows:
+               baseline_window = closes[-(L+B) : -L]   # B days before the pump
+               pump_window     = highs[-L : -1]        # L recent days, excludes today
+          2. baseline = mean(baseline_window)
+          3. peak     = max(pump_window)
+          4. pump_pct = (peak - baseline) / baseline * 100
+          5. days_since_peak = (L - 1) - peak_index_in_pump_window
+          6. off_peak_pct  = (peak - current_price) / peak * 100
+          7. ma7 = mean(closes[-7:])
+
+          REJECT iff all of these hold:
+             pump_pct          >= pp_threshold_pct       (recent big pump)
+             off_peak_pct      >= pp_off_peak_min_pct    (already off the peak)
+             current_price     <  ma7                    (below short-term avg)
+             days_since_peak   >= pp_min_days_since_peak (peak is not today)
+
+        Returns (ok, features_dict). On any data error returns (True, None)
+        so a Binance hiccup does not silently disable the filter.
+        """
+        if not self.pp_enabled:
+            return True, None
+        data = await self._fetch_d1_klines(symbol)
+        if not data or len(data) < (self.pp_lookback_days + 2):
+            return True, None  # not enough history (e.g. new listing)
+        try:
+            closes = [float(c[4]) for c in data]
+            highs  = [float(c[2]) for c in data]
+        except Exception:
+            return True, None
+
+        L = self.pp_lookback_days
+        B = self.pp_baseline_days
+        current_price = closes[-1]
+        # MA7 from the most recent 7 daily closes.
+        ma7 = sum(closes[-7:]) / 7 if len(closes) >= 7 else current_price
+
+        # Pump window: last L days EXCLUDING today (so an in-progress pump
+        # doesn't get flagged as "past peak").
+        pump_window = highs[-(L + 1):-1]
+        if not pump_window:
+            return True, None
+        peak = max(pump_window)
+        peak_idx = pump_window.index(peak)              # 0..L-1
+        days_since_peak = (len(pump_window) - 1) - peak_idx  # 0..L-1
+
+        # Baseline window: B days BEFORE the pump window.
+        baseline_slice = closes[-(L + 1 + B):-(L + 1)]
+        if not baseline_slice:
+            return True, None
+        baseline = sum(baseline_slice) / len(baseline_slice)
+        if baseline <= 0:
+            return True, None
+
+        pump_pct = (peak - baseline) / baseline * 100.0
+        off_peak_pct = (peak - current_price) / peak * 100.0 if peak > 0 else 0.0
+
+        features = {
+            "filter": "post_pump_bleed",
+            "current_price": round(current_price, 8),
+            "ma7": round(ma7, 8),
+            "peak_14d": round(peak, 8),
+            "baseline_7d_pre_pump": round(baseline, 8),
+            "pump_pct": round(pump_pct, 2),
+            "off_peak_pct": round(off_peak_pct, 2),
+            "days_since_peak": int(days_since_peak),
+        }
+
+        rejected = (
+            pump_pct        >= self.pp_threshold_pct       and
+            off_peak_pct    >= self.pp_off_peak_min_pct    and
+            current_price   <  ma7                          and
+            days_since_peak >= self.pp_min_days_since_peak
+        )
+        if rejected:
+            reason = (f"post-pump bleed: pumped +{pump_pct:.0f}% to {peak:.4f} "
+                      f"{days_since_peak}d ago, now {current_price:.4f} "
+                      f"(-{off_peak_pct:.1f}% off peak, < MA7 {ma7:.4f})")
+            log.info(f"📉 [{symbol}] skipped by post_pump_bleed: {reason}")
+            if self.metrics is not None:
+                self.metrics.signal_skipped(symbol, "post_pump_bleed", reason, features)
+            return False, features
+        return True, features
 
     async def get_indicators(self, symbol: str):
         """Fetch data and compute indicators for a symbol."""
@@ -775,6 +906,14 @@ class MultiSymbolScalper:
                     decision="pass" if ok else "skipped",
                 )
             if not ok:
+                return
+            # Daily-timeframe post-pump-bleed gate (2026-05-12). The 24h/1h
+            # filters can't see a multi-day downtrend — e.g. JTO pumped a
+            # week ago and bled back, every short-timeframe check looked
+            # calm. This filter is the only one that opens the multi-day
+            # window. Skip-events show up in METRICS:SKIP as `post_pump_bleed`.
+            pp_ok, _ = await self._passes_post_pump_filter(symbol)
+            if not pp_ok:
                 return
             await self.execute_buy(symbol, last_price, features=features)
 
