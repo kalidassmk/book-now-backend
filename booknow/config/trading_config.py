@@ -85,7 +85,11 @@ class TradingConfig:
     trendReversalExitEnabled: bool = True
 
     # ── Virtual Scalper live mode ────────────────────────────────────────
-    virtualScalperLiveMode: bool = False   # set true to make Virtual Scalper trade real money
+    # 2026-05-12 iter 15: default True (was False). Operator's intended
+    # mode is live virtual trading. Combined with the new merge-on-POST in
+    # routes_config, this ensures the value survives dashboard saves AND
+    # a fresh Redis (e.g. volume wipe) without needing manual re-flips.
+    virtualScalperLiveMode: bool = True
 
     # ── 24h market-context filter (post-mortem-derived) ─────────────────
     # Reject buy entries when the symbol's 24h ticker fails any of these.

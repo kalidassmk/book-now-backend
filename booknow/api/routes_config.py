@@ -47,7 +47,18 @@ async def post_config(
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail=f"Invalid {fld}")
 
-    cfg = TradingConfig.from_dict(payload)
+    # 2026-05-12 iter 15 fix: MERGE payload with existing Redis config
+    # before saving. Without this, any field NOT in the payload silently
+    # reverts to its dataclass default — and the dashboard form only sends
+    # 6 fields (autoBuyEnabled, buyAmountUsdt, profitPct, profitAmountUsdt,
+    # tslPct, limitBuyOffsetPct). Every "save" was wiping virtualScalperLiveMode,
+    # postPump*, ladderTimeExit*, ladderTrailing*, etc. back to defaults.
+    # Operator reported "after every deploy virtualScalperLiveMode reverts
+    # to false" — that wasn't a deploy issue, it was every dashboard save.
+    existing = await state.config_service.refresh()
+    merged = {**existing.to_dict(), **payload}
+    cfg = TradingConfig.from_dict(merged)
     await state.config_service.save(cfg)
-    logger.info("[/config] updated: %s", cfg.to_dict())
+    logger.info("[/config] updated (merged %d payload fields over %d existing): %s",
+                len(payload), len(existing.to_dict()), cfg.to_dict())
     return {"success": True, "config": cfg.to_dict()}
