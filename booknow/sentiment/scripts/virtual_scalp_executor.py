@@ -386,7 +386,9 @@ class VirtualScalpExecutor:
         except Exception as e:
             print(f"⚠️ [v-ladder] balance fetch failed ({e}); proceeding")
             return True
-        margin = required * 0.10
+        # 2026-05-12 iter 13: margin 10% → 3% (mirrors Fast Scalper).
+        # Fees on $100 ladder are ~$0.20 net; 3% = $3 buffer is plenty.
+        margin = required * 0.03
         if free < required + margin:
             print(f"⚠️ [v-ladder] insufficient USDT: free=${free:.4f} need=${required:.4f} (+margin)")
             return False

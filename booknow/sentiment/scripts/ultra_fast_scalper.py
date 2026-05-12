@@ -819,9 +819,14 @@ class MultiSymbolScalper:
         except Exception as exc:
             log.warning(f"⚠️ [ladder] balance fetch failed ({exc}); proceeding")
             return True
-        # Add a tiny safety margin (10% of required) to absorb fees +
-        # races with other pending orders.
-        margin = required * 0.10
+        # Safety margin to absorb fees + races with other pending orders.
+        # 2026-05-12 iter 13: was 10% — too aggressive when free USDT is
+        # close to the ladder size ($100 needs $110 free, but $103.88 free
+        # was rejecting every ladder while the wallet was bigger than the
+        # ladder itself). 3% is more than enough to cover 2 legs × $0.05
+        # of BNB-discounted fees + small price drift between this balance
+        # check and the actual order placement.
+        margin = required * 0.03
         if free < required + margin:
             log.warning(f"⚠️ [ladder] insufficient USDT: free=${free:.4f} need=${required:.4f} (+margin)")
             return False
