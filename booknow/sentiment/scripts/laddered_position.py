@@ -96,6 +96,12 @@ class LadderState:
     below_avg_started_ts: int = 0   # for Time-to-Break-Even metric
     total_underwater_ms: int = 0    # accumulator for TBE
     recovered_to_break_even: bool = False
+    # 2026-05-12 iter 15: trailing-TP state. Once price exceeds tp_target,
+    # we cancel the limit TP and start trailing the running peak. Exit when
+    # current_price <= peak × (1 - ladderTrailingTpPct/100). Lets winners
+    # run beyond the static TP and capture the bigger-move upside.
+    trailing_active: bool = False
+    peak_price_since_tp: float = 0.0
     closed_ts: int = 0
     exit_reason: str = ""
 
@@ -111,6 +117,8 @@ class LadderState:
             "below_avg_started_ts": self.below_avg_started_ts,
             "total_underwater_ms": self.total_underwater_ms,
             "recovered_to_break_even": self.recovered_to_break_even,
+            "trailing_active": self.trailing_active,
+            "peak_price_since_tp": self.peak_price_since_tp,
             "closed_ts": self.closed_ts,
             "exit_reason": self.exit_reason,
         }
@@ -136,6 +144,8 @@ class LadderState:
             below_avg_started_ts=int(d.get("below_avg_started_ts") or 0),
             total_underwater_ms=int(d.get("total_underwater_ms") or 0),
             recovered_to_break_even=bool(d.get("recovered_to_break_even") or False),
+            trailing_active=bool(d.get("trailing_active") or False),
+            peak_price_since_tp=float(d.get("peak_price_since_tp") or 0),
             closed_ts=int(d.get("closed_ts") or 0),
             exit_reason=d.get("exit_reason") or "",
         )

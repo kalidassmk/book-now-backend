@@ -194,6 +194,13 @@ class MultiSymbolScalper:
         self.ladder_breakeven_exit_enabled = True
         self.ladder_breakeven_buffer_pct = 0.05     # exit at avg × (1 + 0.05%) once recovered
 
+        # Trailing-TP (iter 15) — once static TP target is reached we
+        # cancel the limit TP and trail the running peak. Sells when price
+        # retraces by ladder_trailing_tp_pct% from peak. Captures bigger
+        # moves than the fixed TP could.
+        self.ladder_trailing_tp_enabled = True
+        self.ladder_trailing_tp_pct = 0.5
+
         # Metrics collector — bound after Redis connects.
         self.metrics = None
 
@@ -502,6 +509,9 @@ class MultiSymbolScalper:
             self.ladder_max_hold_seconds = int(cfg.get("ladderMaxHoldSeconds", 14400))
             self.ladder_breakeven_exit_enabled = bool(cfg.get("ladderBreakevenExitEnabled", True))
             self.ladder_breakeven_buffer_pct = float(cfg.get("ladderBreakevenBufferPct", 0.05))
+            # Trailing-TP knobs (iter 15).
+            self.ladder_trailing_tp_enabled = bool(cfg.get("ladderTrailingTpEnabled", True))
+            self.ladder_trailing_tp_pct = float(cfg.get("ladderTrailingTpPct", 0.5))
 
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -1323,6 +1333,13 @@ class MultiSymbolScalper:
                 if await self._maybe_force_exit_ladder(state, f):
                     continue
 
+                # iter 15: trailing-TP gate. Once price clears the static
+                # TP we switch to trailing-mode; this method handles both
+                # the switch and the trail-exit. If it returns True the
+                # ladder is closed and we skip the rest of the tick.
+                if await self._maybe_trailing_tp_exit(state, f):
+                    continue
+
                 if state.state == ladder.PENDING_BUY_1:
                     await self._ladder_check_buy1_fill(state, f, tick)
                 elif state.state == ladder.ACTIVE_1:
@@ -1465,6 +1482,107 @@ class MultiSymbolScalper:
 
         log.info(f"🪜 [ladder] {state.symbol} CLOSED reason={force_reason} "
                  f"net=${pnl:+.4f} age={age_sec/60:.1f}m avg=${avg:.6f} exit=${exit_price:.6f}")
+        ladder.clear_state(self.redis, state.symbol)
+        ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
+        return True
+
+    async def _maybe_trailing_tp_exit(self, state, f):
+        """Iter 15 trailing-TP gate.
+
+        Activation: when current price first reaches state.tp_target_price
+        (the static net-profit TP) we (a) cancel the limit TP order, (b)
+        mark trailing_active=True, (c) seed peak_price_since_tp.
+
+        Trailing: each tick, refresh peak_price_since_tp = max(peak, price).
+        Exit at market when current_price <= peak × (1 - trailing_pct/100).
+
+        Why this matters: the static $0.15-$0.40 TP captured ~10% of the
+        available move on winners like ETHFI (+$0.18 net while +$1.84 was
+        on the table). Trailing TP lets winners run — exits when momentum
+        actually fades, not at an arbitrary fixed level.
+
+        Returns True iff the ladder was closed via trail. Returns False
+        when we either (a) haven't reached TP yet, (b) are trailing but
+        the peak hasn't retraced, or (c) the feature is disabled.
+        """
+        if not self.ladder_trailing_tp_enabled:
+            return False
+        if state is None or state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return False
+        if not state.tp_target_price or state.tp_target_price <= 0:
+            return False
+        filled_legs = [L for L in (state.buy_1, state.buy_2, state.buy_3)
+                       if L and L.qty_filled and L.fill_price]
+        if not filled_legs:
+            return False
+        total_qty = sum(L.qty_filled for L in filled_legs)
+        if total_qty <= 0:
+            return False
+
+        try:
+            tk = await self.client.fetch_ticker(state.symbol)
+            current_price = float(tk.get("last") or tk.get("close") or 0)
+        except Exception:
+            return False
+        if current_price <= 0:
+            return False
+
+        # Phase 1: not yet at TP — nothing to do; static limit TP handles it.
+        if not state.trailing_active:
+            if current_price < state.tp_target_price:
+                return False
+            # First tick at-or-above TP: cancel limit TP and switch to trailing.
+            log.info(f"📈 [ladder] {state.symbol} TP {state.tp_target_price:.6f} reached "
+                     f"@ {current_price:.6f} — switching to trailing-TP")
+            if state.tp_order_id:
+                try:
+                    await self.client.cancel_order(state.tp_order_id, state.symbol)
+                except Exception as exc:
+                    log.warning(f"⚠️ [ladder] {state.symbol} failed to cancel limit TP "
+                                f"({exc}); proceeding to trail anyway")
+                state.tp_order_id = None
+            state.trailing_active = True
+            state.peak_price_since_tp = current_price
+            ladder.save_state(self.redis, state)
+            return False  # keep ladder alive in trailing mode
+
+        # Phase 2: trailing — update peak and check trail-stop.
+        if current_price > state.peak_price_since_tp:
+            state.peak_price_since_tp = current_price
+            ladder.save_state(self.redis, state)
+            return False
+
+        trail_threshold = state.peak_price_since_tp * (1 - self.ladder_trailing_tp_pct / 100.0)
+        if current_price > trail_threshold:
+            return False  # still inside the trail buffer
+
+        # Trail-stop triggered → market sell.
+        total_cost = sum(L.qty_filled * L.fill_price for L in filled_legs)
+        avg = total_cost / total_qty
+        sell_qty = self.round_step(total_qty * 0.999, f["step_size"])
+        exit_price = current_price
+        try:
+            sold = await self.client.create_market_sell_order(state.symbol, sell_qty)
+            exit_price = float(sold.get("average") or sold.get("price") or current_price)
+        except Exception as exc:
+            log.error(f"❌ [ladder] {state.symbol} trailing-TP market sell failed: {exc}")
+
+        pnl = (exit_price - avg) * total_qty
+        pnl -= 2 * self.ladder_fee_rate_per_side * total_cost
+        now_ms = int(time.time() * 1000)
+        state.state = ladder.CLOSED
+        state.exit_reason = "trailing_tp"
+        state.closed_ts = now_ms
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, exit_price, sell_qty,
+                                           reason="trailing_tp", pnl_usdt=pnl)
+            except Exception:
+                pass
+
+        log.info(f"🎯 [ladder] {state.symbol} TRAILING-TP exit "
+                 f"net=${pnl:+.4f} peak=${state.peak_price_since_tp:.6f} "
+                 f"exit=${exit_price:.6f} avg=${avg:.6f}")
         ladder.clear_state(self.redis, state.symbol)
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
         return True

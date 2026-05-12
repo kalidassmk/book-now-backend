@@ -180,7 +180,11 @@ class TradingConfig:
     # automatically: tp_pct = (target_net / buy_size) × 100 + 2 × fee_rate_pct
     # which guarantees the configured net profit after BOTH sides' fees.
     # Set to 0 to fall back to the static ladderTpFromAvgPct above.
-    ladderTargetNetProfitUsdt: float = 0.15   # was 0.05
+    # 2026-05-12 iter 15: 0.15 → 0.40. Static TP was capturing only ~10%
+    # of available intraday moves on alts (ETHFI net +$0.18 when +$1.84
+    # was on the table). With ladderTrailingTpEnabled, this number is the
+    # ACTIVATION threshold; actual profit can be much higher via trail.
+    ladderTargetNetProfitUsdt: float = 0.40
     # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075
@@ -204,6 +208,22 @@ class TradingConfig:
     ladderMaxHoldSeconds: int = 14400         # 4 hours
     ladderBreakevenExitEnabled: bool = True
     ladderBreakevenBufferPct: float = 0.05
+
+    # ── Trailing TP (iter 15) ────────────────────────────────────────────
+    # Captures bigger upside on winners. When the static TP (set to net
+    # ladderTargetNetProfitUsdt) is *reached*, instead of selling we cancel
+    # the limit TP and start trailing the running peak. We market-sell
+    # when price retraces ladderTrailingTpPct% from that peak.
+    #
+    # Why: ETHFI on 2026-05-12 hit static TP at +$0.18 net but the 24h
+    # high after that point would have been +$1.84 — 10× the captured
+    # profit. Trailing TP would have caught most of that.
+    #
+    # Combined with break-even exit: if price reaches TP → trail. If price
+    # never reaches TP and reverses → break-even exit catches it. If price
+    # never reaches break-even either → time exit caps the hold time.
+    ladderTrailingTpEnabled: bool = True
+    ladderTrailingTpPct: float = 0.5          # trail by 0.5% from peak
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.
