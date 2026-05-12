@@ -969,9 +969,9 @@ class VirtualScalpExecutor:
 
         # 24h volume gate — uses Binance ticker (cached briefly).
         try:
-            min_vol = float(self.r.get('TRADING_CONFIG') and __import__('json').loads(self.r.get('TRADING_CONFIG') or '{}').get('minVol24hUsd', 5_000_000) or 5_000_000)
+            min_vol = float(self.r.get('TRADING_CONFIG') and __import__('json').loads(self.r.get('TRADING_CONFIG') or '{}').get('minVol24hUsd', 2_000_000) or 2_000_000)
         except Exception:
-            min_vol = 5_000_000
+            min_vol = 2_000_000
         if self.client is not None and min_vol > 0:
             try:
                 tk = self.client.fetch_ticker(self._to_ccxt_symbol(symbol))

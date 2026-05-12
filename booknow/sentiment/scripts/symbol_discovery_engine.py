@@ -56,7 +56,7 @@ WEIGHT_TRADE_COUNT    = 0.25   # number of trades — retail activity
 WEIGHT_PRICE_CHANGE   = 0.25   # absolute % price change — momentum
 
 # Hard filters
-MIN_QUOTE_VOLUME_USDT = 5_000_000      # at least $5M 24h volume
+MIN_QUOTE_VOLUME_USDT = 2_000_000      # at least $2M 24h volume (2026-05-12: lowered from $5M to widen discovery)
 EXCLUDED_SYMBOLS      = {              # stablecoins & wrapped tokens to skip
     "USDCUSDT", "BUSDUSDT", "TUSDUSDT", "USDPUSDT", "DAIUSDT",
     "WBTCUSDT", "WETHUSDT", "STETHUSDT", "LDOUSDT",

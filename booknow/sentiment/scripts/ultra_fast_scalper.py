@@ -403,7 +403,7 @@ class MultiSymbolScalper:
             # 24h downtrends). Set any to None / 0 to disable a filter.
             self.min_change_24h_pct = float(cfg.get("minChange24hPct", -1.0))
             self.min_range_24h_pct  = float(cfg.get("minRange24hPct", 5.0))
-            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 5_000_000))
+            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 2_000_000))
 
             # Limit-buy entry params (set offset to 0 or negative to fall
             # back to market buys). Same Redis key the dashboard already

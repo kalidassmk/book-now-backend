@@ -89,10 +89,11 @@ class TradingConfig:
 
     # ── 24h market-context filter (post-mortem-derived) ─────────────────
     # Reject buy entries when the symbol's 24h ticker fails any of these.
-    # 2026-05-11 iter 9: bumped volume floor to $5M for liquidity safety.
+    # 2026-05-12 iter 13: relaxed volume floor back to $2M — $5M was
+    # starving the signal stream (most alt scalps live in $2M–$5M range).
     minChange24hPct: float = -1.0    # skip falling-knife coins
     minRange24hPct:  float = 5.0     # skip too-quiet coins
-    minVol24hUsd:    float = 5_000_000.0  # liquidity floor (was 2M)
+    minVol24hUsd:    float = 2_000_000.0  # liquidity floor
 
     # ── Falling-knife filter (skip top-of-pump buys) ─────────────────────
     # Derived from 2026-05-10 backtest: XEC/LUNC/LUMIA/etc deep losses came
