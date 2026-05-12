@@ -167,14 +167,14 @@ class TradingConfig:
     ladderedRecoveryEnabled: bool = True
     maxConcurrentLadders: int = 1
     singleCoinModeEnabled: bool = True
-    # 2026-05-12 iter 14: $50/leg → $25/leg. Reasoning: operator wallet is
-    # ~$100-200 and $50/leg ($100/ladder) puts ~80% of wallet at risk per
-    # trade. A 1% adverse move = $1 unrealized loss = 1% of wallet. At
-    # $25/leg ($50/ladder) the same 1% move = $0.50 = 0.5%, half the
-    # psychological pain. Smaller positions also let the bot run more
-    # ladders sequentially per BNB top-up.
-    ladderBuy1SizeUsdt: float = 25.0     # iter 14: $25/leg (was 50)
-    ladderBuy2SizeUsdt: float = 25.0
+    # 2026-05-12 iter 15: $25 → $48 per leg (operator request). Wallet
+    # ~$100-110 → $48×2 = $96 ladder + 3% margin = $98.88 threshold,
+    # fits with ~$3 headroom. Captures more $ per trade since the
+    # static $0.40 net target activates trailing-TP at ~1% gain (vs
+    # ~1.6% needed at $25/leg) — so winners are more likely to enter
+    # trail mode and catch the bigger moves.
+    ladderBuy1SizeUsdt: float = 48.0     # iter 15: $48/leg
+    ladderBuy2SizeUsdt: float = 48.0
     ladderBuy3SizeUsdt: float = 0.0      # 0 = Buy 3 disabled
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99

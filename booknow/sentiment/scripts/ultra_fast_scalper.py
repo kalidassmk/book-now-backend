@@ -97,7 +97,7 @@ class MultiSymbolScalper:
         # 2026-05-12 iter 12: $50/leg, 2-leg ladder. Max $100/ladder.
         # Target $0.15 net per Buy 1 trade.
         self.auto_enabled = True
-        self.buy_amount_usdt = 50.0
+        self.buy_amount_usdt = 48.0
         self.profit_target_usdt = 0.15
         self.stop_loss_usdt = 0.0
 
@@ -156,14 +156,13 @@ class MultiSymbolScalper:
         self.trend_reversal_exit_enabled = True
 
         # Laddered Recovery — 1 ladder concurrent, 2-leg averaging-down.
-        # 2026-05-12 iter 14: $25/leg (was $50). Smaller positions = half
-        # the drawdown per adverse % move = less psychological pressure
-        # to panic-sell underwater.
+        # 2026-05-12 iter 15: $48/leg (operator wants higher capture per
+        # trade — $96/ladder fits wallet with 3% funds margin).
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 25.0
-        self.ladder_buy2_size = 25.0
+        self.ladder_buy1_size = 48.0
+        self.ladder_buy2_size = 48.0
         self.ladder_buy3_size = 0.0       # Buy 3 disabled
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
@@ -429,7 +428,7 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 50.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 48.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
             # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
@@ -492,8 +491,8 @@ class MultiSymbolScalper:
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
             self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
             self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 25.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 25.0))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 48.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 48.0))
             self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))

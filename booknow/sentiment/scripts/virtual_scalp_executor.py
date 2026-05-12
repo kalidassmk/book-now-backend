@@ -101,12 +101,12 @@ class VirtualScalpExecutor:
         self.fd_vol_surge_mult = 2.0
 
         # Laddered Recovery (paper or live, mirrors Fast Scalper).
-        # 2026-05-12 iter 14: $50/leg → $25/leg (less wallet pressure).
+        # 2026-05-12 iter 15: $48/leg (operator wants bigger capture).
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 25.0
-        self.ladder_buy2_size = 25.0
+        self.ladder_buy1_size = 48.0
+        self.ladder_buy2_size = 48.0
         self.ladder_buy3_size = 0.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
@@ -183,8 +183,8 @@ class VirtualScalpExecutor:
                 self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
                 self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
                 self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 25.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 25.0))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 48.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 48.0))
                 self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
