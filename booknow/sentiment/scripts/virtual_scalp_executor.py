@@ -83,8 +83,10 @@ class VirtualScalpExecutor:
         self.pp_threshold_pct = 30.0
         self.pp_off_peak_min_pct = 10.0
         self.pp_min_days_since_peak = 2
-        self.pp_lookback_days = 14
-        self.pp_baseline_days = 7
+        # 2026-05-12 iter 13 tuning: 14 → 15 days pump window, 7 → 10 days
+        # baseline (mirrors Fast Scalper for parity).
+        self.pp_lookback_days = 15
+        self.pp_baseline_days = 10
         self._d1_cache: dict = {}
         self._d1_cache_ttl_sec = 600
 
@@ -168,8 +170,8 @@ class VirtualScalpExecutor:
                 self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
                 self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
                 self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
-                self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 14))
-                self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 7))
+                self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
+                self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
                 # Stop-loss config (0 = disabled, matches Fast Scalper).
                 self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
                 # Fast-drop-without-volume filter knobs.

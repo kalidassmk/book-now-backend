@@ -111,6 +111,25 @@ class TradingConfig:
     overboughtSkipEnabled: bool = True # skip if 24h>0 AND 60m>+2.5%
     overbought60mPct: float = 2.5      # 60m threshold for overbought combo (was 1.5)
 
+    # ── Post-pump-bleed (daily-timeframe) filter ─────────────────────────
+    # 2026-05-12: added after the JTO loss. JTO pumped from $0.345 → $0.70
+    # ~4-5 days ago and has been bleeding back ever since. Every short-
+    # timeframe filter saw a calm market because the pump was outside their
+    # window. This filter runs on daily klines and blocks coins that:
+    #   pumped >= postPumpThresholdPct% off a 10-day pre-pump baseline,
+    #   are now >= postPumpOffPeakMinPct% off that peak,
+    #   sit below their MA7 (short-term avg breaking down),
+    #   peaked >= postPumpMinDaysSincePeak days ago (i.e. not still pumping).
+    # All four gates must fire — singletons false-positive on healthy
+    # volatility. Defaults verified against JTO + ICP (both blocked) and
+    # BTC/ETH/SOL/XRP/ATOM/TAO/TIA/SEI (none blocked) on 2026-05-12 data.
+    postPumpFilterEnabled: bool = True
+    postPumpThresholdPct: float = 30.0       # pump = +30% over baseline
+    postPumpOffPeakMinPct: float = 10.0      # current ≥ 10% below pump peak
+    postPumpMinDaysSincePeak: int = 2        # peak ≥ 2 days ago
+    postPumpLookbackDays: int = 15           # scan last 15 days for the peak
+    postPumpBaselineDays: int = 10           # 10-day pre-pump baseline window
+
     # ── Fast-drop-without-volume filter (Pattern C, post-signal) ─────────
     # 2026-05-10 trajectory analysis showed BIO/SOPH (today's losers) both
     # dropped to -0.5% within minutes of signal WITHOUT a volume surge,

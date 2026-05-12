@@ -132,8 +132,12 @@ class MultiSymbolScalper:
         self.pp_threshold_pct = 30.0          # pump = +30% over pre-pump baseline
         self.pp_off_peak_min_pct = 10.0       # current ≥ 10% below pump peak
         self.pp_min_days_since_peak = 2       # peak was at least 2 days ago
-        self.pp_lookback_days = 14            # window to scan for pump
-        self.pp_baseline_days = 7             # 7-day pre-pump baseline window
+        # 2026-05-12 iter 13 tuning: 14 → 15 days pump window (operator
+        # asked for the upper end of a 10–15 day scan), 7 → 10 days
+        # baseline (more stable "normal price" anchor — a 7-day baseline
+        # can be skewed by a mini-rally just before the real pump).
+        self.pp_lookback_days = 15            # window to scan for pump
+        self.pp_baseline_days = 10            # pre-pump baseline window
         self._d1_cache: dict = {}             # symbol -> {data, ts}
         self._d1_cache_ttl_sec = 600          # 10 min — daily candle, fine
 
@@ -441,8 +445,8 @@ class MultiSymbolScalper:
             self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
             self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
             self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
-            self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 14))
-            self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 7))
+            self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
+            self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
 
             # Fast-drop-without-volume filter (Pattern C). Cancels the
             # limit-buy if price falls fast in the first few minutes
