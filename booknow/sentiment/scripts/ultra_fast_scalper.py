@@ -94,12 +94,12 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
-        # 2026-05-11 iter 9: $30/leg sizing (was $12). 1 ladder concurrent,
-        # 3 legs each → max $90 in flight. Target $0.15 net per Buy 1.
+        # 2026-05-12 iter 11: $55/leg, 2-leg ladder (Buy 3 disabled).
+        # Max $110 per ladder. Target $0.15 net per Buy 1 trade.
         self.auto_enabled = True
-        self.buy_amount_usdt = 30.0
+        self.buy_amount_usdt = 55.0
         self.profit_target_usdt = 0.15
-        self.stop_loss_usdt = 0.0       # disabled by default (Option B legacy)
+        self.stop_loss_usdt = 0.0
 
         # Market-context filters (derived from yesterday's P&L analysis).
         # Hot-reloaded from TRADING_CONFIG so thresholds can be tuned
@@ -137,14 +137,14 @@ class MultiSymbolScalper:
         # showed most "panic exits" hit TP later if held.
         self.trend_reversal_exit_enabled = True
 
-        # Laddered Recovery — 1 ladder concurrent, 3-tier averaging-down.
-        # 2026-05-11 iter 9: $30/leg + max 1 concurrent.
+        # Laddered Recovery — 1 ladder concurrent, 2-leg averaging-down.
+        # 2026-05-12 iter 11: $55/leg, Buy 3 disabled.
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 30.0
-        self.ladder_buy2_size = 30.0
-        self.ladder_buy3_size = 30.0
+        self.ladder_buy1_size = 55.0
+        self.ladder_buy2_size = 55.0
+        self.ladder_buy3_size = 0.0       # Buy 3 disabled
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
@@ -152,7 +152,7 @@ class MultiSymbolScalper:
         self.ladder_fee_rate_per_side = 0.00075 # 0.075% (BNB discount)
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
-        self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
+        self.ladder_buy1_offset_pct = 0.05  # 0.05% = -$0.001 on $2 coin
         self.ladder_cooldown_seconds = 14400   # 4 hours
 
         # Metrics collector — bound after Redis connects.
@@ -383,7 +383,7 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 30.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 55.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
             # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
@@ -438,9 +438,9 @@ class MultiSymbolScalper:
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
             self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
             self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 30.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 30.0))
-            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 30.0))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 55.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 55.0))
+            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
             self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
@@ -448,7 +448,7 @@ class MultiSymbolScalper:
             self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
-            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
+            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.05))
             self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
 
             if self.metrics is not None:
@@ -488,14 +488,17 @@ class MultiSymbolScalper:
 
             updates = {
                 'now_pct':  round(now_pct, 4),
+                'now_price': round(close, 10),       # NEW: live price for dashboard
                 'last_tick_ts': int(time.time() * 1000),
             }
             if low > 0 and new_btm < prev_btm:
                 updates['bottom_pct'] = round(new_btm, 4)
                 updates['bottom_ts'] = int(time.time() * 1000)
+                updates['lowest_since_buy'] = round(low, 10)   # NEW: absolute price
             if high > 0 and new_max > prev_max:
                 updates['max_pct'] = round(new_max, 4)
                 updates['max_ts'] = int(time.time() * 1000)
+                updates['highest_since_buy'] = round(high, 10)  # NEW: absolute price
 
             # Vol-1m / pre-baseline ratio (proxy for capitulation strength).
             if pre_baseline > 0 and close > 0 and vol_base > 0:
@@ -859,6 +862,51 @@ class MultiSymbolScalper:
         ladder.clear_state(self.redis, state.symbol)
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
 
+    async def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
+        """Build the audit dict the dashboard needs:
+            pre_signal_price, past 15m low/high, buy_2 limit, three target-sell prices.
+        Best-effort: any field that can't be computed stays None."""
+        out = {
+            "signal_price": signal_price,
+            "buy_1_limit_price": buy1_limit_price,
+            "pre_signal_price": None,
+            "past_15min_low": None,
+            "past_15min_high": None,
+            "buy_2_limit_price": None,
+            "target_sell_005": None,
+            "target_sell_010": None,
+            "target_sell_015": None,
+        }
+        try:
+            candles = await self.client.fetch_ohlcv(symbol, "1m", limit=20)
+            if candles and len(candles) >= 5:
+                # Pre-signal price = close 5 min before now
+                pre = candles[-6] if len(candles) >= 6 else candles[0]
+                out["pre_signal_price"] = float(pre[4] or 0)
+                # Past-15m low/high
+                last_15 = candles[-15:] if len(candles) >= 15 else candles
+                highs = [float(c[2] or 0) for c in last_15 if float(c[2] or 0) > 0]
+                lows  = [float(c[3] or 0) for c in last_15 if float(c[3] or 0) > 0]
+                if highs: out["past_15min_high"] = max(highs)
+                if lows:  out["past_15min_low"]  = min(lows)
+        except Exception as exc:
+            log.debug(f"audit snapshot 15m candles failed for {symbol}: {exc}")
+        # Buy 2 limit = signal × (1 - buy2_offset)
+        try:
+            out["buy_2_limit_price"] = signal_price * (1 - self.ladder_buy2_offset_pct / 100.0)
+        except Exception:
+            pass
+        # Target sell prices for $0.05/$0.10/$0.15 NET on this buy
+        fee_2 = 2 * self.ladder_fee_rate_per_side
+        try:
+            buy_size = self.ladder_buy1_size or 1.0
+            for net, key in ((0.05, "target_sell_005"), (0.10, "target_sell_010"), (0.15, "target_sell_015")):
+                tp_pct = (net / buy_size) + fee_2   # decimal (not %)
+                out[key] = buy1_limit_price * (1 + tp_pct)
+        except Exception:
+            pass
+        return out
+
     async def _ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
         whole ladder (legs 2/3 + TP) is on the book within microseconds
@@ -914,9 +962,13 @@ class MultiSymbolScalper:
                 log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
                          f"(-{self.ladder_buy1_offset_pct}% from signal {signal_price}) qty={buy1_qty}")
                 if self.metrics is not None:
-                    self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
-                                            features=features, order_type="ladder_buy_1_offset_limit",
-                                            offset_pct=self.ladder_buy1_offset_pct)
+                    audit = await self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+                    self.metrics.buy_placed(
+                        symbol, buy1_price, self.ladder_buy1_size,
+                        features=features, order_type="ladder_buy_1_offset_limit",
+                        offset_pct=self.ladder_buy1_offset_pct,
+                        **audit,
+                    )
                 return
 
             if self.ladder_buy1_market:
@@ -956,8 +1008,12 @@ class MultiSymbolScalper:
                 )
                 log.info(f"🪜 [ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
                 if self.metrics is not None:
-                    self.metrics.buy_placed(symbol, fill_price, self.ladder_buy1_size,
-                                            features=features, order_type="ladder_buy_1_market")
+                    audit = await self._compute_audit_snapshot(symbol, signal_price, fill_price)
+                    self.metrics.buy_placed(
+                        symbol, fill_price, self.ladder_buy1_size,
+                        features=features, order_type="ladder_buy_1_market",
+                        **audit,
+                    )
                     self.metrics.fill_recorded(symbol, fill_price, base_qty)
                 # Place legs 2, 3, and TP simultaneously
                 await self._ladder_place_legs_after_buy1(state, f, tick)
@@ -994,8 +1050,12 @@ class MultiSymbolScalper:
             ladder.save_state(self.redis, state)
             log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
             if self.metrics is not None:
-                self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
-                                        features=features, order_type="ladder_buy_1_limit")
+                audit = await self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+                self.metrics.buy_placed(
+                    symbol, buy1_price, self.ladder_buy1_size,
+                    features=features, order_type="ladder_buy_1_limit",
+                    **audit,
+                )
         except Exception as exc:
             log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
 

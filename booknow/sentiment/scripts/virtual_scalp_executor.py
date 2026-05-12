@@ -40,11 +40,11 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
-# 2026-05-11 iter 9: $30/leg, $0.15 net target, max 1 ladder concurrent.
-DEFAULT_BUY_AMOUNT_USDT = 30.0
+# 2026-05-12 iter 11: $55/leg, $0.15 net target, Buy 3 disabled.
+DEFAULT_BUY_AMOUNT_USDT = 55.0
 DEFAULT_PROFIT_TARGET_USDT = 0.15
-DEFAULT_PROFIT_PCT = 0.7             # % above entry → ≈$0.15 NET on $30 buy after 0.2% fees
-DEFAULT_LIMIT_OFFSET_PCT = 0.65      # % below signal price; legacy strategy
+DEFAULT_PROFIT_PCT = 0.5             # % above entry → ≈$0.15 NET on $55 buy after 0.2% fees
+DEFAULT_LIMIT_OFFSET_PCT = 0.05      # 0.05 % below signal (-$0.001 on $2 coin)
 
 # Risk Settings for Virtual Scalper
 SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience
@@ -87,20 +87,20 @@ class VirtualScalpExecutor:
         self.fd_vol_surge_mult = 2.0
 
         # Laddered Recovery (paper or live, mirrors Fast Scalper).
-        # 2026-05-11 iter 9: $30/leg, max 1 concurrent.
+        # 2026-05-12 iter 11: $55/leg, 2-leg ladder (Buy 3 disabled).
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 30.0
-        self.ladder_buy2_size = 30.0
-        self.ladder_buy3_size = 30.0
+        self.ladder_buy1_size = 55.0
+        self.ladder_buy2_size = 55.0
+        self.ladder_buy3_size = 0.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
         self.ladder_target_net_usdt = 0.15
         self.ladder_fee_rate_per_side = 0.00075
         self.ladder_hard_stop_pct = 1.0
-        self.ladder_buy1_offset_pct = 0.0   # 0 = market; >0 = limit at signal × (1-X%)
+        self.ladder_buy1_offset_pct = 0.05  # 0.05 % below signal
         self.ladder_cooldown_seconds = 14400  # 4 hours
 
         # Metrics collector — same Redis as everything else.
@@ -162,9 +162,9 @@ class VirtualScalpExecutor:
                 self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
                 self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
                 self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 30.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 30.0))
-                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 30.0))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 55.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 55.0))
+                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
@@ -320,9 +320,54 @@ class VirtualScalpExecutor:
               f"buy2@{state.buy_2.target_price:.6g} buy3@{state.buy_3.target_price:.6g} "
               f"tp@{state.tp_target_price:.6g}")
         if self.metrics is not None:
-            self.metrics.buy_placed(symbol, signal_price, self.ladder_buy1_size,
-                                    features=features, order_type="virtual_ladder_buy_1")
+            audit = self._compute_audit_snapshot(symbol, signal_price, signal_price)
+            self.metrics.buy_placed(
+                symbol, signal_price, self.ladder_buy1_size,
+                features=features, order_type="virtual_ladder_buy_1_paper",
+                **audit,
+            )
             self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
+
+    def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
+        """Same logic as Fast Scalper's helper — but sync (Virtual uses sync ccxt)."""
+        out = {
+            "signal_price": signal_price,
+            "buy_1_limit_price": buy1_limit_price,
+            "pre_signal_price": None,
+            "past_15min_low": None,
+            "past_15min_high": None,
+            "buy_2_limit_price": None,
+            "target_sell_005": None,
+            "target_sell_010": None,
+            "target_sell_015": None,
+        }
+        if self.client is not None:
+            try:
+                ccxt_sym = self._to_ccxt_symbol(symbol)
+                candles = self.client.fetch_ohlcv(ccxt_sym, "1m", limit=20)
+                if candles and len(candles) >= 5:
+                    pre = candles[-6] if len(candles) >= 6 else candles[0]
+                    out["pre_signal_price"] = float(pre[4] or 0)
+                    last_15 = candles[-15:] if len(candles) >= 15 else candles
+                    highs = [float(c[2] or 0) for c in last_15 if float(c[2] or 0) > 0]
+                    lows  = [float(c[3] or 0) for c in last_15 if float(c[3] or 0) > 0]
+                    if highs: out["past_15min_high"] = max(highs)
+                    if lows:  out["past_15min_low"]  = min(lows)
+            except Exception as e:
+                print(f"audit 15m candles failed for {symbol}: {e}")
+        try:
+            out["buy_2_limit_price"] = signal_price * (1 - self.ladder_buy2_offset_pct / 100.0)
+        except Exception:
+            pass
+        fee_2 = 2 * self.ladder_fee_rate_per_side
+        try:
+            buy_size = self.ladder_buy1_size or 1.0
+            for net, key in ((0.05, "target_sell_005"), (0.10, "target_sell_010"), (0.15, "target_sell_015")):
+                tp_pct = (net / buy_size) + fee_2
+                out[key] = buy1_limit_price * (1 + tp_pct)
+        except Exception:
+            pass
+        return out
 
     def _has_sufficient_usdt(self, required: float) -> bool:
         """Pre-flight balance check (sync). Returns True if we can proceed."""
@@ -420,9 +465,12 @@ class VirtualScalpExecutor:
             print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
                   f"(-{buy1_offset}% from signal {signal_price}) qty={buy1_qty}")
             if self.metrics is not None:
-                self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
-                                        features=features, order_type="virtual_ladder_buy_1_offset_limit",
-                                        offset_pct=buy1_offset)
+                audit = self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+                self.metrics.buy_placed(
+                    symbol, buy1_price, self.ladder_buy1_size,
+                    features=features, order_type="virtual_ladder_buy_1_offset_limit",
+                    offset_pct=buy1_offset, **audit,
+                )
             return
 
         if use_market:
@@ -454,8 +502,12 @@ class VirtualScalpExecutor:
             )
             print(f"🪜 [v-ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
             if self.metrics is not None:
-                self.metrics.buy_placed(symbol, fill_price, self.ladder_buy1_size,
-                                        features=features, order_type="virtual_ladder_buy_1_market")
+                audit = self._compute_audit_snapshot(symbol, signal_price, fill_price)
+                self.metrics.buy_placed(
+                    symbol, fill_price, self.ladder_buy1_size,
+                    features=features, order_type="virtual_ladder_buy_1_market",
+                    **audit,
+                )
                 self.metrics.fill_recorded(symbol, fill_price, base_qty)
             self._ladder_place_legs_after_buy1_live(state, f, tick)
             self._paper_ladder_save(state)
@@ -490,8 +542,12 @@ class VirtualScalpExecutor:
         self._paper_ladder_save(state)
         print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
         if self.metrics is not None:
-            self.metrics.buy_placed(symbol, buy1_price, self.ladder_buy1_size,
-                                    features=features, order_type="virtual_ladder_buy_1_limit")
+            audit = self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+            self.metrics.buy_placed(
+                symbol, buy1_price, self.ladder_buy1_size,
+                features=features, order_type="virtual_ladder_buy_1_limit",
+                **audit,
+            )
 
     def _ladder_place_legs_after_buy1_live(self, state, f, tick):
         """Shared helper: places Buy 2/3 limits + TP once buy 1 is filled.

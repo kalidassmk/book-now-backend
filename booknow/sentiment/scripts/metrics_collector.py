@@ -130,18 +130,47 @@ class MetricsCollector:
 
     def buy_placed(self, symbol: str, price: float, size_usdt: float,
                    features: Optional[Dict[str, Any]] = None,
-                   order_type: str = "market", offset_pct: float = 0.0) -> None:
+                   order_type: str = "market", offset_pct: float = 0.0,
+                   signal_price: Optional[float] = None,
+                   pre_signal_price: Optional[float] = None,
+                   buy_1_limit_price: Optional[float] = None,
+                   buy_2_limit_price: Optional[float] = None,
+                   past_15min_low: Optional[float] = None,
+                   past_15min_high: Optional[float] = None,
+                   target_sell_005: Optional[float] = None,
+                   target_sell_010: Optional[float] = None,
+                   target_sell_015: Optional[float] = None) -> None:
+        """Records a buy with FULL audit trail for the dashboard.
+
+        Captured per buy event:
+          • signal_price       — ask at signal time
+          • pre_signal_price   — price 5 min before signal (for trend context)
+          • buy_1_limit_price  — limit after offset applied (= the order on book)
+          • buy_2_limit_price  — limit for next leg
+          • past_15min_low/high — recent extremes around signal time
+          • target_sell_005/010/015 — sell prices for $0.05/$0.10/$0.15 net
+        """
         date = _today()
         payload = {
             "ts": _now_ms(), "symbol": symbol, "price": price,
             "size_usdt": size_usdt, "order_type": order_type,
             "offset_pct": offset_pct, "features": features or {},
+            # NEW audit fields (iter 12)
+            "signal_price": signal_price,
+            "pre_signal_price": pre_signal_price,
+            "buy_1_limit_price": buy_1_limit_price,
+            "buy_2_limit_price": buy_2_limit_price,
+            "past_15min_low": past_15min_low,
+            "past_15min_high": past_15min_high,
+            "target_sell_005": target_sell_005,
+            "target_sell_010": target_sell_010,
+            "target_sell_015": target_sell_015,
         }
         self._push(self._k("BUY", date), payload)
         self._hincr(self._k("DAILY", date), "buys_placed")
-        # Initialise the per-coin outcome record
+        # Initialise the per-coin OUTCOME / AUDIT record
         outcome_key = self._k("OUTCOME", date, symbol.replace("/", ""))
-        self._hset(outcome_key, {
+        audit_fields = {
             "symbol": symbol,
             "buy_ts": _now_ms(),
             "buy_price": price,
@@ -150,6 +179,38 @@ class MetricsCollector:
             "tp_hit": 0,
             "exited": 0,
             "features": features or {},
+            # NEW audit fields
+            "signal_price": signal_price if signal_price is not None else "",
+            "pre_signal_price": pre_signal_price if pre_signal_price is not None else "",
+            "buy_1_limit_price": buy_1_limit_price if buy_1_limit_price is not None else "",
+            "buy_2_limit_price": buy_2_limit_price if buy_2_limit_price is not None else "",
+            "past_15min_low": past_15min_low if past_15min_low is not None else "",
+            "past_15min_high": past_15min_high if past_15min_high is not None else "",
+            "target_sell_005": target_sell_005 if target_sell_005 is not None else "",
+            "target_sell_010": target_sell_010 if target_sell_010 is not None else "",
+            "target_sell_015": target_sell_015 if target_sell_015 is not None else "",
+            "offset_pct": offset_pct,
+            "order_type": order_type,
+            "lowest_since_buy": "",          # updated by tick
+            "highest_since_buy": "",         # updated by tick
+        }
+        self._hset(outcome_key, audit_fields)
+        # Also push a compact AUDIT event so the new dashboard can list them
+        # chronologically without needing to scan all OUTCOME keys.
+        self._push(self._k("AUDIT", date), {
+            "ts": _now_ms(), "symbol": symbol,
+            "signal_price": signal_price,
+            "pre_signal_price": pre_signal_price,
+            "offset_pct": offset_pct,
+            "buy_1_limit_price": buy_1_limit_price,
+            "buy_1_actual_price": price,
+            "buy_2_limit_price": buy_2_limit_price,
+            "past_15min_low": past_15min_low,
+            "past_15min_high": past_15min_high,
+            "target_sell_005": target_sell_005,
+            "target_sell_010": target_sell_010,
+            "target_sell_015": target_sell_015,
+            "size_usdt": size_usdt,
         })
 
     def fill_recorded(self, symbol: str, fill_price: float, qty: float,

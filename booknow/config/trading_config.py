@@ -38,7 +38,7 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 30.0      # 2026-05-11 iter 9: $30/leg (was 12)
+    buyAmountUsdt: float = 55.0      # 2026-05-12 iter 11: $55/leg (was 30)
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
@@ -137,15 +137,15 @@ class TradingConfig:
     #   • TP at weighted-avg × (1 + ladderTpFromAvgPct/100)
     #   • Hard stop activated ONLY after Buy 3 fills (gap scenario), at
     #     buy_3_price × (1 - ladderHardStopBelowBuy3Pct/100)
-    # 2026-05-11 iter 9: single coin / 3 legs / $30/leg.
-    # Max exposure per ladder: $90 (3 × $30). Only 1 ladder at a time.
+    # 2026-05-12 iter 11: 2-leg ladder ($55 / $55 / Buy 3 DISABLED).
+    # Max exposure per ladder: $110 (2 × $55). Only 1 ladder at a time.
+    # Buy 3 off via size=0 → min_notional check skips placement.
     ladderedRecoveryEnabled: bool = True
-    maxConcurrentLadders: int = 1     # was 3
-    # Legacy: kept for back-compat. Code now uses maxConcurrentLadders.
-    singleCoinModeEnabled: bool = True   # mirrors max=1
-    ladderBuy1SizeUsdt: float = 30.0      # was 12
-    ladderBuy2SizeUsdt: float = 30.0
-    ladderBuy3SizeUsdt: float = 30.0
+    maxConcurrentLadders: int = 1
+    singleCoinModeEnabled: bool = True
+    ladderBuy1SizeUsdt: float = 55.0
+    ladderBuy2SizeUsdt: float = 55.0
+    ladderBuy3SizeUsdt: float = 0.0      # 0 = Buy 3 disabled
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
     ladderTpFromAvgPct: float = 0.6     # static TP fallback when target-net not set
@@ -170,8 +170,8 @@ class TradingConfig:
     # market order. Set to 0 to keep the current market-order behaviour.
     # When >0, ladderBuy1UseMarketOrder is ignored and Buy 1 waits up to
     # limitBuyTimeoutSec for fill.
-    # 2026-05-11 iter 10: 0.0 → 0.09 (save spread, ~85% fill rate).
-    ladderBuy1OffsetPct: float = 0.09
+    # 2026-05-12 iter 11: 0.09 → 0.05 (tighter limit for better fills).
+    ladderBuy1OffsetPct: float = 0.05
     # 2026-05-11 iter 4: per-coin cooldown. After a ladder closes the
     # same symbol is blocked for N seconds so the bot doesn't immediately
     # re-enter the same trade.
