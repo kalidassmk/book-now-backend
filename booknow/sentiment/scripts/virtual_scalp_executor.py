@@ -41,10 +41,10 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
 # 2026-05-12 iter 11: $55/leg, $0.15 net target, Buy 3 disabled.
-DEFAULT_BUY_AMOUNT_USDT = 55.0
+DEFAULT_BUY_AMOUNT_USDT = 50.0
 DEFAULT_PROFIT_TARGET_USDT = 0.15
 DEFAULT_PROFIT_PCT = 0.5             # % above entry → ≈$0.15 NET on $55 buy after 0.2% fees
-DEFAULT_LIMIT_OFFSET_PCT = 0.05      # 0.05 % below signal (-$0.001 on $2 coin)
+DEFAULT_LIMIT_OFFSET_PCT = 0.15      # 0.15 % below signal
 
 # Risk Settings for Virtual Scalper
 SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience
@@ -91,8 +91,8 @@ class VirtualScalpExecutor:
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 55.0
-        self.ladder_buy2_size = 55.0
+        self.ladder_buy1_size = 50.0
+        self.ladder_buy2_size = 50.0
         self.ladder_buy3_size = 0.0
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
@@ -100,7 +100,7 @@ class VirtualScalpExecutor:
         self.ladder_target_net_usdt = 0.15
         self.ladder_fee_rate_per_side = 0.00075
         self.ladder_hard_stop_pct = 1.0
-        self.ladder_buy1_offset_pct = 0.05  # 0.05 % below signal
+        self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
         self.ladder_cooldown_seconds = 14400  # 4 hours
 
         # Metrics collector — same Redis as everything else.
@@ -162,8 +162,8 @@ class VirtualScalpExecutor:
                 self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
                 self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
                 self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 55.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 55.0))
+                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 50.0))
+                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 50.0))
                 self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
@@ -171,7 +171,7 @@ class VirtualScalpExecutor:
                 self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.15))
                 self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
-                self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.0))
+                self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
                 self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
                 if self.metrics is not None:
                     self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -329,25 +329,33 @@ class VirtualScalpExecutor:
             self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
 
     def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
-        """Same logic as Fast Scalper's helper — but sync (Virtual uses sync ccxt)."""
+        """Same logic as Fast Scalper's helper — but sync (Virtual uses sync ccxt).
+        Captures pre_signal_price (5m back), pre_signal_price_2 (10m back),
+        past 15m extremes, Buy 2 limit, three target-sell prices, and tags
+        scalper_origin = 'VIRTUAL'."""
         out = {
             "signal_price": signal_price,
             "buy_1_limit_price": buy1_limit_price,
             "pre_signal_price": None,
+            "pre_signal_price_2": None,
             "past_15min_low": None,
             "past_15min_high": None,
             "buy_2_limit_price": None,
             "target_sell_005": None,
             "target_sell_010": None,
             "target_sell_015": None,
+            "scalper_origin": "VIRTUAL",
         }
         if self.client is not None:
             try:
                 ccxt_sym = self._to_ccxt_symbol(symbol)
                 candles = self.client.fetch_ohlcv(ccxt_sym, "1m", limit=20)
                 if candles and len(candles) >= 5:
-                    pre = candles[-6] if len(candles) >= 6 else candles[0]
-                    out["pre_signal_price"] = float(pre[4] or 0)
+                    pre1 = candles[-6] if len(candles) >= 6 else candles[0]
+                    out["pre_signal_price"] = float(pre1[4] or 0)
+                    if len(candles) >= 11:
+                        pre2 = candles[-11]
+                        out["pre_signal_price_2"] = float(pre2[4] or 0)
                     last_15 = candles[-15:] if len(candles) >= 15 else candles
                     highs = [float(c[2] or 0) for c in last_15 if float(c[2] or 0) > 0]
                     lows  = [float(c[3] or 0) for c in last_15 if float(c[3] or 0) > 0]
@@ -437,7 +445,7 @@ class VirtualScalpExecutor:
         except Exception:
             pass
         use_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
-        buy1_offset = float(cfg.get("ladderBuy1OffsetPct", 0.0))
+        buy1_offset = float(cfg.get("ladderBuy1OffsetPct", 0.15))
 
         # If offset > 0: place LIMIT BUY at signal × (1 - offset/100)
         if buy1_offset > 0:

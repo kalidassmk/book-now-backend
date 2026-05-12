@@ -94,10 +94,10 @@ class MultiSymbolScalper:
         # auto_enabled defaults to True — auto buy/sell is the intended
         # operational mode. Explicitly set "autoBuyEnabled": false in
         # booknow:config to pause without restarting the process.
-        # 2026-05-12 iter 11: $55/leg, 2-leg ladder (Buy 3 disabled).
-        # Max $110 per ladder. Target $0.15 net per Buy 1 trade.
+        # 2026-05-12 iter 12: $50/leg, 2-leg ladder. Max $100/ladder.
+        # Target $0.15 net per Buy 1 trade.
         self.auto_enabled = True
-        self.buy_amount_usdt = 55.0
+        self.buy_amount_usdt = 50.0
         self.profit_target_usdt = 0.15
         self.stop_loss_usdt = 0.0
 
@@ -138,12 +138,12 @@ class MultiSymbolScalper:
         self.trend_reversal_exit_enabled = True
 
         # Laddered Recovery — 1 ladder concurrent, 2-leg averaging-down.
-        # 2026-05-12 iter 11: $55/leg, Buy 3 disabled.
+        # 2026-05-12 iter 12: $50/leg, Buy 3 disabled.
         self.ladder_enabled = False
         self.max_concurrent_ladders = 1
         self.single_coin_mode = True
-        self.ladder_buy1_size = 55.0
-        self.ladder_buy2_size = 55.0
+        self.ladder_buy1_size = 50.0
+        self.ladder_buy2_size = 50.0
         self.ladder_buy3_size = 0.0       # Buy 3 disabled
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
@@ -152,7 +152,7 @@ class MultiSymbolScalper:
         self.ladder_fee_rate_per_side = 0.00075 # 0.075% (BNB discount)
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True
-        self.ladder_buy1_offset_pct = 0.05  # 0.05% = -$0.001 on $2 coin
+        self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
         self.ladder_cooldown_seconds = 14400   # 4 hours
 
         # Metrics collector — bound after Redis connects.
@@ -383,7 +383,7 @@ class MultiSymbolScalper:
                 return
             cfg = json.loads(raw)
             self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 55.0))
+            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 50.0))
 
             # Profit: prefer percentage if set, fall back to flat USDT.
             # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
@@ -438,8 +438,8 @@ class MultiSymbolScalper:
             self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
             self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
             self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 55.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 55.0))
+            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 50.0))
+            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 50.0))
             self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
             self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
             self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
@@ -448,7 +448,7 @@ class MultiSymbolScalper:
             self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
             self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
             self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
-            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.05))
+            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
             self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
 
             if self.metrics is not None:
@@ -864,25 +864,32 @@ class MultiSymbolScalper:
 
     async def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
         """Build the audit dict the dashboard needs:
-            pre_signal_price, past 15m low/high, buy_2 limit, three target-sell prices.
+            pre_signal_price (5m back), pre_signal_price_2 (10m back),
+            past 15m low/high, buy_2 limit, three target-sell prices.
         Best-effort: any field that can't be computed stays None."""
         out = {
             "signal_price": signal_price,
             "buy_1_limit_price": buy1_limit_price,
-            "pre_signal_price": None,
+            "pre_signal_price": None,        # 5 min before signal
+            "pre_signal_price_2": None,      # 10 min before signal
             "past_15min_low": None,
             "past_15min_high": None,
             "buy_2_limit_price": None,
             "target_sell_005": None,
             "target_sell_010": None,
             "target_sell_015": None,
+            "scalper_origin": "FAST",
         }
         try:
             candles = await self.client.fetch_ohlcv(symbol, "1m", limit=20)
             if candles and len(candles) >= 5:
-                # Pre-signal price = close 5 min before now
-                pre = candles[-6] if len(candles) >= 6 else candles[0]
-                out["pre_signal_price"] = float(pre[4] or 0)
+                # Pre-signal-1 = close 5 min before now
+                pre1 = candles[-6] if len(candles) >= 6 else candles[0]
+                out["pre_signal_price"] = float(pre1[4] or 0)
+                # Pre-signal-2 = close 10 min before now
+                if len(candles) >= 11:
+                    pre2 = candles[-11]
+                    out["pre_signal_price_2"] = float(pre2[4] or 0)
                 # Past-15m low/high
                 last_15 = candles[-15:] if len(candles) >= 15 else candles
                 highs = [float(c[2] or 0) for c in last_15 if float(c[2] or 0) > 0]

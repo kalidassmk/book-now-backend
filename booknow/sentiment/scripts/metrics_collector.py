@@ -133,13 +133,15 @@ class MetricsCollector:
                    order_type: str = "market", offset_pct: float = 0.0,
                    signal_price: Optional[float] = None,
                    pre_signal_price: Optional[float] = None,
+                   pre_signal_price_2: Optional[float] = None,
                    buy_1_limit_price: Optional[float] = None,
                    buy_2_limit_price: Optional[float] = None,
                    past_15min_low: Optional[float] = None,
                    past_15min_high: Optional[float] = None,
                    target_sell_005: Optional[float] = None,
                    target_sell_010: Optional[float] = None,
-                   target_sell_015: Optional[float] = None) -> None:
+                   target_sell_015: Optional[float] = None,
+                   scalper_origin: Optional[str] = None) -> None:
         """Records a buy with FULL audit trail for the dashboard.
 
         Captured per buy event:
@@ -157,7 +159,8 @@ class MetricsCollector:
             "offset_pct": offset_pct, "features": features or {},
             # NEW audit fields (iter 12)
             "signal_price": signal_price,
-            "pre_signal_price": pre_signal_price,
+            "pre_signal_price": pre_signal_price,        # 5 min before signal
+            "pre_signal_price_2": pre_signal_price_2,    # 10 min before signal
             "buy_1_limit_price": buy_1_limit_price,
             "buy_2_limit_price": buy_2_limit_price,
             "past_15min_low": past_15min_low,
@@ -165,6 +168,7 @@ class MetricsCollector:
             "target_sell_005": target_sell_005,
             "target_sell_010": target_sell_010,
             "target_sell_015": target_sell_015,
+            "scalper_origin": scalper_origin,            # FAST | VIRTUAL
         }
         self._push(self._k("BUY", date), payload)
         self._hincr(self._k("DAILY", date), "buys_placed")
@@ -182,6 +186,7 @@ class MetricsCollector:
             # NEW audit fields
             "signal_price": signal_price if signal_price is not None else "",
             "pre_signal_price": pre_signal_price if pre_signal_price is not None else "",
+            "pre_signal_price_2": pre_signal_price_2 if pre_signal_price_2 is not None else "",
             "buy_1_limit_price": buy_1_limit_price if buy_1_limit_price is not None else "",
             "buy_2_limit_price": buy_2_limit_price if buy_2_limit_price is not None else "",
             "past_15min_low": past_15min_low if past_15min_low is not None else "",
@@ -191,6 +196,7 @@ class MetricsCollector:
             "target_sell_015": target_sell_015 if target_sell_015 is not None else "",
             "offset_pct": offset_pct,
             "order_type": order_type,
+            "scalper_origin": scalper_origin if scalper_origin else "",
             "lowest_since_buy": "",          # updated by tick
             "highest_since_buy": "",         # updated by tick
         }
@@ -201,6 +207,7 @@ class MetricsCollector:
             "ts": _now_ms(), "symbol": symbol,
             "signal_price": signal_price,
             "pre_signal_price": pre_signal_price,
+            "pre_signal_price_2": pre_signal_price_2,
             "offset_pct": offset_pct,
             "buy_1_limit_price": buy_1_limit_price,
             "buy_1_actual_price": price,
@@ -211,6 +218,7 @@ class MetricsCollector:
             "target_sell_010": target_sell_010,
             "target_sell_015": target_sell_015,
             "size_usdt": size_usdt,
+            "scalper_origin": scalper_origin,
         })
 
     def fill_recorded(self, symbol: str, fill_price: float, qty: float,

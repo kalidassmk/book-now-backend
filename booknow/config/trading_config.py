@@ -38,7 +38,7 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
-    buyAmountUsdt: float = 55.0      # 2026-05-12 iter 11: $55/leg (was 30)
+    buyAmountUsdt: float = 50.0      # 2026-05-12 iter 12: $50/leg (was 55)
 
     # ── Profit target ────────────────────────────────────────────────────
     # If profitAmountUsdt > 0 it overrides profitPct (matches Java logic).
@@ -143,8 +143,8 @@ class TradingConfig:
     ladderedRecoveryEnabled: bool = True
     maxConcurrentLadders: int = 1
     singleCoinModeEnabled: bool = True
-    ladderBuy1SizeUsdt: float = 55.0
-    ladderBuy2SizeUsdt: float = 55.0
+    ladderBuy1SizeUsdt: float = 50.0     # iter 12: $50/leg
+    ladderBuy2SizeUsdt: float = 50.0
     ladderBuy3SizeUsdt: float = 0.0      # 0 = Buy 3 disabled
     ladderBuy2OffsetPct: float = 0.5    # buy 2 at signal × 0.995
     ladderBuy3OffsetPct: float = 1.0    # buy 3 at signal × 0.99
@@ -170,8 +170,8 @@ class TradingConfig:
     # market order. Set to 0 to keep the current market-order behaviour.
     # When >0, ladderBuy1UseMarketOrder is ignored and Buy 1 waits up to
     # limitBuyTimeoutSec for fill.
-    # 2026-05-12 iter 11: 0.09 → 0.05 (tighter limit for better fills).
-    ladderBuy1OffsetPct: float = 0.05
+    # 2026-05-12 iter 12: 0.05 → 0.15 (deeper limit, better entries).
+    ladderBuy1OffsetPct: float = 0.15
     # 2026-05-11 iter 4: per-coin cooldown. After a ladder closes the
     # same symbol is blocked for N seconds so the bot doesn't immediately
     # re-enter the same trade.
