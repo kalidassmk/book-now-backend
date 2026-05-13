@@ -184,11 +184,12 @@ class TradingConfig:
     # automatically: tp_pct = (target_net / buy_size) × 100 + 2 × fee_rate_pct
     # which guarantees the configured net profit after BOTH sides' fees.
     # Set to 0 to fall back to the static ladderTpFromAvgPct above.
-    # 2026-05-12 iter 15: 0.15 → 0.40. Static TP was capturing only ~10%
-    # of available intraday moves on alts (ETHFI net +$0.18 when +$1.84
-    # was on the table). With ladderTrailingTpEnabled, this number is the
-    # ACTIVATION threshold; actual profit can be much higher via trail.
-    ladderTargetNetProfitUsdt: float = 0.40
+    # 2026-05-13 iter 19: $0.40 → $0.20 (operator request — TP fires
+    # faster). Math: on $48 leg the TP sits at +0.567% above Buy 1
+    # instead of +0.983%. That's a more reachable target on the kind of
+    # alt moves we see, and the trailing-TP layer still lets winners
+    # ride further when momentum continues past the TP level.
+    ladderTargetNetProfitUsdt: float = 0.20
     # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075

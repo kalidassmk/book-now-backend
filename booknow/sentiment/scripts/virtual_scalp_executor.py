@@ -111,7 +111,7 @@ class VirtualScalpExecutor:
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
-        self.ladder_target_net_usdt = 0.15
+        self.ladder_target_net_usdt = 0.20      # iter 19: 0.15→0.20
         self.ladder_fee_rate_per_side = 0.00075
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
@@ -189,7 +189,7 @@ class VirtualScalpExecutor:
                 self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
                 self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
                 self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
-                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.15))
+                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.20))
                 self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
                 self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
                 self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
