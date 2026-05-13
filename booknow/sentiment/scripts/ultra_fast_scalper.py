@@ -1027,8 +1027,18 @@ class MultiSymbolScalper:
     async def _handle_external_cancel(self, state, who: str):
         """A leg or TP order was cancelled outside the bot (operator did
         it manually on Binance). Free the slot, set cooldown so we don't
-        immediately re-enter, but DON'T sell any held qty — that's the
-        operator's to manage now."""
+        immediately re-enter.
+
+        iter 17 (2026-05-13): if Buy 1 was already filled when this fires,
+        the operator is now holding the position and will likely sell
+        themselves. Record the entry with the right exit_reason and try
+        to find the matching sell trade now — and schedule a delayed
+        retry to catch sells that happen AFTER our cancel detect.
+
+        The old behaviour (always pnl_usdt=0) was wrong for the common
+        case where bot bought, operator cancelled bot's TP, then operator
+        market-sold — bot was reporting $0 P&L when there was a real
+        realised gain/loss to track."""
         log.info(f"🛑 [ladder] {state.symbol} {who} cancelled externally; releasing slot + cooldown")
         # Cancel any remaining open orders for this ladder so we don't
         # leave stragglers on the book that could fill later.
@@ -1046,18 +1056,142 @@ class MultiSymbolScalper:
             except Exception:
                 pass
             state.tp_order_id = None
-        # Record + free
+
+        # Did Buy 1 actually fill? If so, qty + avg are real and the
+        # operator may have realised a P&L by selling externally.
+        filled_legs = [L for L in (state.buy_1, state.buy_2, state.buy_3)
+                       if L and L.qty_filled and L.qty_filled > 0]
+        total_qty = sum(L.qty_filled for L in filled_legs)
+        avg_buy = state.weighted_avg() or 0
+        had_fill = total_qty > 0 and avg_buy > 0
+
+        # Initial exit record — best info we have right now.
         state.state = ladder.CLOSED
-        state.exit_reason = "manual_cancel"
         state.closed_ts = int(time.time() * 1000)
-        if self.metrics is not None:
-            try:
-                self.metrics.exit_recorded(state.symbol, state.weighted_avg() or 0,
-                                           0, reason="manual_cancel", pnl_usdt=0)
-            except Exception:
-                pass
+        if had_fill:
+            # Try to find a matching sell that's already on the books.
+            buy_ts = int(state.buy_1.fill_ts) if state.buy_1 and state.buy_1.fill_ts else 0
+            sell_info = await self._find_post_buy_sell(state.symbol, buy_ts, total_qty)
+            if sell_info is not None:
+                exit_price = sell_info["price"]
+                fees = 2 * self.ladder_fee_rate_per_side * (avg_buy * total_qty)
+                pnl = (exit_price - avg_buy) * total_qty - fees
+                state.exit_reason = "manual_cancel_resolved"
+                log.info(f"🛑 [ladder] {state.symbol} found operator sell @ ${exit_price:.6f} "
+                         f"qty={sell_info['qty']:.6f} → realised P&L ${pnl:+.4f}")
+                if self.metrics is not None:
+                    try:
+                        self.metrics.exit_recorded(state.symbol, avg_buy, exit_price,
+                                                   reason="manual_cancel_resolved", pnl_usdt=pnl)
+                    except Exception:
+                        pass
+            else:
+                # No matching sell yet — operator may sell in the next
+                # few minutes. Record as 'holding' and schedule retry.
+                state.exit_reason = "manual_cancel_holding"
+                log.info(f"🛑 [ladder] {state.symbol} no sell found yet — "
+                         f"recording as holding ({total_qty:.6f} @ avg ${avg_buy:.6f}), "
+                         f"will retry resolution in 5 min")
+                if self.metrics is not None:
+                    try:
+                        self.metrics.exit_recorded(state.symbol, avg_buy, avg_buy,
+                                                   reason="manual_cancel_holding", pnl_usdt=0)
+                    except Exception:
+                        pass
+                # Fire-and-forget retry. Will re-query trade history and
+                # patch the OUTCOME hash with the real P&L when the sell
+                # appears. Multiple attempts at 60s / 5min / 15min so
+                # operator delays are accommodated.
+                asyncio.create_task(self._resolve_manual_cancel_later(
+                    state.symbol, buy_ts, total_qty, avg_buy
+                ))
+        else:
+            # Buy 1 never filled — the old behaviour was correct here.
+            state.exit_reason = "manual_cancel"
+            if self.metrics is not None:
+                try:
+                    self.metrics.exit_recorded(state.symbol, 0, 0,
+                                               reason="manual_cancel", pnl_usdt=0)
+                except Exception:
+                    pass
+
         ladder.clear_state(self.redis, state.symbol)
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
+
+    async def _find_post_buy_sell(self, symbol: str, buy_ts_ms: int, expected_qty: float):
+        """Search Binance trade history for a SELL trade matching this qty
+        after buy_ts_ms. Returns {'price': avg_price, 'qty': total_qty}
+        or None if no matching sell found.
+
+        Uses ccxt.fetch_my_trades and aggregates any SELLs that happened
+        after the buy timestamp. Matches on cumulative qty (within 5%)
+        rather than a single fill, so split sells (e.g. partial fills
+        across two limit orders) still resolve correctly.
+        """
+        if buy_ts_ms <= 0 or expected_qty <= 0:
+            return None
+        try:
+            # ccxt: since= is start time in ms, limit caps result count
+            trades = await self.client.fetch_my_trades(symbol, since=buy_ts_ms, limit=50)
+        except Exception as exc:
+            log.warning(f"⚠️ [ladder] {symbol} fetch_my_trades failed: {exc}")
+            return None
+        sells = [t for t in (trades or [])
+                 if (t.get("side") or "").lower() == "sell"
+                 and int(t.get("timestamp") or 0) >= buy_ts_ms]
+        if not sells:
+            return None
+        total_qty = sum(float(t.get("amount") or 0) for t in sells)
+        total_cost = sum(float(t.get("amount") or 0) * float(t.get("price") or 0) for t in sells)
+        if total_qty <= 0:
+            return None
+        # Require cumulative sell qty within 5% of expected (catches both
+        # partial sells and combined sells).
+        if abs(total_qty - expected_qty) > expected_qty * 0.05:
+            log.debug(f"[ladder] {symbol} sell qty mismatch: got {total_qty} expected {expected_qty}")
+            return None
+        return {"price": total_cost / total_qty, "qty": total_qty}
+
+    async def _resolve_manual_cancel_later(self, symbol: str, buy_ts_ms: int,
+                                            expected_qty: float, avg_buy: float):
+        """Delayed retry: re-query trade history at 60s, 5 min, 15 min
+        intervals to catch sells that happen after _handle_external_cancel
+        fired. When a matching sell is found, patch the OUTCOME hash with
+        the real exit price + realised P&L.
+
+        Fire-and-forget — runs as an asyncio.Task. Exits silently after
+        all retries exhaust without finding a match (operator is still
+        holding the position)."""
+        retry_delays = (60, 300, 900)   # 1 min, 5 min, 15 min
+        for delay_sec in retry_delays:
+            try:
+                await asyncio.sleep(delay_sec)
+            except asyncio.CancelledError:
+                return
+            try:
+                sell_info = await self._find_post_buy_sell(symbol, buy_ts_ms, expected_qty)
+            except Exception as exc:
+                log.debug(f"[ladder] {symbol} delayed resolve query failed: {exc}")
+                continue
+            if sell_info is None:
+                continue
+            exit_price = sell_info["price"]
+            fees = 2 * self.ladder_fee_rate_per_side * (avg_buy * expected_qty)
+            pnl = (exit_price - avg_buy) * expected_qty - fees
+            log.info(f"🛑 [ladder] {symbol} retroactively resolved manual_cancel: "
+                     f"sell @ ${exit_price:.6f} → P&L ${pnl:+.4f} "
+                     f"(after {delay_sec}s retry)")
+            if self.metrics is not None:
+                try:
+                    self.metrics.patch_outcome(
+                        symbol, exit_price=exit_price, pnl_usdt=pnl,
+                        reason="manual_cancel_resolved",
+                    )
+                except Exception:
+                    pass
+            return
+        log.info(f"🛑 [ladder] {symbol} manual_cancel still unresolved after all retries — "
+                 f"operator is holding {expected_qty:.6f} @ avg ${avg_buy:.6f}")
 
     async def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
         """Build the audit dict the dashboard needs:

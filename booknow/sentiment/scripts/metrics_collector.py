@@ -258,6 +258,55 @@ class MetricsCollector:
         except Exception:
             pass
 
+    def patch_outcome(self, symbol: str, date: Optional[str] = None,
+                      exit_price: Optional[float] = None,
+                      pnl_usdt: Optional[float] = None,
+                      reason: Optional[str] = None) -> None:
+        """Retroactively update the OUTCOME hash for a symbol/date.
+
+        2026-05-13 iter 17: when _handle_external_cancel fires and Buy 1
+        was already filled, the bot doesn't know yet whether the operator
+        will sell, what price, or whether they'll hold. The initial record
+        is exit_reason='manual_cancel' with pnl_usdt=0. Later we look up
+        the actual sell from Binance trade history and call this to update
+        the entry with the real exit price + P&L.
+
+        Adjusts DAILY:realized_pnl_usdt by the DELTA between old and new
+        pnl_usdt so the daily aggregate remains correct after backfill.
+        Best-effort: any missing field is left untouched.
+        """
+        date = date or _today()
+        outcome_key = self._k("OUTCOME", date, symbol.replace("/", ""))
+        try:
+            existing = self.client.hgetall(outcome_key) or {}
+        except Exception:
+            existing = {}
+        old_pnl = 0.0
+        try:
+            old_pnl = float(existing.get("pnl_usdt") or 0)
+        except Exception:
+            pass
+
+        patch: Dict[str, Any] = {}
+        if exit_price is not None:
+            patch["exit_price"] = exit_price
+        if pnl_usdt is not None:
+            patch["pnl_usdt"] = pnl_usdt
+        if reason is not None:
+            patch["exit_reason"] = reason
+        if not patch:
+            return
+        self._hset(outcome_key, patch)
+
+        # Adjust DAILY aggregate by the pnl delta (only if new pnl given).
+        if pnl_usdt is not None:
+            delta = pnl_usdt - old_pnl
+            try:
+                self.client.hincrbyfloat(self._k("DAILY", date), "realized_pnl_usdt", delta)
+                self.client.expire(self._k("DAILY", date), TTL_SECONDS)
+            except Exception:
+                pass
+
 
 def make_collector(redis_client: Any, enabled: bool = True) -> MetricsCollector:
     """Factory. ``redis_client`` is a ready-to-use ``redis.Redis``."""
