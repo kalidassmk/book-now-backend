@@ -2930,21 +2930,33 @@ class MultiSymbolScalper:
                     await asyncio.sleep(5)
                     continue
 
-                # Drive the laddered-recovery state machine if any are in
-                # flight. Runs once per loop so order fills + TP/stop
-                # transitions are reacted to within ~1 s.
-                if self.ladder_enabled and ladder is not None:
-                    try:
-                        await self._ladder_tick()
-                    except Exception as exc:
-                        log.warning(f"⚠️ ladder_tick raised: {exc}")
-
-                # Process in small batches to avoid Binance Rate Limits
+                # iter 32 (2026-05-13): ladder_tick used to run ONCE per
+                # outer loop. With ~600 symbols × 5/batch × 1s sleep =
+                # 2-8 min per full cycle, fill detection lagged by minutes.
+                # ATOM/USDT today: Buy 1 LIMIT filled at 17:22:48 but the
+                # TP wasn't placed until 17:31:00 — an 8m12s gap during
+                # which the bot was holding qty with no exit on the book.
+                #
+                # Fix: run _ladder_tick BETWEEN every batch. With batch=5
+                # and 1s sleep, that's a tick every ~1.2s. Now Buy 1 fill
+                # → Buy 2/3 + TP placement happens within ~2 seconds.
+                # Cost: ~3 extra Binance API calls per active ladder per
+                # second (fetch_order on tp / buy_2 / buy_3). For 1 active
+                # ladder that's 180 calls/min, well under the 1200 weight
+                # budget.
                 batch_size = 5
                 for i in range(0, len(self.symbols), batch_size):
                     batch = self.symbols[i : i + batch_size]
                     tasks = [self.process_symbol(s, btc_df) for s in batch]
                     await asyncio.gather(*tasks)
+                    # Drive the laddered-recovery state machine after each
+                    # batch — keeps fill detection latency at ~1-2 seconds
+                    # instead of 1-8 minutes.
+                    if self.ladder_enabled and ladder is not None:
+                        try:
+                            await self._ladder_tick()
+                        except Exception as exc:
+                            log.warning(f"⚠️ ladder_tick raised: {exc}")
                     await asyncio.sleep(1.0) # Gentle spacing
 
             except Exception as e:
