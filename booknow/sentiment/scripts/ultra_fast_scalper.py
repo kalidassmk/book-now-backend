@@ -138,6 +138,9 @@ class MultiSymbolScalper:
         # can be skewed by a mini-rally just before the real pump).
         self.pp_lookback_days = 15            # window to scan for pump
         self.pp_baseline_days = 10            # pre-pump baseline window
+        # iter 21: MA7 gate is OFF by default — was disabling the filter
+        # on real post-pump cases due to single-day bounces above MA7.
+        self.pp_require_below_ma7 = False
         self._d1_cache: dict = {}             # symbol -> {data, ts}
         self._d1_cache_ttl_sec = 600          # 10 min — daily candle, fine
 
@@ -483,6 +486,7 @@ class MultiSymbolScalper:
             self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
             self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
             self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
+            self.pp_require_below_ma7 = bool(cfg.get("postPumpRequireBelowMa7", False))
 
             # Fast-drop-without-volume filter (Pattern C). Cancels the
             # limit-buy if price falls fast in the first few minutes
@@ -713,16 +717,27 @@ class MultiSymbolScalper:
             "days_since_peak": int(days_since_peak),
         }
 
-        rejected = (
+        # iter 21 (2026-05-13): MA7 gate is now OPT-IN. The original 4-gate
+        # design used `current < MA7` as a "still trending down" safety,
+        # but in practice a single-day bounce of $0.0001 above MA7 was
+        # disabling the whole filter on clear post-pump patterns. JASMY
+        # 2026-05-13 — pumped +37% to $0.00783 peak, dropped to $0.00695
+        # (-11% off peak), but $0.00011 above MA7 — bot bought it.
+        # Sanity backtest: dropping the gate adds JASMY + SEI to blocks
+        # (correctly), no false positives on BTC/ETH/SOL/XRP/ATOM/NEAR.
+        gates_met = (
             pump_pct        >= self.pp_threshold_pct       and
             off_peak_pct    >= self.pp_off_peak_min_pct    and
-            current_price   <  ma7                          and
             days_since_peak >= self.pp_min_days_since_peak
         )
+        if gates_met and self.pp_require_below_ma7:
+            gates_met = current_price < ma7
+        rejected = gates_met
         if rejected:
+            ma7_note = f", < MA7 {ma7:.4f}" if self.pp_require_below_ma7 else ""
             reason = (f"post-pump bleed: pumped +{pump_pct:.0f}% to {peak:.4f} "
                       f"{days_since_peak}d ago, now {current_price:.4f} "
-                      f"(-{off_peak_pct:.1f}% off peak, < MA7 {ma7:.4f})")
+                      f"(-{off_peak_pct:.1f}% off peak{ma7_note})")
             log.info(f"📉 [{symbol}] skipped by post_pump_bleed: {reason}")
             if self.metrics is not None:
                 self.metrics.signal_skipped(symbol, "post_pump_bleed", reason, features)

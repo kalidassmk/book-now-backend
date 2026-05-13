@@ -87,6 +87,7 @@ class VirtualScalpExecutor:
         # baseline (mirrors Fast Scalper for parity).
         self.pp_lookback_days = 15
         self.pp_baseline_days = 10
+        self.pp_require_below_ma7 = False    # iter 21: opt-in
         self._d1_cache: dict = {}
         self._d1_cache_ttl_sec = 600
 
@@ -172,6 +173,7 @@ class VirtualScalpExecutor:
                 self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
                 self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
                 self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
+                self.pp_require_below_ma7 = bool(cfg.get("postPumpRequireBelowMa7", False))
                 # Stop-loss config (0 = disabled, matches Fast Scalper).
                 self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
                 # Fast-drop-without-volume filter knobs.
@@ -1139,16 +1141,20 @@ class VirtualScalpExecutor:
             "days_since_peak": int(days_since_peak),
         }
 
-        rejected = (
+        # iter 21: MA7 gate is opt-in. See ultra_fast_scalper.py for context.
+        gates_met = (
             pump_pct        >= self.pp_threshold_pct       and
             off_peak_pct    >= self.pp_off_peak_min_pct    and
-            current_price   <  ma7                          and
             days_since_peak >= self.pp_min_days_since_peak
         )
+        if gates_met and self.pp_require_below_ma7:
+            gates_met = current_price < ma7
+        rejected = gates_met
         if rejected:
+            ma7_note = f", < MA7 {ma7:.4f}" if self.pp_require_below_ma7 else ""
             reason = (f"post-pump bleed: pumped +{pump_pct:.0f}% to {peak:.4f} "
                       f"{days_since_peak}d ago, now {current_price:.4f} "
-                      f"(-{off_peak_pct:.1f}% off peak, < MA7 {ma7:.4f})")
+                      f"(-{off_peak_pct:.1f}% off peak{ma7_note})")
             print(f"📉 [{symbol}] virtual skip post_pump_bleed: {reason}")
             if self.metrics is not None:
                 self.metrics.signal_skipped(symbol, "post_pump_bleed", reason, features)

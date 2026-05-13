@@ -133,6 +133,10 @@ class TradingConfig:
     postPumpMinDaysSincePeak: int = 2        # peak ≥ 2 days ago
     postPumpLookbackDays: int = 15           # scan last 15 days for the peak
     postPumpBaselineDays: int = 10           # 10-day pre-pump baseline window
+    # iter 21 (2026-05-13): MA7 gate was too sensitive — single-day bounces
+    # of <1% above MA7 disabled the whole filter on real post-pump cases.
+    # Default False (gate disabled); flip True only if a regression appears.
+    postPumpRequireBelowMa7: bool = False
 
     # ── Fast-drop-without-volume filter (Pattern C, post-signal) ─────────
     # 2026-05-10 trajectory analysis showed BIO/SOPH (today's losers) both
