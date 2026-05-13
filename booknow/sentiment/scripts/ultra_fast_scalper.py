@@ -1450,10 +1450,19 @@ class MultiSymbolScalper:
                                  size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
 
         tp_pct = self._effective_tp_pct()
-        tp_p = ladder.tp_price(state.weighted_avg(), tp_pct, tick)
+        avg_for_tp = state.weighted_avg()
+        tp_p = ladder.tp_price(avg_for_tp, tp_pct, tick)
         await self._ladder_place_tp(state, state.total_qty(), tp_p, f)
-        log.info(f"🪜 [ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} "
-                 f"tp@{tp_p:.6g} (tp_pct={tp_pct:.3f}%)")
+        # iter 18 (2026-05-13): explicit logging of every input to the TP
+        # math so we can verify the running container is using current
+        # Redis values rather than stale defaults from a long-running
+        # process. NEIRO/USDT today placed TP at +0.29% when target $0.40
+        # net on $48 leg should have produced +0.98% — caused by stale
+        # in-memory config that this restart forces a refresh of.
+        log.info(f"🪜 [ladder] {symbol} TP-INPUTS avg={avg_for_tp:.8f} "
+                 f"tp_pct={tp_pct:.4f}% buy1_size=${self.ladder_buy1_size} "
+                 f"target_net=${self.ladder_target_net_usdt} "
+                 f"fee_rate={self.ladder_fee_rate_per_side} → tp@{tp_p:.8f}")
 
     async def _ladder_tick(self):
         """Called every loop iteration to drive ALL active ladders forward.
