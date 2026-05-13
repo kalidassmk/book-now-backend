@@ -62,6 +62,10 @@ class VirtualScalpExecutor:
     def __init__(self):
         self.r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
+        # iter 22: gate trading on a successful strict Redis read. False
+        # until _sync_live_mode populates every required key.
+        self.config_loaded: bool = False
+
         # Live-trading state. live_mode is hot-reloaded from TRADING_CONFIG
         # every loop iteration so an operator can flip paper↔live without
         # restarting. Default True — live trading is the intended mode.
@@ -150,56 +154,99 @@ class VirtualScalpExecutor:
             print(f"❌ [VIRTUAL] Binance client init failed: {e}")
             self.client = None
 
+    # iter 22 (2026-05-13): every config key the Virtual Scalper needs.
+    # Same hard rule as Fast Scalper — no in-memory fallbacks.
+    _REQUIRED_CONFIG_KEYS = (
+        "virtualScalperLiveMode",
+        "fallingKnifeFilterEnabled", "maxChange24hPct", "maxRange1hPct",
+        "overboughtSkipEnabled", "overbought60mPct",
+        "postPumpFilterEnabled", "postPumpThresholdPct",
+        "postPumpOffPeakMinPct", "postPumpMinDaysSincePeak",
+        "postPumpLookbackDays", "postPumpBaselineDays",
+        "postPumpRequireBelowMa7",
+        "stopLossUsdt",
+        "fastDropFilterEnabled", "fastDropDetectMinutes",
+        "fastDropThresholdPct", "volSurgeThresholdMultiplier",
+        "ladderedRecoveryEnabled", "maxConcurrentLadders",
+        "singleCoinModeEnabled",
+        "ladderBuy1SizeUsdt", "ladderBuy2SizeUsdt", "ladderBuy3SizeUsdt",
+        "ladderBuy2OffsetPct", "ladderBuy3OffsetPct",
+        "ladderTpFromAvgPct", "ladderTargetNetProfitUsdt",
+        "ladderFeeRatePerSide", "ladderHardStopBelowBuy3Pct",
+        "ladderBuy1OffsetPct", "ladderCooldownSeconds",
+        "metricsEnabled",
+    )
+
     def _sync_live_mode(self):
-        """Hot-reload live_mode flag + falling-knife filter knobs from
-        TRADING_CONFIG every iteration. Default True — operator must
-        explicitly set ``virtualScalperLiveMode: false`` to pause live.
-        Also picks up stopLossUsdt: when 0/negative, the SOFT/HARD stops
-        are bypassed entirely (Option B "patient hold")."""
+        """STRICT Redis read of every config field (iter 22).
+
+        Refuses to leave self.* populated unless ALL required keys are
+        present in TRADING_CONFIG. Sets self.config_loaded accordingly
+        — callers check that flag before performing any trading action.
+
+        No fallback defaults. If Redis is missing a key, the Virtual
+        Scalper will not place new orders until the operator fixes
+        the config. Better to halt loudly than silently use a stale
+        in-memory value.
+        """
         try:
             raw = self.r.get(TRADING_CONFIG_KEY)
-            if raw:
-                cfg = json.loads(raw)
-                self.live_mode = bool(cfg.get("virtualScalperLiveMode", True))
-                self.fk_enabled = bool(cfg.get("fallingKnifeFilterEnabled", True))
-                self.fk_max_24h = float(cfg.get("maxChange24hPct", 8.0))
-                self.fk_max_1h_range = float(cfg.get("maxRange1hPct", 6.0))
-                self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
-                self.fk_overbought_60m = float(cfg.get("overbought60mPct", 1.5))
-                # Post-pump-bleed (daily) filter knobs (added 2026-05-12).
-                self.pp_enabled = bool(cfg.get("postPumpFilterEnabled", True))
-                self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
-                self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
-                self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
-                self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
-                self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
-                self.pp_require_below_ma7 = bool(cfg.get("postPumpRequireBelowMa7", False))
-                # Stop-loss config (0 = disabled, matches Fast Scalper).
-                self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
-                # Fast-drop-without-volume filter knobs.
-                self.fd_enabled = bool(cfg.get("fastDropFilterEnabled", True))
-                self.fd_detect_minutes = int(cfg.get("fastDropDetectMinutes", 3))
-                self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
-                self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
-                # Laddered Recovery knobs.
-                self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-                self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
-                self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-                self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 48.0))
-                self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 48.0))
-                self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
-                self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
-                self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
-                self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
-                self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.20))
-                self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
-                self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
-                self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
-                self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
-                if self.metrics is not None:
-                    self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"❌ [VIRTUAL] Redis read failed: {exc} — refusing to trade")
+            self.config_loaded = False
+            return
+        if not raw:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG missing in Redis — refusing to trade")
+            self.config_loaded = False
+            return
+        try:
+            cfg = json.loads(raw)
+        except Exception as exc:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG JSON parse failed: {exc} — refusing to trade")
+            self.config_loaded = False
+            return
+        missing = [k for k in self._REQUIRED_CONFIG_KEYS if k not in cfg]
+        if missing:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG missing keys {missing} — refusing to trade")
+            self.config_loaded = False
+            return
+
+        # Strict population — direct key access, no .get(default).
+        self.live_mode = bool(cfg["virtualScalperLiveMode"])
+        self.fk_enabled = bool(cfg["fallingKnifeFilterEnabled"])
+        self.fk_max_24h = float(cfg["maxChange24hPct"])
+        self.fk_max_1h_range = float(cfg["maxRange1hPct"])
+        self.fk_overbought_skip = bool(cfg["overboughtSkipEnabled"])
+        self.fk_overbought_60m = float(cfg["overbought60mPct"])
+        self.pp_enabled = bool(cfg["postPumpFilterEnabled"])
+        self.pp_threshold_pct = float(cfg["postPumpThresholdPct"])
+        self.pp_off_peak_min_pct = float(cfg["postPumpOffPeakMinPct"])
+        self.pp_min_days_since_peak = int(cfg["postPumpMinDaysSincePeak"])
+        self.pp_lookback_days = int(cfg["postPumpLookbackDays"])
+        self.pp_baseline_days = int(cfg["postPumpBaselineDays"])
+        self.pp_require_below_ma7 = bool(cfg["postPumpRequireBelowMa7"])
+        self.stop_loss_usdt = float(cfg["stopLossUsdt"])
+        self.fd_enabled = bool(cfg["fastDropFilterEnabled"])
+        self.fd_detect_minutes = int(cfg["fastDropDetectMinutes"])
+        self.fd_threshold_pct = float(cfg["fastDropThresholdPct"])
+        self.fd_vol_surge_mult = float(cfg["volSurgeThresholdMultiplier"])
+        self.ladder_enabled = bool(cfg["ladderedRecoveryEnabled"])
+        self.max_concurrent_ladders = int(cfg["maxConcurrentLadders"])
+        self.single_coin_mode = bool(cfg["singleCoinModeEnabled"])
+        self.ladder_buy1_size = float(cfg["ladderBuy1SizeUsdt"])
+        self.ladder_buy2_size = float(cfg["ladderBuy2SizeUsdt"])
+        self.ladder_buy3_size = float(cfg["ladderBuy3SizeUsdt"])
+        self.ladder_buy2_offset_pct = float(cfg["ladderBuy2OffsetPct"])
+        self.ladder_buy3_offset_pct = float(cfg["ladderBuy3OffsetPct"])
+        self.ladder_tp_from_avg_pct = float(cfg["ladderTpFromAvgPct"])
+        self.ladder_target_net_usdt = float(cfg["ladderTargetNetProfitUsdt"])
+        self.ladder_fee_rate_per_side = float(cfg["ladderFeeRatePerSide"])
+        self.ladder_hard_stop_pct = float(cfg["ladderHardStopBelowBuy3Pct"])
+        self.ladder_buy1_offset_pct = float(cfg["ladderBuy1OffsetPct"])
+        self.ladder_cooldown_seconds = int(cfg["ladderCooldownSeconds"])
+        if self.metrics is not None:
+            self.metrics.enabled = bool(cfg["metricsEnabled"])
+        self.config_loaded = True
 
     def _is_live(self) -> bool:
         return self.client is not None and self.live_mode
@@ -1184,9 +1231,13 @@ class VirtualScalpExecutor:
         last_heartbeat = 0
         while True:
             try:
-                # Hot-reload live_mode at the top of every loop so config
-                # toggles take effect within ~1 s.
+                # iter 22: STRICT Redis read. _sync_live_mode sets
+                # self.config_loaded only when all required keys are
+                # present; if False, we skip the cycle and don't trade.
                 self._sync_live_mode()
+                if not self.config_loaded:
+                    time.sleep(5)
+                    continue
 
                 now = time.time()
                 all_analysis = self.r.hgetall(ANALYSIS_020_KEY)

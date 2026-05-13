@@ -87,6 +87,9 @@ class MultiSymbolScalper:
         self.client = None
         self.redis = None
         self.is_running = True
+        # iter 22: gate trading on a successful sync_config. False until
+        # the first strict Redis read populates every required key.
+        self.config_loaded: bool = False
         self.symbols = []
         self.active_positions = {} # symbol -> {buy_price, qty}
 
@@ -417,123 +420,147 @@ class MultiSymbolScalper:
         except Exception:
             pass
 
+    # iter 22 (2026-05-13): list of every config key the bot needs from
+    # Redis. sync_config refuses to populate self.* unless ALL of these
+    # are present. Operator's hard rule: "always read from Redis, never
+    # use anything in memory" — the bot will not trade if any value is
+    # missing rather than falling back to a hardcoded stale default
+    # (which is what caused the NEIRO/USDT TP-at-+0.29% bug).
+    _REQUIRED_CONFIG_KEYS = (
+        "autoBuyEnabled", "buyAmountUsdt", "profitPct", "profitAmountUsdt",
+        "stopLossUsdt",
+        "minChange24hPct", "minRange24hPct", "minVol24hUsd",
+        "limitBuyOffsetPct", "limitBuyTimeoutSec",
+        "fallingKnifeFilterEnabled", "maxChange24hPct", "maxRange1hPct",
+        "overboughtSkipEnabled", "overbought60mPct",
+        "postPumpFilterEnabled", "postPumpThresholdPct",
+        "postPumpOffPeakMinPct", "postPumpMinDaysSincePeak",
+        "postPumpLookbackDays", "postPumpBaselineDays",
+        "postPumpRequireBelowMa7",
+        "fastDropFilterEnabled", "fastDropDetectMinutes",
+        "fastDropThresholdPct", "volSurgeThresholdMultiplier",
+        "trendReversalExitEnabled",
+        "ladderedRecoveryEnabled", "maxConcurrentLadders",
+        "singleCoinModeEnabled",
+        "ladderBuy1SizeUsdt", "ladderBuy2SizeUsdt", "ladderBuy3SizeUsdt",
+        "ladderBuy2OffsetPct", "ladderBuy3OffsetPct",
+        "ladderTpFromAvgPct", "ladderTargetNetProfitUsdt",
+        "ladderFeeRatePerSide", "ladderHardStopBelowBuy3Pct",
+        "ladderBuy1UseMarketOrder", "ladderBuy1OffsetPct",
+        "ladderCooldownSeconds",
+        "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
+        "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+        "ladderTrailingTpEnabled", "ladderTrailingTpPct",
+        "pendingPumpDumpCancelEnabled", "pendingPumpThresholdPct",
+        "pendingDumpFromPeakPct", "pendingMinAgeSeconds",
+        "metricsEnabled",
+    )
+
     async def sync_config(self):
-        """Fetch global dashboard settings from TRADING_CONFIG.
+        """STRICT Redis-only read of every config field.
 
-        Field semantics (mirrors what the dashboard writes):
-          autoBuyEnabled    : bool  — gates new buys
-          buyAmountUsdt     : float — investment per trade
-          profitPct         : float — profit target as % of entry; takes
-                                      priority when > 0 (matches the
-                                      dashboard's UX)
-          profitAmountUsdt  : float — flat USDT profit target; used only
-                                      when profitPct == 0
-          stopLossUsdt      : float — flat USDT loss before exit; falls
-                                      back to 1 % of buyAmountUsdt if
-                                      omitted, so older configs without
-                                      this field still get a sane stop
+        iter 22 design rules (operator request):
+          - Read fresh from Redis on every loop iteration (no caching of
+            stale memory across cycles).
+          - NO fallback defaults — if Redis returns nothing, or the JSON
+            is corrupted, or any required key is missing, raise.
+          - Caller (the main loop) catches the exception, logs it,
+            clears the `config_loaded` flag, and skips the cycle. The
+            bot will not place ANY new orders until Redis is healthy.
+
+        Why so strict: the prior `cfg.get(key, hardcoded_default)` style
+        let stale code defaults silently leak into live trading whenever
+        a Redis read returned None or the container's in-memory state
+        diverged from Redis. That's what caused NEIRO/USDT 2026-05-13
+        to place a TP at +0.29% when current Redis said +0.567%. With
+        strict mode any misconfiguration fails LOUDLY instead of
+        silently mis-sizing trades.
         """
-        if not self.redis: return
-        try:
-            raw = self.redis.get(CONFIG_KEY)
-            if not raw:
-                return
-            cfg = json.loads(raw)
-            self.auto_enabled    = bool(cfg.get("autoBuyEnabled", True))
-            self.buy_amount_usdt = float(cfg.get("buyAmountUsdt", 48.0))
+        if not self.redis:
+            self.config_loaded = False
+            raise RuntimeError("sync_config called before Redis connected")
+        raw = self.redis.get(CONFIG_KEY)
+        if not raw:
+            self.config_loaded = False
+            raise RuntimeError(f"TRADING_CONFIG key missing in Redis — bot refuses to trade")
+        cfg = json.loads(raw)  # raises on corrupted JSON — caller catches
+        missing = [k for k in self._REQUIRED_CONFIG_KEYS if k not in cfg]
+        if missing:
+            self.config_loaded = False
+            raise RuntimeError(f"TRADING_CONFIG missing required keys: {missing}")
 
-            # Profit: prefer percentage if set, fall back to flat USDT.
-            # Defaults: profitPct = 0.6 % (2026-05-11), legacy USDT = $0.05.
-            profit_pct = float(cfg.get("profitPct", 0.6) or 0.6)
-            if profit_pct > 0:
-                self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
-            else:
-                self.profit_target_usdt = float(cfg.get("profitAmountUsdt", 0.15))
+        # All required keys present — populate state. Direct cfg[key]
+        # access intentionally (no .get with defaults).
+        self.auto_enabled    = bool(cfg["autoBuyEnabled"])
+        self.buy_amount_usdt = float(cfg["buyAmountUsdt"])
 
-            # Stop loss: explicit USDT; 0 (or negative) disables both the
-            # OCO SL leg and the polling SL exit. Default to 0 so older
-            # configs without this field opt into Option B's patient hold.
-            self.stop_loss_usdt = float(cfg.get("stopLossUsdt", 0.0))
+        # Profit target: profitPct wins when > 0, else fall through to
+        # explicit USDT. Both are required keys so an operator-set "0"
+        # is a deliberate choice, not a missing field.
+        profit_pct = float(cfg["profitPct"])
+        if profit_pct > 0:
+            self.profit_target_usdt = self.buy_amount_usdt * profit_pct / 100.0
+        else:
+            self.profit_target_usdt = float(cfg["profitAmountUsdt"])
 
-            # Market-context filters (added 2026-05-10 after PENGU/AAVE
-            # post-mortem revealed the bot was buying coins already in
-            # 24h downtrends). Set any to None / 0 to disable a filter.
-            self.min_change_24h_pct = float(cfg.get("minChange24hPct", -1.0))
-            self.min_range_24h_pct  = float(cfg.get("minRange24hPct", 5.0))
-            self.min_vol_24h_usd    = float(cfg.get("minVol24hUsd", 2_000_000))
+        self.stop_loss_usdt = float(cfg["stopLossUsdt"])
+        self.min_change_24h_pct = float(cfg["minChange24hPct"])
+        self.min_range_24h_pct  = float(cfg["minRange24hPct"])
+        self.min_vol_24h_usd    = float(cfg["minVol24hUsd"])
+        self.limit_buy_offset_pct = float(cfg["limitBuyOffsetPct"])
+        self.limit_buy_timeout_sec = int(cfg["limitBuyTimeoutSec"])
 
-            # Limit-buy entry params (set offset to 0 or negative to fall
-            # back to market buys). Same Redis key the dashboard already
-            # writes for Virtual Scalper, so both engines use the same
-            # offset and the operator only has one knob to tune.
-            # Default 0.65 % matches Option B (2026-05-10 backtest).
-            self.limit_buy_offset_pct = float(cfg.get("limitBuyOffsetPct", 0.65))
-            self.limit_buy_timeout_sec = int(cfg.get("limitBuyTimeoutSec", 60))
+        self.fk_enabled = bool(cfg["fallingKnifeFilterEnabled"])
+        self.fk_max_change_24h_pct = float(cfg["maxChange24hPct"])
+        self.fk_max_range_1h_pct = float(cfg["maxRange1hPct"])
+        self.fk_overbought_skip = bool(cfg["overboughtSkipEnabled"])
+        self.fk_overbought_60m_pct = float(cfg["overbought60mPct"])
 
-            # Falling-knife filter (added 2026-05-10 after Option-B backtest
-            # showed XEC/LUNC/LUMIA were all bought near a peak/pump).
-            # Layered on top of the existing 24h market-context filter.
-            self.fk_enabled = bool(cfg.get("fallingKnifeFilterEnabled", True))
-            self.fk_max_change_24h_pct = float(cfg.get("maxChange24hPct", 8.0))
-            self.fk_max_range_1h_pct = float(cfg.get("maxRange1hPct", 6.0))
-            self.fk_overbought_skip = bool(cfg.get("overboughtSkipEnabled", True))
-            self.fk_overbought_60m_pct = float(cfg.get("overbought60mPct", 1.5))
+        self.pp_enabled = bool(cfg["postPumpFilterEnabled"])
+        self.pp_threshold_pct = float(cfg["postPumpThresholdPct"])
+        self.pp_off_peak_min_pct = float(cfg["postPumpOffPeakMinPct"])
+        self.pp_min_days_since_peak = int(cfg["postPumpMinDaysSincePeak"])
+        self.pp_lookback_days = int(cfg["postPumpLookbackDays"])
+        self.pp_baseline_days = int(cfg["postPumpBaselineDays"])
+        self.pp_require_below_ma7 = bool(cfg["postPumpRequireBelowMa7"])
 
-            # Post-pump-bleed (daily-timeframe) filter knobs.
-            self.pp_enabled = bool(cfg.get("postPumpFilterEnabled", True))
-            self.pp_threshold_pct = float(cfg.get("postPumpThresholdPct", 30.0))
-            self.pp_off_peak_min_pct = float(cfg.get("postPumpOffPeakMinPct", 10.0))
-            self.pp_min_days_since_peak = int(cfg.get("postPumpMinDaysSincePeak", 2))
-            self.pp_lookback_days = int(cfg.get("postPumpLookbackDays", 15))
-            self.pp_baseline_days = int(cfg.get("postPumpBaselineDays", 10))
-            self.pp_require_below_ma7 = bool(cfg.get("postPumpRequireBelowMa7", False))
+        self.fd_enabled = bool(cfg["fastDropFilterEnabled"])
+        self.fd_detect_minutes = int(cfg["fastDropDetectMinutes"])
+        self.fd_threshold_pct = float(cfg["fastDropThresholdPct"])
+        self.fd_vol_surge_mult = float(cfg["volSurgeThresholdMultiplier"])
 
-            # Fast-drop-without-volume filter (Pattern C). Cancels the
-            # limit-buy if price falls fast in the first few minutes
-            # without a corresponding volume surge.
-            self.fd_enabled = bool(cfg.get("fastDropFilterEnabled", True))
-            self.fd_detect_minutes = int(cfg.get("fastDropDetectMinutes", 3))
-            self.fd_threshold_pct = float(cfg.get("fastDropThresholdPct", 0.5))
-            self.fd_vol_surge_mult = float(cfg.get("volSurgeThresholdMultiplier", 2.0))
+        self.trend_reversal_exit_enabled = bool(cfg["trendReversalExitEnabled"])
 
-            # Trend-reversal exit toggle. Hot-reloaded so operator can
-            # flip on/off without restart.
-            self.trend_reversal_exit_enabled = bool(cfg.get("trendReversalExitEnabled", True))
+        self.ladder_enabled = bool(cfg["ladderedRecoveryEnabled"])
+        self.max_concurrent_ladders = int(cfg["maxConcurrentLadders"])
+        self.single_coin_mode = bool(cfg["singleCoinModeEnabled"])
+        self.ladder_buy1_size = float(cfg["ladderBuy1SizeUsdt"])
+        self.ladder_buy2_size = float(cfg["ladderBuy2SizeUsdt"])
+        self.ladder_buy3_size = float(cfg["ladderBuy3SizeUsdt"])
+        self.ladder_buy2_offset_pct = float(cfg["ladderBuy2OffsetPct"])
+        self.ladder_buy3_offset_pct = float(cfg["ladderBuy3OffsetPct"])
+        self.ladder_tp_from_avg_pct = float(cfg["ladderTpFromAvgPct"])
+        self.ladder_target_net_usdt = float(cfg["ladderTargetNetProfitUsdt"])
+        self.ladder_fee_rate_per_side = float(cfg["ladderFeeRatePerSide"])
+        self.ladder_hard_stop_pct = float(cfg["ladderHardStopBelowBuy3Pct"])
+        self.ladder_buy1_market = bool(cfg["ladderBuy1UseMarketOrder"])
+        self.ladder_buy1_offset_pct = float(cfg["ladderBuy1OffsetPct"])
+        self.ladder_cooldown_seconds = int(cfg["ladderCooldownSeconds"])
+        self.ladder_time_exit_enabled = bool(cfg["ladderTimeExitEnabled"])
+        self.ladder_max_hold_seconds = int(cfg["ladderMaxHoldSeconds"])
+        self.ladder_breakeven_exit_enabled = bool(cfg["ladderBreakevenExitEnabled"])
+        self.ladder_breakeven_buffer_pct = float(cfg["ladderBreakevenBufferPct"])
+        self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
+        self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
+        self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
+        self.pending_pump_threshold_pct = float(cfg["pendingPumpThresholdPct"])
+        self.pending_dump_from_peak_pct = float(cfg["pendingDumpFromPeakPct"])
+        self.pending_min_age_seconds = int(cfg["pendingMinAgeSeconds"])
 
-            # Laddered Recovery knobs (3-tier averaging-down).
-            self.ladder_enabled = bool(cfg.get("ladderedRecoveryEnabled", False))
-            self.max_concurrent_ladders = int(cfg.get("maxConcurrentLadders", 1))
-            self.single_coin_mode = bool(cfg.get("singleCoinModeEnabled", False))
-            self.ladder_buy1_size = float(cfg.get("ladderBuy1SizeUsdt", 48.0))
-            self.ladder_buy2_size = float(cfg.get("ladderBuy2SizeUsdt", 48.0))
-            self.ladder_buy3_size = float(cfg.get("ladderBuy3SizeUsdt", 0.0))
-            self.ladder_buy2_offset_pct = float(cfg.get("ladderBuy2OffsetPct", 0.5))
-            self.ladder_buy3_offset_pct = float(cfg.get("ladderBuy3OffsetPct", 1.0))
-            self.ladder_tp_from_avg_pct = float(cfg.get("ladderTpFromAvgPct", 0.6))
-            self.ladder_target_net_usdt = float(cfg.get("ladderTargetNetProfitUsdt", 0.20))
-            self.ladder_fee_rate_per_side = float(cfg.get("ladderFeeRatePerSide", 0.00075))
-            self.ladder_hard_stop_pct = float(cfg.get("ladderHardStopBelowBuy3Pct", 1.0))
-            self.ladder_buy1_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
-            self.ladder_buy1_offset_pct = float(cfg.get("ladderBuy1OffsetPct", 0.15))
-            self.ladder_cooldown_seconds = int(cfg.get("ladderCooldownSeconds", 14400))
-            # Time-based exit knobs (iter 14).
-            self.ladder_time_exit_enabled = bool(cfg.get("ladderTimeExitEnabled", True))
-            self.ladder_max_hold_seconds = int(cfg.get("ladderMaxHoldSeconds", 14400))
-            self.ladder_breakeven_exit_enabled = bool(cfg.get("ladderBreakevenExitEnabled", True))
-            self.ladder_breakeven_buffer_pct = float(cfg.get("ladderBreakevenBufferPct", 0.05))
-            # Trailing-TP knobs (iter 15).
-            self.ladder_trailing_tp_enabled = bool(cfg.get("ladderTrailingTpEnabled", True))
-            self.ladder_trailing_tp_pct = float(cfg.get("ladderTrailingTpPct", 0.5))
-            # Pending-pump-dump knobs (iter 16).
-            self.pending_pump_dump_enabled = bool(cfg.get("pendingPumpDumpCancelEnabled", True))
-            self.pending_pump_threshold_pct = float(cfg.get("pendingPumpThresholdPct", 0.5))
-            self.pending_dump_from_peak_pct = float(cfg.get("pendingDumpFromPeakPct", 0.5))
-            self.pending_min_age_seconds = int(cfg.get("pendingMinAgeSeconds", 60))
+        if self.metrics is not None:
+            self.metrics.enabled = bool(cfg["metricsEnabled"])
 
-            if self.metrics is not None:
-                self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
-        except Exception as e:
-            log.warning("sync_config failed (continuing with last values): %s", e)
+        self.config_loaded = True
 
     def _update_trajectory_metrics(self, symbol, pos, curr_row):
         """Persist post-fill trajectory features to METRICS:OUTCOME so the
@@ -2832,8 +2859,22 @@ class MultiSymbolScalper:
         last_symbol_refresh = 0
         while self.is_running:
             try:
-                await self.sync_config()
-                
+                # iter 22: STRICT Redis read. If any required key is
+                # missing or Redis is unhealthy, sync_config raises and
+                # we skip this cycle entirely — no trading actions run
+                # with stale in-memory state.
+                try:
+                    await self.sync_config()
+                except Exception as cfg_err:
+                    log.error(f"❌ sync_config failed — bot will NOT trade this cycle: {cfg_err}")
+                    self.config_loaded = False
+                    await asyncio.sleep(5)
+                    continue
+                if not self.config_loaded:
+                    log.warning("sync_config did not set config_loaded — skipping cycle")
+                    await asyncio.sleep(5)
+                    continue
+
                 # Refresh symbols every 5 minutes
                 if time.time() - last_symbol_refresh > 300:
                     await self.refresh_symbols()
