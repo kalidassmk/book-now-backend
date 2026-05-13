@@ -2872,19 +2872,46 @@ class MultiSymbolScalper:
         return float(Decimal(str(qty)).quantize(Decimal(str(10**-p)), rounding=ROUND_DOWN))
 
     async def start(self):
+        # iter 31 (2026-05-13): diagnostic heartbeat written to Redis on
+        # every iteration so we can confirm from outside whether the
+        # main loop is alive and which stage it's reaching. Useful when
+        # SCALPER:SIGNAL:* keys (TTL=30s) aren't appearing — tells us
+        # if sync_config is the blocker vs the loop never starting.
+        def _heartbeat(stage):
+            try:
+                if self.redis:
+                    import time as _t
+                    self.redis.set("SCALPER:HEARTBEAT", json.dumps({
+                        "stage": stage,
+                        "ts": int(_t.time() * 1000),
+                        "config_loaded": bool(getattr(self, "config_loaded", False)),
+                    }), ex=120)
+            except Exception:
+                pass
+
+        _heartbeat("pre_initialize")
         await self.initialize()
-        
+        _heartbeat("post_initialize")
+
         last_symbol_refresh = 0
         while self.is_running:
             try:
+                _heartbeat("loop_iter_start")
                 # iter 22: STRICT Redis read. If any required key is
                 # missing or Redis is unhealthy, sync_config raises and
                 # we skip this cycle entirely — no trading actions run
                 # with stale in-memory state.
                 try:
                     await self.sync_config()
+                    _heartbeat("sync_config_ok")
                 except Exception as cfg_err:
                     log.error(f"❌ sync_config failed — bot will NOT trade this cycle: {cfg_err}")
+                    try:
+                        if self.redis:
+                            self.redis.set("SCALPER:LAST_CONFIG_ERROR",
+                                str(cfg_err)[:500], ex=300)
+                    except Exception:
+                        pass
                     self.config_loaded = False
                     await asyncio.sleep(5)
                     continue
