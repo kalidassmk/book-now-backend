@@ -102,6 +102,13 @@ class LadderState:
     # run beyond the static TP and capture the bigger-move upside.
     trailing_active: bool = False
     peak_price_since_tp: float = 0.0
+    # 2026-05-13 iter 16: pending-pump-dump tracker. While Buy 1 is a
+    # resting LIMIT and price has been ABOVE the limit (limit not filling
+    # because market is too high), we track the running peak. If the peak
+    # exceeds limit by pending_pump_threshold% AND then price drops
+    # pending_dump_from_peak% from that peak, we cancel before the limit
+    # fills into a falling knife (GIGGLE/USDT 2026-05-13 pattern).
+    peak_since_signal: float = 0.0
     closed_ts: int = 0
     exit_reason: str = ""
 
@@ -119,6 +126,7 @@ class LadderState:
             "recovered_to_break_even": self.recovered_to_break_even,
             "trailing_active": self.trailing_active,
             "peak_price_since_tp": self.peak_price_since_tp,
+            "peak_since_signal": self.peak_since_signal,
             "closed_ts": self.closed_ts,
             "exit_reason": self.exit_reason,
         }
@@ -146,6 +154,7 @@ class LadderState:
             recovered_to_break_even=bool(d.get("recovered_to_break_even") or False),
             trailing_active=bool(d.get("trailing_active") or False),
             peak_price_since_tp=float(d.get("peak_price_since_tp") or 0),
+            peak_since_signal=float(d.get("peak_since_signal") or 0),
             closed_ts=int(d.get("closed_ts") or 0),
             exit_reason=d.get("exit_reason") or "",
         )

@@ -200,6 +200,15 @@ class MultiSymbolScalper:
         self.ladder_trailing_tp_enabled = True
         self.ladder_trailing_tp_pct = 0.5
 
+        # Pending-pump-dump cancel (iter 16, 2026-05-13). Cancels a
+        # resting Buy 1 LIMIT when price pumps above limit then crashes
+        # back — saves us from filling into a falling knife. Details in
+        # _maybe_cancel_pending_on_pump_dump().
+        self.pending_pump_dump_enabled = True
+        self.pending_pump_threshold_pct = 0.5
+        self.pending_dump_from_peak_pct = 0.5
+        self.pending_min_age_seconds = 60
+
         # Metrics collector — bound after Redis connects.
         self.metrics = None
 
@@ -511,6 +520,11 @@ class MultiSymbolScalper:
             # Trailing-TP knobs (iter 15).
             self.ladder_trailing_tp_enabled = bool(cfg.get("ladderTrailingTpEnabled", True))
             self.ladder_trailing_tp_pct = float(cfg.get("ladderTrailingTpPct", 0.5))
+            # Pending-pump-dump knobs (iter 16).
+            self.pending_pump_dump_enabled = bool(cfg.get("pendingPumpDumpCancelEnabled", True))
+            self.pending_pump_threshold_pct = float(cfg.get("pendingPumpThresholdPct", 0.5))
+            self.pending_dump_from_peak_pct = float(cfg.get("pendingDumpFromPeakPct", 0.5))
+            self.pending_min_age_seconds = int(cfg.get("pendingMinAgeSeconds", 60))
 
             if self.metrics is not None:
                 self.metrics.enabled = bool(cfg.get("metricsEnabled", True))
@@ -1339,6 +1353,14 @@ class MultiSymbolScalper:
                 if await self._maybe_trailing_tp_exit(state, f):
                     continue
 
+                # iter 16: pending-pump-dump cancel. If Buy 1 is a resting
+                # LIMIT and price has pumped above limit then crashed back,
+                # cancel before the limit fills into a falling knife.
+                # (GIGGLE/USDT 2026-05-13 reference case.)
+                if state.state == ladder.PENDING_BUY_1:
+                    if await self._maybe_cancel_pending_pump_dump(state, f):
+                        continue
+
                 if state.state == ladder.PENDING_BUY_1:
                     await self._ladder_check_buy1_fill(state, f, tick)
                 elif state.state == ladder.ACTIVE_1:
@@ -1582,6 +1604,110 @@ class MultiSymbolScalper:
         log.info(f"🎯 [ladder] {state.symbol} TRAILING-TP exit "
                  f"net=${pnl:+.4f} peak=${state.peak_price_since_tp:.6f} "
                  f"exit=${exit_price:.6f} avg=${avg:.6f}")
+        ladder.clear_state(self.redis, state.symbol)
+        ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
+        return True
+
+    async def _maybe_cancel_pending_pump_dump(self, state, f):
+        """Iter 16 (2026-05-13): cancel a resting Buy 1 LIMIT when price
+        is showing a pump-then-dump pattern that would fill our limit
+        into a falling knife.
+
+        Trigger conditions (ALL must hold):
+          - state is PENDING_BUY_1 (Buy 1 limit still resting)
+          - age >= pendingMinAgeSeconds (don't trigger on noise)
+          - peak_since_signal >= limit × (1 + pendingPumpThresholdPct/100)
+            (price actually pumped meaningfully ABOVE our limit)
+          - current_price <= peak × (1 - pendingDumpFromPeakPct/100)
+            (price has now dropped from that peak)
+
+        Reference case: 2026-05-13 GIGGLE/USDT 1m chart. Signal fired,
+        Buy 1 LIMIT placed ~$35.75. Price pumped to $36.09 (+0.95% above
+        limit) then crashed to $35.74 (-0.97% from peak). Without this
+        filter, the limit would fill at $35.75 into a continuing
+        downtrend → instant unrealized loss before TP can ever fire.
+
+        Returns True iff the order was cancelled (caller skips fill check).
+        Best-effort: any error returns False so the regular flow continues.
+        """
+        if not self.pending_pump_dump_enabled:
+            return False
+        if state is None or state.state != ladder.PENDING_BUY_1:
+            return False
+        if not state.buy_1 or not state.buy_1.order_id:
+            return False
+        limit_price = state.buy_1.target_price
+        if limit_price <= 0:
+            return False
+
+        now_ms = int(time.time() * 1000)
+        signal_ts = int(state.signal_ts or 0)
+        age_sec = (now_ms - signal_ts) / 1000.0 if signal_ts else 0
+        # Update peak first even if we don't trigger — useful for audit.
+        try:
+            tk = await self.client.fetch_ticker(state.symbol)
+            current_price = float(tk.get("last") or tk.get("close") or 0)
+        except Exception:
+            return False
+        if current_price <= 0:
+            return False
+        if current_price > state.peak_since_signal:
+            state.peak_since_signal = current_price
+            ladder.save_state(self.redis, state)
+
+        # Gate 1: enough time elapsed so we're not reacting to a single
+        # tick spike right after order placement.
+        if age_sec < self.pending_min_age_seconds:
+            return False
+
+        # Gate 2: peak actually pumped meaningfully above the limit.
+        pump_above_limit_pct = ((state.peak_since_signal - limit_price)
+                                / limit_price * 100.0) if limit_price > 0 else 0
+        if pump_above_limit_pct < self.pending_pump_threshold_pct:
+            return False
+
+        # Gate 3: price has dropped from the peak.
+        drop_from_peak_pct = ((state.peak_since_signal - current_price)
+                              / state.peak_since_signal * 100.0) if state.peak_since_signal > 0 else 0
+        if drop_from_peak_pct < self.pending_dump_from_peak_pct:
+            return False
+
+        # All three gates fired — cancel the limit order.
+        log.info(f"💥 [ladder] {state.symbol} pump-then-dump during PENDING_BUY_1: "
+                 f"peak {state.peak_since_signal:.6f} (+{pump_above_limit_pct:.2f}% above "
+                 f"limit {limit_price:.6f}), now {current_price:.6f} "
+                 f"(-{drop_from_peak_pct:.2f}% from peak), age={age_sec:.0f}s — cancelling")
+        try:
+            await self.client.cancel_order(state.buy_1.order_id, state.symbol)
+        except Exception as exc:
+            log.warning(f"⚠️ [ladder] {state.symbol} cancel failed ({exc}); "
+                        f"will rely on next tick or natural fill")
+
+        state.buy_1.status = "cancelled"
+        state.buy_1.order_id = None
+        state.state = ladder.CLOSED
+        state.exit_reason = "pending_pump_dump_cancel"
+        state.closed_ts = now_ms
+
+        if self.metrics is not None:
+            try:
+                # Record as a skip-style event so the dashboard sees why
+                # the ladder ended without a fill.
+                self.metrics.signal_skipped(
+                    state.symbol, "pending_pump_dump",
+                    f"limit {limit_price:.6f} pumped to {state.peak_since_signal:.6f} "
+                    f"(+{pump_above_limit_pct:.2f}%) then dropped to {current_price:.6f} "
+                    f"(-{drop_from_peak_pct:.2f}% from peak), age {age_sec:.0f}s",
+                    {"limit_price": limit_price,
+                     "peak": state.peak_since_signal,
+                     "current_price": current_price,
+                     "pump_pct": pump_above_limit_pct,
+                     "drop_pct": drop_from_peak_pct,
+                     "age_sec": int(age_sec)},
+                )
+            except Exception:
+                pass
+
         ladder.clear_state(self.redis, state.symbol)
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
         return True

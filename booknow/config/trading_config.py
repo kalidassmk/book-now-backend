@@ -228,6 +228,27 @@ class TradingConfig:
     # never reaches break-even either → time exit caps the hold time.
     ladderTrailingTpEnabled: bool = True
     ladderTrailingTpPct: float = 0.5          # trail by 0.5% from peak
+
+    # ── Pending-pump-dump cancel (iter 16, 2026-05-13) ────────────────
+    # While Buy 1 is sitting as a resting LIMIT (PENDING_BUY_1), monitor
+    # the price action. If price first pumps ≥ pendingPumpThresholdPct
+    # above our limit (a real bullish move that left our limit cheap)
+    # AND then drops ≥ pendingDumpFromPeakPct from that peak, the move
+    # has reversed and our limit is about to fill INTO a falling knife.
+    # Cancel before the fill.
+    #
+    # Why: 2026-05-13 GIGGLE/USDT — Buy 1 limit at ~$35.75. Price pumped
+    # to $36.09 (+0.95% above limit) then crashed to $35.74 (-0.97% from
+    # peak). The operator had to manually cancel; without that, the limit
+    # would have filled at $35.75 into a continuing downtrend.
+    #
+    # Both gates must fire — single-side checks false-positive on normal
+    # noise. The minimum age prevents cancelling on a single-tick spike
+    # right after order placement.
+    pendingPumpDumpCancelEnabled: bool = True
+    pendingPumpThresholdPct: float = 0.5      # peak must be >= +0.5% above limit
+    pendingDumpFromPeakPct: float = 0.5       # current must be >= 0.5% below peak
+    pendingMinAgeSeconds: int = 60            # wait at least 60s before allowing cancel
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.
