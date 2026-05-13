@@ -465,20 +465,31 @@ class VirtualScalpExecutor:
         return True
 
     def _handle_external_cancel_live(self, state, who: str):
-        """Manual cancel detected — cancel remaining orders, free slot,
-        set cooldown. Do NOT auto-sell any held qty (operator's call)."""
-        print(f"🛑 [v-ladder] {state.symbol} {who} cancelled externally; releasing slot + cooldown")
-        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        """Manual cancel detected — bot STANDS DOWN on this symbol.
+
+        iter 23 (2026-05-13): mirrors the Fast Scalper change. The bot
+        no longer cancels any other bot-placed orders when the operator
+        manually cancels one — the operator is taking control and any
+        bot interference (cancelling Buy 2, placing a new TP, etc.) just
+        fights against their manual position management. Setting
+        cooldown so the bot doesn't auto-enter this symbol again, and
+        leaving the held qty untouched (operator sells it themselves)."""
+        print(f"🛑 [v-ladder] {state.symbol} {who} cancelled externally — bot STANDING DOWN "
+              f"(no auto-cancel of other legs; operator is in control)")
+
+        remaining = []
         for leg in (state.buy_1, state.buy_2, state.buy_3):
             if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
-                try: self.client.cancel_order(leg.order_id, ccxt_sym)
-                except Exception: pass
-                leg.status = "cancelled"
-                leg.order_id = None
-        if state.tp_order_id:
-            try: self.client.cancel_order(state.tp_order_id, ccxt_sym)
-            except Exception: pass
-            state.tp_order_id = None
+                remaining.append(f"{leg.label}@{leg.order_id} ({leg.target_price})")
+                # iter 23: do not cancel. Mark as operator-managed.
+                leg.status = "operator_managed"
+        if state.tp_order_id and who != "TP":
+            remaining.append(f"tp@{state.tp_order_id} ({state.tp_target_price})")
+        if remaining:
+            print(f"   [v-ladder] {state.symbol} bot-placed orders left ALONE for operator: {remaining}")
+        state.tp_order_id = None
+
+        # Record + free
         state.state = ladder.CLOSED
         state.exit_reason = "manual_cancel"
         state.closed_ts = int(time.time() * 1000)

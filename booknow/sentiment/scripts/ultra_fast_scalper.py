@@ -1067,37 +1067,55 @@ class MultiSymbolScalper:
         return True
 
     async def _handle_external_cancel(self, state, who: str):
-        """A leg or TP order was cancelled outside the bot (operator did
-        it manually on Binance). Free the slot, set cooldown so we don't
-        immediately re-enter.
+        """An order the bot was tracking was cancelled outside the bot
+        (operator did it manually on the Binance app/web).
 
-        iter 17 (2026-05-13): if Buy 1 was already filled when this fires,
-        the operator is now holding the position and will likely sell
-        themselves. Record the entry with the right exit_reason and try
-        to find the matching sell trade now — and schedule a delayed
-        retry to catch sells that happen AFTER our cancel detect.
+        iter 23 (2026-05-13): when the operator takes over, the bot
+        STANDS DOWN COMPLETELY on this symbol. No more auto-cancels of
+        any other legs (Buy 2 limit etc.), no market-sells, no further
+        TP placements. The operator is now in control — anything else
+        the bot does could fight against their manual order management.
 
-        The old behaviour (always pnl_usdt=0) was wrong for the common
-        case where bot bought, operator cancelled bot's TP, then operator
-        market-sold — bot was reporting $0 P&L when there was a real
-        realised gain/loss to track."""
-        log.info(f"🛑 [ladder] {state.symbol} {who} cancelled externally; releasing slot + cooldown")
-        # Cancel any remaining open orders for this ladder so we don't
-        # leave stragglers on the book that could fill later.
+        Why we used to cancel other legs:
+          A pending Buy 2 LIMIT could still fill in the background,
+          giving the operator extra qty they didn't expect.
+
+        Why iter 23 stops doing that:
+          The operator was reporting that the bot was "cancelling the
+          sell order I just placed in Binance app". The bot wasn't
+          actually cancelling the operator's NEW sell — it was cancelling
+          its own Buy 2 LIMIT — but the cleanup confused the operator's
+          mental model of "I'm taking over". Best behaviour is: respect
+          the manual cancel as a 'hands off' signal and stop touching
+          anything else on this symbol. If Buy 2 fills later, the
+          operator manages it (or cancels it themselves on the Binance
+          app — they already have it open).
+
+        iter 17 retry chain stays: we still attempt to find the operator's
+        sell trade and patch the OUTCOME hash with realised P&L.
+        """
+        log.info(f"🛑 [ladder] {state.symbol} {who} cancelled externally — bot STANDING DOWN "
+                 f"(no auto-cancel of other legs; operator is in control)")
+
+        # iter 23: list any remaining bot-owned orders for transparency,
+        # but DO NOT cancel them. Operator can cancel via Binance app if
+        # they don't want Buy 2 to fill.
+        remaining = []
         for leg in (state.buy_1, state.buy_2, state.buy_3):
             if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
-                try:
-                    await self.client.cancel_order(leg.order_id, state.symbol)
-                except Exception:
-                    pass
-                leg.status = "cancelled"
-                leg.order_id = None
-        if state.tp_order_id:
-            try:
-                await self.client.cancel_order(state.tp_order_id, state.symbol)
-            except Exception:
-                pass
-            state.tp_order_id = None
+                remaining.append(f"{leg.label}@{leg.order_id} ({leg.target_price})")
+                # Mark as "operator-managed" in our state — we no longer
+                # think of these orders as ours to manage. We still
+                # remember the order_id for diagnostics.
+                leg.status = "operator_managed"
+        if state.tp_order_id and who != "TP":
+            # If the cancel came from a leg, the TP is also still on the
+            # book — operator now owns it.
+            remaining.append(f"tp@{state.tp_order_id} ({state.tp_target_price})")
+        if remaining:
+            log.info(f"   [ladder] {state.symbol} bot-placed orders left ALONE for operator: {remaining}")
+        # Clear our tracked tp_order_id either way — we no longer manage it.
+        state.tp_order_id = None
 
         # Did Buy 1 actually fill? If so, qty + avg are real and the
         # operator may have realised a P&L by selling externally.
