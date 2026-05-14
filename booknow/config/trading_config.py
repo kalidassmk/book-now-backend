@@ -222,7 +222,7 @@ class TradingConfig:
     ladderTimeExitEnabled: bool = True
     ladderMaxHoldSeconds: int = 14400         # 4 hours
     ladderBreakevenExitEnabled: bool = True
-    ladderBreakevenBufferPct: float = 0.20
+    ladderBreakevenBufferPct: float = 0.50
 
     # ── Trailing TP (iter 15) ────────────────────────────────────────────
     # Captures bigger upside on winners. When the static TP (set to net

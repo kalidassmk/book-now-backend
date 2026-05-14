@@ -197,7 +197,7 @@ class MultiSymbolScalper:
         self.ladder_time_exit_enabled = True
         self.ladder_max_hold_seconds = 14400        # 4h max hold
         self.ladder_breakeven_exit_enabled = True
-        self.ladder_breakeven_buffer_pct = 0.20     # iter 35: 0.05→0.20 to cover fees (0.15%)
+        self.ladder_breakeven_buffer_pct = 0.50     # iter 36: 0.20→0.50 covers fees (0.15%) + slippage (~0.30%)
 
         # Trailing-TP (iter 15) — once static TP target is reached we
         # cancel the limit TP and trail the running peak. Sells when price
