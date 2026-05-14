@@ -1524,11 +1524,123 @@ class MultiSymbolScalper:
                  f"target_net=${self.ladder_target_net_usdt} "
                  f"fee_rate={self.ladder_fee_rate_per_side} → tp@{tp_p:.8f}")
 
+    async def _drain_fill_events(self):
+        """iter 33 (2026-05-14): consume Binance user-data-stream fill
+        events that the frontend's binance-worker.js pushes to the Redis
+        list BINANCE:FILL_EVENTS. These arrive via WebSocket push within
+        a few ms of the actual fill on Binance, so reacting from this
+        list gives us sub-second TP placement vs the previous polling
+        which was ~1.2s best case (iter32) and up to 8min worst case
+        (pre-iter32 — caused the ATOM 17:22→17:31 gap and the WLFI
+        00:06→00:27 gap).
+
+        For each event:
+          - FILLED on a Buy 1 LIMIT belonging to a PENDING_BUY_1 ladder
+            → mark state as ACTIVE_1 and place Buy 2 + TP immediately
+          - FILLED on a TP order → handled later in this tick by the
+            existing state-machine check (no extra work here)
+          - CANCELED/EXPIRED on any tracked order → leave for the
+            existing _handle_external_cancel detection
+        """
+        if not self.redis or ladder is None:
+            return
+        events_processed = 0
+        # Drain up to 50 events per tick — usually 0 or 1.
+        for _ in range(50):
+            try:
+                raw = self.redis.rpop("BINANCE:FILL_EVENTS")
+            except Exception:
+                break
+            if not raw:
+                break
+            try:
+                evt = json.loads(raw)
+            except Exception:
+                continue
+            order_id = str(evt.get("orderId") or "")
+            status = (evt.get("status") or "").upper()
+            side = (evt.get("side") or "").upper()
+            if status != "FILLED" or side != "BUY":
+                # Only Buy fills need the immediate TP placement path.
+                # Cancellations and sells are handled elsewhere.
+                continue
+            # Find the matching ladder by buy_1 order_id.
+            states = ladder.load_all_states(self.redis)
+            for state in states:
+                if (state.state == ladder.PENDING_BUY_1
+                        and state.buy_1
+                        and state.buy_1.order_id == order_id):
+                    try:
+                        await self._on_buy1_fill_pushed(state, evt)
+                    except Exception as exc:
+                        log.warning(
+                            f"⚠️ [ladder] WS fill handler failed for {state.symbol}: {exc} "
+                            f"(falling back to polling)"
+                        )
+                    break
+            events_processed += 1
+        if events_processed:
+            log.info(f"⚡ [ladder] drained {events_processed} WS fill event(s)")
+
+    async def _on_buy1_fill_pushed(self, state, evt):
+        """Mirror of _ladder_check_buy1_fill but driven by the WebSocket
+        push event from the user data stream — no Binance REST call
+        needed since the event already contains the fill price + qty.
+
+        Transitions state to ACTIVE_1 and places Buy 2 + Buy 3 + TP."""
+        symbol = state.symbol
+        # Need market filters before placing follow-on legs.
+        f = self.filters.get(symbol)
+        if not f:
+            await self.fetch_filters(symbol)
+            f = self.filters.get(symbol)
+        if not f:
+            log.warning(f"⚠️ [ladder] {symbol} WS fill: no filters yet, skipping (will retry on poll)")
+            return
+        tick = f.get("tick_size") or 0.00000001
+
+        # Extract fill data from the executionReport.
+        try:
+            fill_qty = float(evt.get("cumQty") or evt.get("fillQty") or 0)
+            fill_price = float(evt.get("fillPrice") or state.buy_1.target_price or 0)
+        except (TypeError, ValueError):
+            fill_qty, fill_price = 0, 0
+        if fill_qty <= 0 or fill_price <= 0:
+            log.warning(f"⚠️ [ladder] {symbol} WS fill missing qty/price; falling back to polling")
+            return
+
+        # Mark the leg as filled (mirrors what _ladder_check_buy1_fill does)
+        # and transition to ACTIVE_1. Then place Buy 2/3 + TP right away.
+        base_qty = self.round_step(fill_qty * 0.999, f["step_size"])
+        state.buy_1.qty_filled = base_qty
+        state.buy_1.fill_price = fill_price
+        state.buy_1.fill_ts = int(time.time() * 1000)
+        state.buy_1.status = "filled"
+        state.state = ladder.ACTIVE_1
+
+        await self._ladder_place_legs_after_buy1(state, f, tick)
+        ladder.save_state(self.redis, state)
+        log.info(
+            f"⚡✅ [ladder] {symbol} buy 1 filled @ {fill_price} (qty={base_qty}) "
+            f"— TP placed in same tick via WebSocket push"
+        )
+        if self.metrics is not None:
+            try:
+                self.metrics.fill_recorded(symbol, fill_price, base_qty)
+            except Exception:
+                pass
+
     async def _ladder_tick(self):
         """Called every loop iteration to drive ALL active ladders forward.
         Multi-ladder version: iterates every symbol with an in-flight
-        state and runs the appropriate state-transition handler."""
+        state and runs the appropriate state-transition handler.
+
+        iter 33: drains BINANCE:FILL_EVENTS first so push-based detection
+        runs before polling. Polling stays as a safety net in case the
+        frontend WebSocket drops or the Redis bridge has a hiccup."""
         if ladder is None: return
+        # Push-based detection FIRST — handles fills within ms of receipt.
+        await self._drain_fill_events()
         states = ladder.load_all_states(self.redis)
         if not states: return
         for state in states:
