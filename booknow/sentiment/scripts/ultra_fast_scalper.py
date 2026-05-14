@@ -1618,17 +1618,21 @@ class MultiSymbolScalper:
         state.buy_1.status = "filled"
         state.state = ladder.ACTIVE_1
 
+        # iter 34: record fill BEFORE placing follow-on legs so the
+        # OUTCOME hash reflects the real state even if leg placement
+        # fails. The dashboard sees filled=1 immediately.
+        if self.metrics is not None:
+            try:
+                self.metrics.fill_recorded(symbol, fill_price, base_qty)
+            except Exception:
+                pass
+
         await self._ladder_place_legs_after_buy1(state, f, tick)
         ladder.save_state(self.redis, state)
         log.info(
             f"⚡✅ [ladder] {symbol} buy 1 filled @ {fill_price} (qty={base_qty}) "
             f"— TP placed in same tick via WebSocket push"
         )
-        if self.metrics is not None:
-            try:
-                self.metrics.fill_recorded(symbol, fill_price, base_qty)
-            except Exception:
-                pass
 
     async def _ladder_tick(self):
         """Called every loop iteration to drive ALL active ladders forward.
@@ -2022,6 +2026,17 @@ class MultiSymbolScalper:
                 )
             except Exception:
                 pass
+            # iter 34 (2026-05-14): ALSO write exited=1 to METRICS:OUTCOME
+            # so the /metrics dashboard shows CANCELLED instead of PENDING
+            # forever. Previous iters only called signal_skipped which
+            # didn't touch the per-coin OUTCOME hash created by buy_placed.
+            try:
+                self.metrics.exit_recorded(
+                    state.symbol, 0, 0,
+                    reason="pending_pump_dump_cancel", pnl_usdt=0,
+                )
+            except Exception:
+                pass
 
         ladder.clear_state(self.redis, state.symbol)
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
@@ -2057,11 +2072,20 @@ class MultiSymbolScalper:
         state.buy_1.status = "filled"
         state.state = ladder.ACTIVE_1
 
+        # iter 34 (2026-05-14): record fill BEFORE attempting to place
+        # follow-on legs. If _ladder_place_legs_after_buy1 ever throws
+        # (timeout, weird response, etc.) the fill itself is still
+        # recorded — so the dashboard never shows PENDING for a coin
+        # that was actually bought. The OUTCOME hash now matches reality.
+        if self.metrics is not None:
+            try:
+                self.metrics.fill_recorded(state.symbol, fill_price, base_qty)
+            except Exception:
+                pass
+
         await self._ladder_place_legs_after_buy1(state, f, tick)
         ladder.save_state(self.redis, state)
         log.info(f"✅ [ladder] {state.symbol} buy 1 (limit) filled qty={base_qty} @ {fill_price}")
-        if self.metrics is not None:
-            self.metrics.fill_recorded(state.symbol, fill_price, base_qty)
 
     async def _ladder_place_tp(self, state, qty_total, tp_price, filters):
         """Place a LIMIT SELL for entire filled qty at tp_price."""
