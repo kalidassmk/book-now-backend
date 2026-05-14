@@ -211,12 +211,18 @@ class TradingConfig:
     #   ladderBreakevenExitEnabled:  smarter early exit — if ladder ever went
     #                                underwater AND price returns to break-even
     #                                (+ buffer), exit immediately at market
-    #   ladderBreakevenBufferPct:    buffer above avg (default 0.05% — covers
-    #                                spread + a sliver of profit)
+    #   ladderBreakevenBufferPct:    buffer above avg. MUST exceed round-trip
+    #                                fees (0.15% = 2 × 0.075% per side) for
+    #                                the exit to actually be net-zero or
+    #                                positive. 2026-05-14 iter 35: was 0.05%,
+    #                                which guaranteed a small loss every time
+    #                                ("break-even recovery" sold DOGE for
+    #                                −$0.034). Bumped to 0.20% = fees (0.15%)
+    #                                + 0.05% true profit margin.
     ladderTimeExitEnabled: bool = True
     ladderMaxHoldSeconds: int = 14400         # 4 hours
     ladderBreakevenExitEnabled: bool = True
-    ladderBreakevenBufferPct: float = 0.05
+    ladderBreakevenBufferPct: float = 0.20
 
     # ── Trailing TP (iter 15) ────────────────────────────────────────────
     # Captures bigger upside on winners. When the static TP (set to net

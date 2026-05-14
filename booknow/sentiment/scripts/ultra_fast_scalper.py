@@ -197,7 +197,7 @@ class MultiSymbolScalper:
         self.ladder_time_exit_enabled = True
         self.ladder_max_hold_seconds = 14400        # 4h max hold
         self.ladder_breakeven_exit_enabled = True
-        self.ladder_breakeven_buffer_pct = 0.05     # exit at avg × (1 + 0.05%) once recovered
+        self.ladder_breakeven_buffer_pct = 0.20     # iter 35: 0.05→0.20 to cover fees (0.15%)
 
         # Trailing-TP (iter 15) — once static TP target is reached we
         # cancel the limit TP and trail the running peak. Sells when price
@@ -1815,7 +1815,12 @@ class MultiSymbolScalper:
         state.closed_ts = now_ms
         if self.metrics is not None:
             try:
-                self.metrics.exit_recorded(state.symbol, exit_price, sell_qty,
+                # iter 35: fix arg-order bug. exit_recorded signature is
+                # (symbol, fill_price, exit_price, reason, pnl). The bug
+                # was passing (symbol, exit_price, sell_qty) which stored
+                # the QTY in the exit_price OUTCOME field. DOGE today
+                # showed exit_price=415 (the qty) in the dashboard.
+                self.metrics.exit_recorded(state.symbol, avg, exit_price,
                                            reason=force_reason, pnl_usdt=pnl)
             except Exception:
                 pass
@@ -1915,7 +1920,8 @@ class MultiSymbolScalper:
         state.closed_ts = now_ms
         if self.metrics is not None:
             try:
-                self.metrics.exit_recorded(state.symbol, exit_price, sell_qty,
+                # iter 35: fix arg-order bug — see force-exit comment above.
+                self.metrics.exit_recorded(state.symbol, avg, exit_price,
                                            reason="trailing_tp", pnl_usdt=pnl)
             except Exception:
                 pass
