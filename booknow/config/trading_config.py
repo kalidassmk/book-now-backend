@@ -345,7 +345,54 @@ class TradingConfig:
     active2TightBreakevenBufferPct: float = 0.15 # tighter than ACTIVE_1's 0.5%
     active2PatienceMinutes: int = 20            # how long before no-recovery exit
     active2NoRecoveryDropPct: float = 0.5       # min loss to accept on no-recovery
-    active2HardStopPct: float = 1.5             # worst-case cap from new avg  # only when drop in [0, this]
+    active2HardStopPct: float = 1.5             # worst-case cap from new avg
+
+    # ── Volatility-Adaptive Entry + Dynamic TP (iter 43, 2026-05-15) ──────
+    # Forensic of today's 5 Fast Scalper trades showed every single one
+    # DIPPED after buy (−1% to −10%) — 3 of 5 peaked within 1-5 min after
+    # entry. The bot was buying at the top of small rallies. The depth
+    # of the post-buy dip correlated strongly with `range_1h_pct`:
+    #
+    #   MLN  1h range 5.70% → max drop 9.82%
+    #   IOTA       0.50%   →           4.46%   (low range = surprise dip)
+    #   LINK       0.98%   →           3.00%
+    #   QNT        0.88%   →           1.32%
+    #   NXPC       1.02%   →           1.07%
+    #
+    # New algorithm: at signal time, pick one of 4 strategies based on
+    # range_1h_pct from the features dict. Each tier sets:
+    #   • ladderBuy1OffsetPct  — how far below signal to place Buy 1
+    #   • ladderBuy2OffsetPct  — how far below signal for Buy 2
+    #   • ladderTargetNetProfitUsdt — dynamic TP based on expected swing
+    #
+    #  range_1h          strategy          buy1_off  buy2_off  tp_target
+    #  < 1.0%   (calm)   AGGRESSIVE_BUY1   0.15%     0.5%      $0.15
+    #  1.0–2.0% (normal) MODERATE          0.30%     0.8%      $0.20
+    #  2.0–4.0% (volat)  WAIT_FOR_DIP      0.70%     1.5%      $0.30
+    #  > 4.0%   (xvolat) WAIT_DEEP_DIP     1.50%     2.5%      $0.50
+    #
+    # Static config keys above still control the FALLBACK when adaptive
+    # mode is off. When ON, adaptive params override at ladder_start time.
+    adaptiveEntryEnabled: bool = True
+    # Boundaries on the 1h range %
+    adaptiveTierCalmMaxPct: float = 1.0
+    adaptiveTierNormalMaxPct: float = 2.0
+    adaptiveTierVolatileMaxPct: float = 4.0
+    # Per-tier Buy 1 offset (% below signal)
+    adaptiveBuy1OffsetCalm: float = 0.15
+    adaptiveBuy1OffsetNormal: float = 0.30
+    adaptiveBuy1OffsetVolatile: float = 0.70
+    adaptiveBuy1OffsetXVolatile: float = 1.50
+    # Per-tier Buy 2 offset (% below signal)
+    adaptiveBuy2OffsetCalm: float = 0.50
+    adaptiveBuy2OffsetNormal: float = 0.80
+    adaptiveBuy2OffsetVolatile: float = 1.50
+    adaptiveBuy2OffsetXVolatile: float = 2.50
+    # Per-tier TP target ($ net)
+    adaptiveTpTargetCalm: float = 0.15
+    adaptiveTpTargetNormal: float = 0.20
+    adaptiveTpTargetVolatile: float = 0.30
+    adaptiveTpTargetXVolatile: float = 0.50  # only when drop in [0, this]
 
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the

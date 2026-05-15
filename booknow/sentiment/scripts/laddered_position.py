@@ -117,6 +117,12 @@ class LadderState:
     # of "this coin won't pump back" identified in the HBAR/QNT/FLOKI
     # forensic. Defaults to 0 if features didn't include it (old states).
     pre_vol_baseline_usdt: float = 0.0
+    # 2026-05-15 iter 43: Volatility-Adaptive Entry + TP. Set at ladder
+    # start when adaptive mode is on. 0 means "use static config".
+    dyn_buy1_offset_pct: float = 0.0
+    dyn_buy2_offset_pct: float = 0.0
+    dyn_tp_target_usdt: float = 0.0
+    dyn_strategy: str = ""           # CALM / NORMAL / VOLATILE / X_VOLATILE / STATIC
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -136,6 +142,10 @@ class LadderState:
             "closed_ts": self.closed_ts,
             "exit_reason": self.exit_reason,
             "pre_vol_baseline_usdt": self.pre_vol_baseline_usdt,
+            "dyn_buy1_offset_pct": self.dyn_buy1_offset_pct,
+            "dyn_buy2_offset_pct": self.dyn_buy2_offset_pct,
+            "dyn_tp_target_usdt": self.dyn_tp_target_usdt,
+            "dyn_strategy": self.dyn_strategy,
         }
         for tag, leg in (("buy_1", self.buy_1), ("buy_2", self.buy_2), ("buy_3", self.buy_3)):
             d[tag] = asdict(leg) if leg is not None else None
@@ -165,6 +175,10 @@ class LadderState:
             closed_ts=int(d.get("closed_ts") or 0),
             exit_reason=d.get("exit_reason") or "",
             pre_vol_baseline_usdt=float(d.get("pre_vol_baseline_usdt") or 0),
+            dyn_buy1_offset_pct=float(d.get("dyn_buy1_offset_pct") or 0),
+            dyn_buy2_offset_pct=float(d.get("dyn_buy2_offset_pct") or 0),
+            dyn_tp_target_usdt=float(d.get("dyn_tp_target_usdt") or 0),
+            dyn_strategy=d.get("dyn_strategy") or "",
         )
 
     # ── helpers ──────────────────────────────────────────────────────────

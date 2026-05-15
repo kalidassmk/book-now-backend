@@ -258,6 +258,27 @@ class MultiSymbolScalper:
         self.a2_no_recovery_drop_pct = 0.5
         self.a2_hard_stop_pct = 1.5
 
+        # ── Volatility-Adaptive Entry + TP (iter 43, 2026-05-15) ────────
+        # At signal time, pick Buy 1/2 offsets and TP target based on
+        # range_1h_pct from features. Catches the "we bought the top"
+        # pattern by demanding a deeper entry on volatile coins.
+        self.ae_enabled = True
+        self.ae_tier_calm_max = 1.0
+        self.ae_tier_normal_max = 2.0
+        self.ae_tier_volatile_max = 4.0
+        self.ae_buy1_calm = 0.15
+        self.ae_buy1_normal = 0.30
+        self.ae_buy1_volatile = 0.70
+        self.ae_buy1_xvolatile = 1.50
+        self.ae_buy2_calm = 0.50
+        self.ae_buy2_normal = 0.80
+        self.ae_buy2_volatile = 1.50
+        self.ae_buy2_xvolatile = 2.50
+        self.ae_tp_calm = 0.15
+        self.ae_tp_normal = 0.20
+        self.ae_tp_volatile = 0.30
+        self.ae_tp_xvolatile = 0.50
+
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
         # it. The retrace we were averaging-down for never came, and
@@ -539,6 +560,15 @@ class MultiSymbolScalper:
         "active2QuickProfitPct", "active2TightBreakevenBufferPct",
         "active2PatienceMinutes", "active2NoRecoveryDropPct",
         "active2HardStopPct",
+        # iter 43 (2026-05-15) — Volatility-Adaptive Entry + TP
+        "adaptiveEntryEnabled",
+        "adaptiveTierCalmMaxPct", "adaptiveTierNormalMaxPct", "adaptiveTierVolatileMaxPct",
+        "adaptiveBuy1OffsetCalm", "adaptiveBuy1OffsetNormal",
+        "adaptiveBuy1OffsetVolatile", "adaptiveBuy1OffsetXVolatile",
+        "adaptiveBuy2OffsetCalm", "adaptiveBuy2OffsetNormal",
+        "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
+        "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
+        "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
         "metricsEnabled",
     )
 
@@ -661,6 +691,23 @@ class MultiSymbolScalper:
         self.a2_patience_minutes = int(cfg["active2PatienceMinutes"])
         self.a2_no_recovery_drop_pct = float(cfg["active2NoRecoveryDropPct"])
         self.a2_hard_stop_pct = float(cfg["active2HardStopPct"])
+        # iter 43 — Volatility-Adaptive Entry + TP
+        self.ae_enabled = bool(cfg["adaptiveEntryEnabled"])
+        self.ae_tier_calm_max = float(cfg["adaptiveTierCalmMaxPct"])
+        self.ae_tier_normal_max = float(cfg["adaptiveTierNormalMaxPct"])
+        self.ae_tier_volatile_max = float(cfg["adaptiveTierVolatileMaxPct"])
+        self.ae_buy1_calm = float(cfg["adaptiveBuy1OffsetCalm"])
+        self.ae_buy1_normal = float(cfg["adaptiveBuy1OffsetNormal"])
+        self.ae_buy1_volatile = float(cfg["adaptiveBuy1OffsetVolatile"])
+        self.ae_buy1_xvolatile = float(cfg["adaptiveBuy1OffsetXVolatile"])
+        self.ae_buy2_calm = float(cfg["adaptiveBuy2OffsetCalm"])
+        self.ae_buy2_normal = float(cfg["adaptiveBuy2OffsetNormal"])
+        self.ae_buy2_volatile = float(cfg["adaptiveBuy2OffsetVolatile"])
+        self.ae_buy2_xvolatile = float(cfg["adaptiveBuy2OffsetXVolatile"])
+        self.ae_tp_calm = float(cfg["adaptiveTpTargetCalm"])
+        self.ae_tp_normal = float(cfg["adaptiveTpTargetNormal"])
+        self.ae_tp_volatile = float(cfg["adaptiveTpTargetVolatile"])
+        self.ae_tp_xvolatile = float(cfg["adaptiveTpTargetXVolatile"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -1480,6 +1527,74 @@ class MultiSymbolScalper:
             pass
         return out
 
+    def _compute_adaptive_entry_params(self, features):
+        """iter 43 (2026-05-15) — Volatility-Adaptive Entry + TP.
+
+        Reads `range_1h_pct` from the features dict and picks one of
+        four entry strategies. Returns a dict:
+
+            {
+              'strategy':        'CALM' | 'NORMAL' | 'VOLATILE' | 'X_VOLATILE',
+              'buy1_offset_pct': float,
+              'buy2_offset_pct': float,
+              'tp_target_usdt':  float,
+              'range_1h_pct':    float,
+            }
+
+        When `ae_enabled` is False OR features are missing, returns the
+        static config values (current behaviour) — fully backward-compat.
+        """
+        # Fallback to current static config
+        defaults = {
+            'strategy': 'STATIC',
+            'buy1_offset_pct': self.ladder_buy1_offset_pct,
+            'buy2_offset_pct': self.ladder_buy2_offset_pct,
+            'tp_target_usdt':  self.ladder_target_net_usdt,
+            'range_1h_pct':    -1.0,
+        }
+        if not self.ae_enabled:
+            return defaults
+        if not features:
+            return defaults
+        try:
+            r1h = float(features.get('range_1h_pct') or -1)
+        except (TypeError, ValueError):
+            return defaults
+        if r1h < 0:
+            return defaults
+
+        if r1h < self.ae_tier_calm_max:
+            return {
+                'strategy': 'CALM',
+                'buy1_offset_pct': self.ae_buy1_calm,
+                'buy2_offset_pct': self.ae_buy2_calm,
+                'tp_target_usdt':  self.ae_tp_calm,
+                'range_1h_pct':    r1h,
+            }
+        if r1h < self.ae_tier_normal_max:
+            return {
+                'strategy': 'NORMAL',
+                'buy1_offset_pct': self.ae_buy1_normal,
+                'buy2_offset_pct': self.ae_buy2_normal,
+                'tp_target_usdt':  self.ae_tp_normal,
+                'range_1h_pct':    r1h,
+            }
+        if r1h < self.ae_tier_volatile_max:
+            return {
+                'strategy': 'VOLATILE',
+                'buy1_offset_pct': self.ae_buy1_volatile,
+                'buy2_offset_pct': self.ae_buy2_volatile,
+                'tp_target_usdt':  self.ae_tp_volatile,
+                'range_1h_pct':    r1h,
+            }
+        return {
+            'strategy': 'X_VOLATILE',
+            'buy1_offset_pct': self.ae_buy1_xvolatile,
+            'buy2_offset_pct': self.ae_buy2_xvolatile,
+            'tp_target_usdt':  self.ae_tp_xvolatile,
+            'range_1h_pct':    r1h,
+        }
+
     async def _ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
         whole ladder (legs 2/3 + TP) is on the book within microseconds
@@ -1493,16 +1608,27 @@ class MultiSymbolScalper:
 
             tick = f.get("tick_size") or 0.00000001
 
+            # iter 43: compute volatility-adaptive params from features.
+            # When ae_enabled=False or features missing, falls back to
+            # static config — fully backward compatible.
+            adapt = self._compute_adaptive_entry_params(features)
+            dyn_buy1_off = adapt['buy1_offset_pct']
+            dyn_buy2_off = adapt['buy2_offset_pct']
+            dyn_tp_tgt   = adapt['tp_target_usdt']
+            log.info(f"🎚️ [ladder] {symbol} adaptive strategy={adapt['strategy']} "
+                     f"range_1h={adapt['range_1h_pct']:.2f}% → "
+                     f"buy1_off={dyn_buy1_off}% buy2_off={dyn_buy2_off}% tp_target=${dyn_tp_tgt}")
+
             # Routing priority:
-            #   1. ladderBuy1OffsetPct > 0  → LIMIT at signal × (1 - X%)
+            #   1. dyn_buy1_off > 0  → LIMIT at signal × (1 - X%)
             #   2. ladderBuy1UseMarketOrder → MARKET (current default)
             #   3. else                     → aggressive-limit-at-ask
-            use_offset_limit = self.ladder_buy1_offset_pct > 0
+            use_offset_limit = dyn_buy1_off > 0
 
             if use_offset_limit:
                 # LIMIT BUY at a specific offset below signal price.
                 buy1_price = self.round_step(
-                    signal_price * (1 - self.ladder_buy1_offset_pct / 100.0), tick
+                    signal_price * (1 - dyn_buy1_off / 100.0), tick
                 )
                 buy1_qty = self.round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f["step_size"])
                 if (buy1_qty * buy1_price) < f["min_notional"]:
@@ -1531,10 +1657,15 @@ class MultiSymbolScalper:
                         size_usdt=self.ladder_buy1_size, order_id=str(order_id),
                     ),
                     pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+                    dyn_buy1_offset_pct=dyn_buy1_off,
+                    dyn_buy2_offset_pct=dyn_buy2_off,
+                    dyn_tp_target_usdt=dyn_tp_tgt,
+                    dyn_strategy=adapt['strategy'],
                 )
                 ladder.save_state(self.redis, state)
                 log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
-                         f"(-{self.ladder_buy1_offset_pct}% from signal {signal_price}) qty={buy1_qty}")
+                         f"(-{dyn_buy1_off}% from signal {signal_price}) qty={buy1_qty} "
+                         f"[strategy={adapt['strategy']}]")
                 if self.metrics is not None:
                     audit = await self._compute_audit_snapshot(symbol, signal_price, buy1_price)
                     self.metrics.buy_placed(
@@ -1635,10 +1766,17 @@ class MultiSymbolScalper:
         except Exception as exc:
             log.error(f"❌ [ladder] {symbol} buy 1 failed: {exc}")
 
-    def _effective_tp_pct(self) -> float:
-        """Returns the TP % to use right now. If the operator set a
-        dollar-based target (ladderTargetNetProfitUsdt > 0), the TP is
-        dynamically computed from that. Otherwise the static % is used."""
+    def _effective_tp_pct(self, state=None) -> float:
+        """Returns the TP % to use right now. iter 43: if the ladder has
+        a dynamic TP target stored (volatility-adaptive), use it. Else
+        fall back to the static ladderTargetNetProfitUsdt → static %."""
+        # iter 43: per-ladder dynamic TP target
+        if state is not None and getattr(state, 'dyn_tp_target_usdt', 0) > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                state.dyn_tp_target_usdt,
+                self.ladder_fee_rate_per_side,
+            )
         if self.ladder_target_net_usdt > 0:
             return ladder.required_tp_pct_for_net_profit(
                 self.ladder_buy1_size,
@@ -1663,7 +1801,11 @@ class MultiSymbolScalper:
         # for some reason the fill price wasn't captured).
         ref_price = (state.buy_1.fill_price if state.buy_1 and state.buy_1.fill_price
                      else state.signal_price)
-        buy2_price = self.round_step(ref_price * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        # iter 43: use per-ladder dynamic Buy 2 offset when set
+        eff_buy2_off = (state.dyn_buy2_offset_pct
+                        if getattr(state, 'dyn_buy2_offset_pct', 0) > 0
+                        else self.ladder_buy2_offset_pct)
+        buy2_price = self.round_step(ref_price * (1 - eff_buy2_off / 100.0), tick)
         buy3_price = self.round_step(ref_price * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
         buy2_qty = self.round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f["step_size"])
         buy3_qty = self.round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f["step_size"])
@@ -1687,7 +1829,7 @@ class MultiSymbolScalper:
         state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
                                  size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
 
-        tp_pct = self._effective_tp_pct()
+        tp_pct = self._effective_tp_pct(state)  # iter 43: state-aware dyn TP
         avg_for_tp = state.weighted_avg()
         tp_p = ladder.tp_price(avg_for_tp, tp_pct, tick)
         await self._ladder_place_tp(state, state.total_qty(), tp_p, f)
@@ -2588,7 +2730,7 @@ class MultiSymbolScalper:
             except Exception:
                 pass
         qty_total = state.total_qty()
-        new_tp = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(), tick)
+        new_tp = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state), tick)  # iter 43
         await self._ladder_place_tp(state, qty_total, new_tp, filters)
 
     async def _ladder_check_buy2_or_buy3(self, state, f, tick):

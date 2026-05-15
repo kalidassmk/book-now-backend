@@ -159,6 +159,23 @@ class VirtualScalpExecutor:
         self.a2_patience_minutes = 20
         self.a2_no_recovery_drop_pct = 0.5
         self.a2_hard_stop_pct = 1.5
+        # ── iter 43: Volatility-Adaptive Entry + TP ─────────────────────
+        self.ae_enabled = True
+        self.ae_tier_calm_max = 1.0
+        self.ae_tier_normal_max = 2.0
+        self.ae_tier_volatile_max = 4.0
+        self.ae_buy1_calm = 0.15
+        self.ae_buy1_normal = 0.30
+        self.ae_buy1_volatile = 0.70
+        self.ae_buy1_xvolatile = 1.50
+        self.ae_buy2_calm = 0.50
+        self.ae_buy2_normal = 0.80
+        self.ae_buy2_volatile = 1.50
+        self.ae_buy2_xvolatile = 2.50
+        self.ae_tp_calm = 0.15
+        self.ae_tp_normal = 0.20
+        self.ae_tp_volatile = 0.30
+        self.ae_tp_xvolatile = 0.50
         # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
         self._ld_kline_cache: dict = {}
         self._ld_kline_ttl_sec = 30
@@ -236,6 +253,15 @@ class VirtualScalpExecutor:
         "active2QuickProfitPct", "active2TightBreakevenBufferPct",
         "active2PatienceMinutes", "active2NoRecoveryDropPct",
         "active2HardStopPct",
+        # iter 43 — Volatility-Adaptive Entry + TP
+        "adaptiveEntryEnabled",
+        "adaptiveTierCalmMaxPct", "adaptiveTierNormalMaxPct", "adaptiveTierVolatileMaxPct",
+        "adaptiveBuy1OffsetCalm", "adaptiveBuy1OffsetNormal",
+        "adaptiveBuy1OffsetVolatile", "adaptiveBuy1OffsetXVolatile",
+        "adaptiveBuy2OffsetCalm", "adaptiveBuy2OffsetNormal",
+        "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
+        "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
+        "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
         "metricsEnabled",
     )
 
@@ -289,6 +315,14 @@ class VirtualScalpExecutor:
             "active2QuickProfitPct", "active2TightBreakevenBufferPct",
             "active2PatienceMinutes", "active2NoRecoveryDropPct",
             "active2HardStopPct",
+            "adaptiveEntryEnabled",
+            "adaptiveTierCalmMaxPct", "adaptiveTierNormalMaxPct", "adaptiveTierVolatileMaxPct",
+            "adaptiveBuy1OffsetCalm", "adaptiveBuy1OffsetNormal",
+            "adaptiveBuy1OffsetVolatile", "adaptiveBuy1OffsetXVolatile",
+            "adaptiveBuy2OffsetCalm", "adaptiveBuy2OffsetNormal",
+            "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
+            "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
+            "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
         }
         missing = [k for k in self._REQUIRED_CONFIG_KEYS
                    if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
@@ -329,6 +363,22 @@ class VirtualScalpExecutor:
                     "active2PatienceMinutes": 20,
                     "active2NoRecoveryDropPct": 0.5,
                     "active2HardStopPct": 1.5,
+                    "adaptiveEntryEnabled": True,
+                    "adaptiveTierCalmMaxPct": 1.0,
+                    "adaptiveTierNormalMaxPct": 2.0,
+                    "adaptiveTierVolatileMaxPct": 4.0,
+                    "adaptiveBuy1OffsetCalm": 0.15,
+                    "adaptiveBuy1OffsetNormal": 0.30,
+                    "adaptiveBuy1OffsetVolatile": 0.70,
+                    "adaptiveBuy1OffsetXVolatile": 1.50,
+                    "adaptiveBuy2OffsetCalm": 0.50,
+                    "adaptiveBuy2OffsetNormal": 0.80,
+                    "adaptiveBuy2OffsetVolatile": 1.50,
+                    "adaptiveBuy2OffsetXVolatile": 2.50,
+                    "adaptiveTpTargetCalm": 0.15,
+                    "adaptiveTpTargetNormal": 0.20,
+                    "adaptiveTpTargetVolatile": 0.30,
+                    "adaptiveTpTargetXVolatile": 0.50,
                 }[k]
 
         # Strict population — direct key access, no .get(default).
@@ -398,6 +448,23 @@ class VirtualScalpExecutor:
         self.a2_patience_minutes = int(cfg["active2PatienceMinutes"])
         self.a2_no_recovery_drop_pct = float(cfg["active2NoRecoveryDropPct"])
         self.a2_hard_stop_pct = float(cfg["active2HardStopPct"])
+        # iter 43 — Volatility-Adaptive Entry + TP
+        self.ae_enabled = bool(cfg["adaptiveEntryEnabled"])
+        self.ae_tier_calm_max = float(cfg["adaptiveTierCalmMaxPct"])
+        self.ae_tier_normal_max = float(cfg["adaptiveTierNormalMaxPct"])
+        self.ae_tier_volatile_max = float(cfg["adaptiveTierVolatileMaxPct"])
+        self.ae_buy1_calm = float(cfg["adaptiveBuy1OffsetCalm"])
+        self.ae_buy1_normal = float(cfg["adaptiveBuy1OffsetNormal"])
+        self.ae_buy1_volatile = float(cfg["adaptiveBuy1OffsetVolatile"])
+        self.ae_buy1_xvolatile = float(cfg["adaptiveBuy1OffsetXVolatile"])
+        self.ae_buy2_calm = float(cfg["adaptiveBuy2OffsetCalm"])
+        self.ae_buy2_normal = float(cfg["adaptiveBuy2OffsetNormal"])
+        self.ae_buy2_volatile = float(cfg["adaptiveBuy2OffsetVolatile"])
+        self.ae_buy2_xvolatile = float(cfg["adaptiveBuy2OffsetXVolatile"])
+        self.ae_tp_calm = float(cfg["adaptiveTpTargetCalm"])
+        self.ae_tp_normal = float(cfg["adaptiveTpTargetNormal"])
+        self.ae_tp_volatile = float(cfg["adaptiveTpTargetVolatile"])
+        self.ae_tp_xvolatile = float(cfg["adaptiveTpTargetXVolatile"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -514,6 +581,7 @@ class VirtualScalpExecutor:
     def _ladder_start_paper(self, symbol, signal_price, features=None):
         """Paper start: simulate instant buy 1 fill at signal price."""
         now_ms = int(time.time() * 1000)
+        adapt = self._compute_adaptive_entry_params(features)
         buy1_qty = self.ladder_buy1_size / max(signal_price, 1e-12)
         state = ladder.LadderState(
             symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
@@ -525,13 +593,19 @@ class VirtualScalpExecutor:
                 fill_price=signal_price, fill_ts=now_ms, status="filled",
             ),
             pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+            dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+            dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+            dyn_tp_target_usdt=adapt['tp_target_usdt'],
+            dyn_strategy=adapt['strategy'],
         )
         # 2026-05-11 iter 6: reference price = Buy 1 fill price (= signal
         # in paper since no spread). Keeps semantics identical to live.
         ref_price = state.buy_1.fill_price if state.buy_1 else signal_price
+        # iter 43: use per-ladder dyn Buy 2 offset
+        eff_buy2_off = adapt['buy2_offset_pct'] if adapt['buy2_offset_pct'] > 0 else self.ladder_buy2_offset_pct
         state.buy_2 = ladder.Leg(
             label="buy_2",
-            target_price=ref_price * (1 - self.ladder_buy2_offset_pct / 100.0),
+            target_price=ref_price * (1 - eff_buy2_off / 100.0),
             size_usdt=self.ladder_buy2_size, status="pending",
         )
         state.buy_3 = ladder.Leg(
@@ -539,7 +613,7 @@ class VirtualScalpExecutor:
             target_price=ref_price * (1 - self.ladder_buy3_offset_pct / 100.0),
             size_usdt=self.ladder_buy3_size, status="pending",
         )
-        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
+        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
         self._paper_ladder_save(state)
         print(f"🪜 [paper-ladder] {symbol} buy 1 filled @ {signal_price} "
               f"buy2@{state.buy_2.target_price:.6g} buy3@{state.buy_3.target_price:.6g} "
@@ -685,6 +759,14 @@ class VirtualScalpExecutor:
         use_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
         buy1_offset = float(cfg.get("ladderBuy1OffsetPct", 0.15))
 
+        # iter 43: compute volatility-adaptive params from features
+        adapt = self._compute_adaptive_entry_params(features)
+        if adapt['strategy'] != 'STATIC':
+            buy1_offset = adapt['buy1_offset_pct']  # dynamic override
+            print(f"🎚️ [v-ladder] {symbol} adaptive={adapt['strategy']} "
+                  f"range_1h={adapt['range_1h_pct']:.2f}% → "
+                  f"buy1={buy1_offset}% buy2={adapt['buy2_offset_pct']}% tp=${adapt['tp_target_usdt']}")
+
         # If offset > 0: place LIMIT BUY at signal × (1 - offset/100)
         if buy1_offset > 0:
             buy1_price = self._round_step(signal_price * (1 - buy1_offset / 100.0), tick)
@@ -707,10 +789,15 @@ class VirtualScalpExecutor:
                 buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
                                  size_usdt=self.ladder_buy1_size, order_id=order_id),
                 pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+                dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+                dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+                dyn_tp_target_usdt=adapt['tp_target_usdt'],
+                dyn_strategy=adapt['strategy'],
             )
             self._paper_ladder_save(state)
             print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
-                  f"(-{buy1_offset}% from signal {signal_price}) qty={buy1_qty}")
+                  f"(-{buy1_offset}% from signal {signal_price}) qty={buy1_qty} "
+                  f"[strategy={adapt['strategy']}]")
             if self.metrics is not None:
                 audit = self._compute_audit_snapshot(symbol, signal_price, buy1_price)
                 self.metrics.buy_placed(
@@ -747,6 +834,10 @@ class VirtualScalpExecutor:
                     status="filled",
                 ),
                 pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+                dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+                dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+                dyn_tp_target_usdt=adapt['tp_target_usdt'],
+                dyn_strategy=adapt['strategy'],
             )
             print(f"🪜 [v-ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
             if self.metrics is not None:
@@ -787,6 +878,10 @@ class VirtualScalpExecutor:
             buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
                              size_usdt=self.ladder_buy1_size, order_id=order_id),
             pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+            dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+            dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+            dyn_tp_target_usdt=adapt['tp_target_usdt'],
+            dyn_strategy=adapt['strategy'],
         )
         self._paper_ladder_save(state)
         print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
@@ -809,7 +904,11 @@ class VirtualScalpExecutor:
         ccxt_sym = self._to_ccxt_symbol(symbol)
         ref_price = (state.buy_1.fill_price if state.buy_1 and state.buy_1.fill_price
                      else state.signal_price)
-        buy2_price = self._round_step(ref_price * (1 - self.ladder_buy2_offset_pct / 100.0), tick)
+        # iter 43: state-aware dynamic Buy 2 offset
+        eff_buy2_off = (state.dyn_buy2_offset_pct
+                        if getattr(state, 'dyn_buy2_offset_pct', 0) > 0
+                        else self.ladder_buy2_offset_pct)
+        buy2_price = self._round_step(ref_price * (1 - eff_buy2_off / 100.0), tick)
         buy3_price = self._round_step(ref_price * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
         buy2_qty = self._round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f['step_size'])
         buy3_qty = self._round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f['step_size'])
@@ -1292,7 +1391,7 @@ class VirtualScalpExecutor:
                 # Cancel buy 3 per operator rule
                 if state.buy_3:
                     state.buy_3.status = "cancelled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
                 state.state = ladder.ACTIVE_2
                 print(f"📥 [paper-ladder] {sym} buy 2 filled @ {state.buy_2.target_price:.6g} "
                       f"avg={state.weighted_avg():.6g} new TP={state.tp_target_price:.6g}; buy 3 cancelled")
@@ -1305,7 +1404,7 @@ class VirtualScalpExecutor:
                 state.buy_3.fill_price = state.buy_3.target_price
                 state.buy_3.fill_ts = now_ms
                 state.buy_3.status = "filled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
                 state.hard_stop_price = ladder.hard_stop_price(
                     state.buy_3.target_price, self.ladder_hard_stop_pct
                 )
@@ -1323,7 +1422,7 @@ class VirtualScalpExecutor:
                 state.buy_3.fill_price = state.buy_3.target_price
                 state.buy_3.fill_ts = now_ms
                 state.buy_3.status = "filled"
-                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct())
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
                 state.hard_stop_price = ladder.hard_stop_price(
                     state.buy_3.target_price, self.ladder_hard_stop_pct
                 )
@@ -1512,8 +1611,55 @@ class VirtualScalpExecutor:
                     state.recovered_to_break_even = True
         self._paper_ladder_save(state)
 
-    def _effective_tp_pct(self) -> float:
-        """Same semantics as Fast Scalper: dollar-target wins when set."""
+    def _compute_adaptive_entry_params(self, features):
+        """iter 43 (Virtual parity) — same algorithm as Fast Scalper."""
+        defaults = {
+            'strategy': 'STATIC',
+            'buy1_offset_pct': self.ladder_buy1_offset_pct,
+            'buy2_offset_pct': self.ladder_buy2_offset_pct,
+            'tp_target_usdt':  self.ladder_target_net_usdt,
+            'range_1h_pct':    -1.0,
+        }
+        if not self.ae_enabled or not features:
+            return defaults
+        try:
+            r1h = float(features.get('range_1h_pct') or -1)
+        except (TypeError, ValueError):
+            return defaults
+        if r1h < 0:
+            return defaults
+        if r1h < self.ae_tier_calm_max:
+            return {'strategy':'CALM',
+                    'buy1_offset_pct': self.ae_buy1_calm,
+                    'buy2_offset_pct': self.ae_buy2_calm,
+                    'tp_target_usdt':  self.ae_tp_calm,
+                    'range_1h_pct':    r1h}
+        if r1h < self.ae_tier_normal_max:
+            return {'strategy':'NORMAL',
+                    'buy1_offset_pct': self.ae_buy1_normal,
+                    'buy2_offset_pct': self.ae_buy2_normal,
+                    'tp_target_usdt':  self.ae_tp_normal,
+                    'range_1h_pct':    r1h}
+        if r1h < self.ae_tier_volatile_max:
+            return {'strategy':'VOLATILE',
+                    'buy1_offset_pct': self.ae_buy1_volatile,
+                    'buy2_offset_pct': self.ae_buy2_volatile,
+                    'tp_target_usdt':  self.ae_tp_volatile,
+                    'range_1h_pct':    r1h}
+        return {'strategy':'X_VOLATILE',
+                'buy1_offset_pct': self.ae_buy1_xvolatile,
+                'buy2_offset_pct': self.ae_buy2_xvolatile,
+                'tp_target_usdt':  self.ae_tp_xvolatile,
+                'range_1h_pct':    r1h}
+
+    def _effective_tp_pct(self, state=None) -> float:
+        """Same semantics as Fast Scalper. iter 43: state-aware dynamic TP."""
+        if state is not None and getattr(state, 'dyn_tp_target_usdt', 0) > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                state.dyn_tp_target_usdt,
+                self.ladder_fee_rate_per_side,
+            )
         if self.ladder_target_net_usdt > 0:
             return ladder.required_tp_pct_for_net_profit(
                 self.ladder_buy1_size,
@@ -1525,7 +1671,7 @@ class VirtualScalpExecutor:
     def _ladder_place_tp_live(self, state, qty_total, f, tick):
         """Place a LIMIT SELL at avg × (1 + tp_pct) — real Binance."""
         avg = state.weighted_avg()
-        tp_p = ladder.tp_price(avg, self._effective_tp_pct(), tick)
+        tp_p = ladder.tp_price(avg, self._effective_tp_pct(state), tick)  # iter 43
         ccxt_sym = self._to_ccxt_symbol(state.symbol)
         try:
             placed = self.client.create_limit_sell_order(ccxt_sym, qty_total, tp_p)
