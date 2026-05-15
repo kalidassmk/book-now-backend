@@ -298,6 +298,18 @@ class MultiSymbolScalper:
         self.vr_big_crash_pct = 15.0
         self.vr_lookback_days = 5
 
+        # ── Market Stress Exit (iter 46, 2026-05-15) ────────────────────
+        # Earlier mid-trade exit than iter39's 2.5% catastrophic when
+        # broader market signals confirm a downward drift. Targets the
+        # LINK pattern (BTC-led drop with volume capitulation).
+        self.ms_enabled = True
+        self.ms_min_hold_min = 30
+        self.ms_min_drop_pct = 0.5
+        self.ms_btc_weakness_pct = 0.5
+        self.ms_btc_lookback_min = 30
+        self.ms_vol_spike_mult = 5.0
+        self.ms_red_share_threshold = 0.7
+
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
         # it. The retrace we were averaging-down for never came, and
@@ -594,6 +606,11 @@ class MultiSymbolScalper:
         # iter 45 — Volatility Regime Filter
         "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
         "volRegimeBigCrashPct", "volRegimeLookbackDays",
+        # iter 46 — Market Stress Exit
+        "marketStressExitEnabled", "marketStressMinHoldMin",
+        "marketStressMinDropPct", "marketStressBtcWeaknessPct",
+        "marketStressBtcLookbackMin", "marketStressVolSpikeMult",
+        "marketStressRedShareThreshold",
         "metricsEnabled",
     )
 
@@ -743,6 +760,14 @@ class MultiSymbolScalper:
         self.vr_max_daily_range_pct = float(cfg["volRegimeMaxDailyRangePct"])
         self.vr_big_crash_pct = float(cfg["volRegimeBigCrashPct"])
         self.vr_lookback_days = int(cfg["volRegimeLookbackDays"])
+        # iter 46 — Market Stress Exit
+        self.ms_enabled = bool(cfg["marketStressExitEnabled"])
+        self.ms_min_hold_min = int(cfg["marketStressMinHoldMin"])
+        self.ms_min_drop_pct = float(cfg["marketStressMinDropPct"])
+        self.ms_btc_weakness_pct = float(cfg["marketStressBtcWeaknessPct"])
+        self.ms_btc_lookback_min = int(cfg["marketStressBtcLookbackMin"])
+        self.ms_vol_spike_mult = float(cfg["marketStressVolSpikeMult"])
+        self.ms_red_share_threshold = float(cfg["marketStressRedShareThreshold"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -2192,6 +2217,87 @@ class MultiSymbolScalper:
             except Exception as exc:
                 log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
 
+    def _check_market_stress_exit(self, state, current_price: float, avg: float,
+                                   held_min: float, drop_pct: float):
+        """iter 46 (2026-05-15) — Market Stress Exit.
+
+        Fires BEFORE iter39 catastrophic (2.5%) when broader market
+        signals confirm a downward drift. Built from the LINK/USDT
+        2026-05-15 deep trace: at minute 130 LINK was -1.11%, BTC
+        was -0.74%, and 1m volume spiked to 17× pre-signal baseline.
+        iter39 didn't fire until minute 178 at -2.5% — we ignored 48
+        minutes of clear warning.
+
+        Three triggers (any one fires; held≥30min AND drop≥0.5% required):
+          1. BTC weakness:    BTC down ≥ ms_btc_weakness_pct in last
+                              ms_btc_lookback_min minutes
+          2. Vol capitulation: 1m volume > ms_vol_spike_mult × baseline
+                              AND that candle is red
+          3. Red velocity:    ≥ ms_red_share_threshold of last 10
+                              candles are red
+
+        Returns (True, reason) when exit fires. The caller sells at
+        market — actual loss will be drop_pct + slippage.
+        """
+        if not self.ms_enabled:
+            return False, ""
+        if held_min < self.ms_min_hold_min:
+            return False, ""
+        if drop_pct < self.ms_min_drop_pct:
+            return False, ""
+
+        # Trigger 1: BTC weakness over last ms_btc_lookback_min
+        try:
+            if self.klines_cache is not None and self.klines_cache.has("BTCUSDT", "1m"):
+                # Slightly more than lookback so we have N candles to compare
+                btc_df = self.klines_cache.get_klines("BTCUSDT", "1m",
+                                                      self.ms_btc_lookback_min + 1)
+                if btc_df is not None and not btc_df.empty and len(btc_df) >= 2:
+                    btc_now = float(btc_df.iloc[-1]["close"])
+                    btc_ago = float(btc_df.iloc[0]["close"])
+                    if btc_ago > 0:
+                        btc_chg = (btc_now / btc_ago - 1) * 100
+                        if btc_chg <= -self.ms_btc_weakness_pct:
+                            return True, (f"market_stress:btc_weakness "
+                                          f"BTC={btc_chg:+.2f}% in {self.ms_btc_lookback_min}m "
+                                          f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+        except Exception:
+            pass
+
+        # Triggers 2 + 3 share a klines fetch
+        try:
+            if self.klines_cache is not None and self.klines_cache.has(state.symbol, "1m"):
+                df = self.klines_cache.get_klines(state.symbol, "1m", 10)
+                if df is not None and not df.empty:
+                    rows = df.to_dict("records")
+                    baseline = state.pre_vol_baseline_usdt or 0.0
+
+                    # Trigger 2: volume capitulation on a red candle
+                    if rows and baseline > 0:
+                        last = rows[-1]
+                        last_vol_usdt = float(last["volume"]) * float(last["close"])
+                        spike_ratio = last_vol_usdt / baseline
+                        is_red = float(last["close"]) < float(last["open"])
+                        if spike_ratio >= self.ms_vol_spike_mult and is_red:
+                            return True, (f"market_stress:vol_capitulation "
+                                          f"vol={spike_ratio:.1f}× baseline RED "
+                                          f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+
+                    # Trigger 3: sustained red velocity
+                    if len(rows) >= 10:
+                        recent = rows[-10:]
+                        red_count = sum(1 for r in recent
+                                        if float(r["close"]) < float(r["open"]))
+                        red_share = red_count / 10
+                        if red_share >= self.ms_red_share_threshold:
+                            return True, (f"market_stress:red_velocity "
+                                          f"red_share={red_share*100:.0f}% "
+                                          f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+        except Exception:
+            pass
+
+        return False, ""
+
     def _check_active2_monitor(self, state, current_price: float, avg: float,
                                 drop_pct: float):
         """Iter 41 (2026-05-15) — Post-Buy-2 Careful Monitor.
@@ -2512,6 +2618,20 @@ class MultiSymbolScalper:
         )
         if a2_exit:
             force_reason = a2_reason
+
+        # Path -0.5 (iter 46, 2026-05-15): MARKET STRESS EXIT — earlier
+        # than iter39 catastrophic. Fires when held≥30min AND drop≥0.5%
+        # AND one of: BTC weakness, volume capitulation, or sustained
+        # red velocity. Targets the LINK pattern where iter39 sat too
+        # long while broader market gave clear sell signals.
+        if force_reason is None:
+            held_min_calc = ((now_ms - (state.buy_1.fill_ts if state.buy_1 else 0)) / 60_000.0
+                              if state.buy_1 and state.buy_1.fill_ts else 0.0)
+            ms_exit, ms_reason = self._check_market_stress_exit(
+                state, current_price, avg, held_min_calc, drop_pct_calc,
+            )
+            if ms_exit:
+                force_reason = ms_reason
 
         # Path 0-A (iter 39, 2026-05-15): LIQUIDITY-DEATH adaptive exit.
         # Smarter than iter37's fixed-pct hard stop. Combines drop %

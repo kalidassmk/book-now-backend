@@ -188,6 +188,18 @@ class VirtualScalpExecutor:
         self.vr_max_daily_range_pct = 20.0
         self.vr_big_crash_pct = 15.0
         self.vr_lookback_days = 5
+
+        # ── iter 46: Market Stress Exit ─────────────────────────────────
+        self.ms_enabled = True
+        self.ms_min_hold_min = 30
+        self.ms_min_drop_pct = 0.5
+        self.ms_btc_weakness_pct = 0.5
+        self.ms_btc_lookback_min = 30
+        self.ms_vol_spike_mult = 5.0
+        self.ms_red_share_threshold = 0.7
+        # BTC kline cache (30s TTL — shared across all symbols)
+        self._btc_cache = {"ts": 0, "candles": None}
+        self._btc_cache_ttl_sec = 30
         # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
         self._ld_kline_cache: dict = {}
         self._ld_kline_ttl_sec = 30
@@ -280,6 +292,11 @@ class VirtualScalpExecutor:
         # iter 45 — Volatility Regime Filter
         "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
         "volRegimeBigCrashPct", "volRegimeLookbackDays",
+        # iter 46 — Market Stress Exit
+        "marketStressExitEnabled", "marketStressMinHoldMin",
+        "marketStressMinDropPct", "marketStressBtcWeaknessPct",
+        "marketStressBtcLookbackMin", "marketStressVolSpikeMult",
+        "marketStressRedShareThreshold",
         "metricsEnabled",
     )
 
@@ -345,6 +362,10 @@ class VirtualScalpExecutor:
             "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
             "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
             "volRegimeBigCrashPct", "volRegimeLookbackDays",
+            "marketStressExitEnabled", "marketStressMinHoldMin",
+            "marketStressMinDropPct", "marketStressBtcWeaknessPct",
+            "marketStressBtcLookbackMin", "marketStressVolSpikeMult",
+            "marketStressRedShareThreshold",
         }
         missing = [k for k in self._REQUIRED_CONFIG_KEYS
                    if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
@@ -409,6 +430,13 @@ class VirtualScalpExecutor:
                     "volRegimeMaxDailyRangePct": 20.0,
                     "volRegimeBigCrashPct": 15.0,
                     "volRegimeLookbackDays": 5,
+                    "marketStressExitEnabled": True,
+                    "marketStressMinHoldMin": 30,
+                    "marketStressMinDropPct": 0.5,
+                    "marketStressBtcWeaknessPct": 0.5,
+                    "marketStressBtcLookbackMin": 30,
+                    "marketStressVolSpikeMult": 5.0,
+                    "marketStressRedShareThreshold": 0.7,
                 }[k]
 
         # Strict population — direct key access, no .get(default).
@@ -505,6 +533,14 @@ class VirtualScalpExecutor:
         self.vr_max_daily_range_pct = float(cfg["volRegimeMaxDailyRangePct"])
         self.vr_big_crash_pct = float(cfg["volRegimeBigCrashPct"])
         self.vr_lookback_days = int(cfg["volRegimeLookbackDays"])
+        # iter 46 — Market Stress Exit
+        self.ms_enabled = bool(cfg["marketStressExitEnabled"])
+        self.ms_min_hold_min = int(cfg["marketStressMinHoldMin"])
+        self.ms_min_drop_pct = float(cfg["marketStressMinDropPct"])
+        self.ms_btc_weakness_pct = float(cfg["marketStressBtcWeaknessPct"])
+        self.ms_btc_lookback_min = int(cfg["marketStressBtcLookbackMin"])
+        self.ms_vol_spike_mult = float(cfg["marketStressVolSpikeMult"])
+        self.ms_red_share_threshold = float(cfg["marketStressRedShareThreshold"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -1043,6 +1079,84 @@ class VirtualScalpExecutor:
         self._ld_kline_cache[symbol] = {"ts": now, "candles": candles}
         return candles
 
+    def _get_btc_recent_1m(self):
+        """iter 46 (Virtual): throttled BTC fetch (30s TTL). Returns a
+        list of OHLCV rows or None."""
+        if self.client is None:
+            return None
+        now = time.time()
+        if (self._btc_cache.get("candles")
+                and now - self._btc_cache.get("ts", 0) < self._btc_cache_ttl_sec):
+            return self._btc_cache["candles"]
+        try:
+            candles = self.client.fetch_ohlcv("BTC/USDT", "1m",
+                                              limit=self.ms_btc_lookback_min + 1)
+        except Exception:
+            return None
+        if candles:
+            self._btc_cache = {"ts": now, "candles": candles}
+        return candles
+
+    def _check_market_stress_exit(self, state, current_price: float, avg: float,
+                                   held_min: float, drop_pct: float):
+        """iter 46 (Virtual parity) — Market Stress Exit.
+
+        Same algorithm as Fast Scalper. Sync version uses
+        _get_btc_recent_1m (30s cached) and _ld_get_recent_1m_klines
+        (also 30s cached) so this doesn't spam the REST endpoint."""
+        if not self.ms_enabled:
+            return False, ""
+        if held_min < self.ms_min_hold_min:
+            return False, ""
+        if drop_pct < self.ms_min_drop_pct:
+            return False, ""
+
+        # Trigger 1: BTC weakness
+        btc = self._get_btc_recent_1m()
+        if btc and len(btc) >= 2:
+            try:
+                btc_now = float(btc[-1][4])
+                btc_ago = float(btc[0][4])
+                if btc_ago > 0:
+                    btc_chg = (btc_now / btc_ago - 1) * 100
+                    if btc_chg <= -self.ms_btc_weakness_pct:
+                        return True, (f"market_stress:btc_weakness "
+                                      f"BTC={btc_chg:+.2f}% in {self.ms_btc_lookback_min}m "
+                                      f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        # Triggers 2 + 3: symbol klines (cached)
+        candles = self._ld_get_recent_1m_klines(state.symbol) or []
+        baseline = state.pre_vol_baseline_usdt or 0.0
+        if candles and baseline > 0:
+            try:
+                last = candles[-1]
+                last_vol_usdt = float(last[5]) * float(last[4])
+                spike_ratio = last_vol_usdt / baseline
+                is_red = float(last[4]) < float(last[1])
+                if spike_ratio >= self.ms_vol_spike_mult and is_red:
+                    return True, (f"market_stress:vol_capitulation "
+                                  f"vol={spike_ratio:.1f}× baseline RED "
+                                  f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        if candles and len(candles) >= 10:
+            try:
+                recent = candles[-10:]
+                red_count = sum(1 for r in recent
+                                if float(r[4]) < float(r[1]))
+                red_share = red_count / 10
+                if red_share >= self.ms_red_share_threshold:
+                    return True, (f"market_stress:red_velocity "
+                                  f"red_share={red_share*100:.0f}% "
+                                  f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        return False, ""
+
     def _check_active2_monitor(self, state, current_price: float, avg: float,
                                 drop_pct: float):
         """iter 41 (Virtual parity): Post-Buy-2 Careful Monitor.
@@ -1244,6 +1358,14 @@ class VirtualScalpExecutor:
         )
         if a2_exit:
             force_reason = a2_reason
+
+        # Path -0.5 (iter 46): MARKET STRESS EXIT — earlier than iter39.
+        if force_reason is None:
+            ms_exit, ms_reason = self._check_market_stress_exit(
+                state, current_price, avg, held_min, drop_pct,
+            )
+            if ms_exit:
+                force_reason = ms_reason
 
         # Path 0-A: liquidity-death smart exit
         if force_reason is None:

@@ -446,7 +446,41 @@ class TradingConfig:
     volRegimeFilterEnabled: bool = True
     volRegimeMaxDailyRangePct: float = 20.0      # any 5d day range > this
     volRegimeBigCrashPct: float = 15.0           # any 5d day close ≤ open × (1−this)
-    volRegimeLookbackDays: int = 5               # window size  # only when drop in [0, this]
+    volRegimeLookbackDays: int = 5               # window size
+
+    # ── Market Stress Exit (iter 46, 2026-05-15) ─────────────────────────
+    # Mid-trade exit BEFORE iter39's 2.5% catastrophic when broader
+    # market signals confirm the drop won't reverse. Built from the
+    # LINK/USDT 2026-05-15 deep trace:
+    #
+    #   Time   LINK_drop   BTC_drop   Volume signal
+    #   ────   ─────────   ────────   ─────────────
+    #   min 75   -0.43%    -0.42%     normal
+    #   min 105  -0.62%    -0.38%     normal (never_recovered=true)
+    #   min 130  -1.11%    -0.74%     vol $259K (17× baseline!)  ← exit here
+    #   min 170  -2.08%    -1.99%     $51K
+    #   min 188  -3.33%    -2.52%     iter39 would fire ~min 178 at -2.5%
+    #
+    # LINK followed BTC almost step-for-step. At min 130 BTC was down
+    # 0.74% AND a massive volume spike (17× baseline) signaled clear
+    # distribution. iter39 sat waiting for catastrophic (-2.5%) which
+    # didn't fire until min 178 — we ignored 48 min of warning.
+    #
+    # Three triggers (any one fires when held ≥30min AND drop ≥0.5%):
+    #   1. BTC weakness:    BTC down ≥ marketStressBtcWeaknessPct% in
+    #                       last 30 min  (default 0.5%)
+    #   2. Vol capitulation: 1m volume > marketStressVolSpikeMult ×
+    #                       pre-signal-baseline AND candle is red
+    #                       (default 5×)
+    #   3. Red velocity:    ≥ marketStressRedShareThreshold of last 10
+    #                       candles are red  (default 70%)
+    marketStressExitEnabled: bool = True
+    marketStressMinHoldMin: int = 30
+    marketStressMinDropPct: float = 0.5
+    marketStressBtcWeaknessPct: float = 0.5
+    marketStressBtcLookbackMin: int = 30
+    marketStressVolSpikeMult: float = 5.0
+    marketStressRedShareThreshold: float = 0.7  # only when drop in [0, this]
 
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the
