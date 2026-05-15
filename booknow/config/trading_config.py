@@ -392,7 +392,32 @@ class TradingConfig:
     adaptiveTpTargetCalm: float = 0.15
     adaptiveTpTargetNormal: float = 0.20
     adaptiveTpTargetVolatile: float = 0.30
-    adaptiveTpTargetXVolatile: float = 0.50  # only when drop in [0, this]
+    adaptiveTpTargetXVolatile: float = 0.50
+
+    # ── Macro-Top Exhaustion Filter (iter 44, 2026-05-15) ────────────────
+    # Catches the PENDLE/USDT pattern from 2026-05-14: a coin that rallied
+    # massively (+84% in 30 days), is currently near the top of that
+    # rally (92% of 30d high), and is showing distribution (4 red days
+    # in last 7). The existing `postPumpFilterEnabled` requires the coin
+    # to ALREADY have crashed off-peak — but the most damaging entries
+    # are RIGHT AT the top BEFORE the crash.
+    #
+    # Three conditions must ALL be true to block:
+    #   1. 30-day return  >= macroTopMinReturnPct   (default 50%)
+    #   2. Buy price      >= 30d_high × (macroTopWithinHighPct/100)
+    #                         (within X% of 30d high, default 90% → within 10%)
+    #   3. Red daily closes in last 7  >= macroTopMinRedDaysIn7  (default 3)
+    #
+    # Validated against 8 historical trades:
+    #   PENDLE: 30d +84%, 92% of high, 4/7 red → BLOCK ✓ (the bad one)
+    #   MOVR:   30d +116%, 59% of high → not within 90% → PASS ✓
+    #   TIA:    30d +40% → under 50% → PASS ✓
+    #   IMX:    30d +26% → under 50% → PASS ✓
+    #   DOGE/FLOKI/NXPC/MLN: all PASS ✓
+    macroTopFilterEnabled: bool = True
+    macroTopMinReturnPct: float = 50.0       # 30-day return >= this
+    macroTopWithinHighPct: float = 90.0      # buy_price / 30d_high >= this
+    macroTopMinRedDaysIn7: int = 3           # need this many red days in last 7  # only when drop in [0, this]
 
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the

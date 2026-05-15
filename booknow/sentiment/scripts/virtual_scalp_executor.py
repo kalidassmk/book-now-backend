@@ -176,6 +176,12 @@ class VirtualScalpExecutor:
         self.ae_tp_normal = 0.20
         self.ae_tp_volatile = 0.30
         self.ae_tp_xvolatile = 0.50
+
+        # ── iter 44: Macro-Top Exhaustion Filter ────────────────────────
+        self.mt_enabled = True
+        self.mt_min_return_pct = 50.0
+        self.mt_within_high_pct = 90.0
+        self.mt_min_red_days_in_7 = 3
         # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
         self._ld_kline_cache: dict = {}
         self._ld_kline_ttl_sec = 30
@@ -262,6 +268,9 @@ class VirtualScalpExecutor:
         "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
         "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
         "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
+        # iter 44 — Macro-Top Exhaustion Filter
+        "macroTopFilterEnabled", "macroTopMinReturnPct",
+        "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
         "metricsEnabled",
     )
 
@@ -323,6 +332,8 @@ class VirtualScalpExecutor:
             "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
             "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
             "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
+            "macroTopFilterEnabled", "macroTopMinReturnPct",
+            "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
         }
         missing = [k for k in self._REQUIRED_CONFIG_KEYS
                    if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
@@ -379,6 +390,10 @@ class VirtualScalpExecutor:
                     "adaptiveTpTargetNormal": 0.20,
                     "adaptiveTpTargetVolatile": 0.30,
                     "adaptiveTpTargetXVolatile": 0.50,
+                    "macroTopFilterEnabled": True,
+                    "macroTopMinReturnPct": 50.0,
+                    "macroTopWithinHighPct": 90.0,
+                    "macroTopMinRedDaysIn7": 3,
                 }[k]
 
         # Strict population — direct key access, no .get(default).
@@ -465,6 +480,11 @@ class VirtualScalpExecutor:
         self.ae_tp_normal = float(cfg["adaptiveTpTargetNormal"])
         self.ae_tp_volatile = float(cfg["adaptiveTpTargetVolatile"])
         self.ae_tp_xvolatile = float(cfg["adaptiveTpTargetXVolatile"])
+        # iter 44 — Macro-Top Exhaustion Filter
+        self.mt_enabled = bool(cfg["macroTopFilterEnabled"])
+        self.mt_min_return_pct = float(cfg["macroTopMinReturnPct"])
+        self.mt_within_high_pct = float(cfg["macroTopWithinHighPct"])
+        self.mt_min_red_days_in_7 = int(cfg["macroTopMinRedDaysIn7"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -1865,6 +1885,54 @@ class VirtualScalpExecutor:
             self._d1_cache[symbol] = {"_ts": now, "data": data}
         return data
 
+    def _passes_macro_top_filter(self, symbol):
+        """iter 44 (Virtual parity) — Macro-Top Exhaustion Filter.
+
+        Mirrors the Fast Scalper algorithm. Returns (True, None) when
+        the buy is allowed; (False, features) when it must be skipped."""
+        if not self.mt_enabled:
+            return True, None
+        candles = self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 8:
+            return True, None
+        candles = candles[-30:]
+        try:
+            closes = [float(k[4]) for k in candles]
+            opens  = [float(k[1]) for k in candles]
+            highs  = [float(k[2]) for k in candles]
+        except Exception:
+            return True, None
+        if closes[0] <= 0:
+            return True, None
+        last_close = closes[-1]
+        h30 = max(highs)
+        ret30 = (last_close / closes[0] - 1) * 100
+        within_hi = (last_close / h30) * 100 if h30 > 0 else 0
+        red7 = sum(1 for o, cl in zip(opens[-7:], closes[-7:]) if cl < o)
+        block = (ret30 >= self.mt_min_return_pct
+                 and within_hi >= self.mt_within_high_pct
+                 and red7 >= self.mt_min_red_days_in_7)
+        if not block:
+            return True, None
+        reason = (f"macro-top exhaustion: 30d_return={ret30:+.1f}% "
+                  f"(>= {self.mt_min_return_pct}%) AND "
+                  f"within_30d_high={within_hi:.1f}% "
+                  f"(>= {self.mt_within_high_pct}%) AND "
+                  f"red_days_in_7={red7} (>= {self.mt_min_red_days_in_7})")
+        feats = {"filter": "macro_top",
+                 "30d_return_pct": round(ret30, 2),
+                 "30d_high": h30,
+                 "within_30d_high_pct": round(within_hi, 2),
+                 "red_days_in_7": red7,
+                 "last_close": last_close}
+        print(f"🪦 [{symbol}] virtual skip macro_top: {reason}")
+        if self.metrics is not None:
+            try:
+                self.metrics.signal_skipped(symbol, "macro_top", reason, feats)
+            except Exception:
+                pass
+        return False, feats
+
     def _passes_post_pump_filter(self, symbol):
         """Daily-timeframe post-pump-bleed filter (mirrors Fast Scalper).
 
@@ -2030,14 +2098,13 @@ class VirtualScalpExecutor:
                                         decision="pass" if ok else "skipped",
                                     )
                                 if ok:
-                                    # iter 38 (Virtual parity): near-top pump
-                                    # filter. Blocks buying within 2% of the
-                                    # 24h high after a ≥5% 24h pump (QNT
-                                    # pattern). Reuses features dict.
+                                    # iter 38 (Virtual parity): near-top pump filter
                                     if not self._passes_near_top_pump_filter(symbol, features):
-                                        pass  # already logged + counted
+                                        pass
+                                    # iter 44 (Virtual parity): macro-top exhaustion
+                                    elif not self._passes_macro_top_filter(symbol)[0]:
+                                        pass
                                     else:
-                                        # Daily-timeframe post-pump gate (2026-05-12).
                                         pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
                                         if pp_ok:
                                             self._paper_ladder_start(symbol, curr_price, features=features)
@@ -2056,8 +2123,9 @@ class VirtualScalpExecutor:
                                 # iter 38 (Virtual parity)
                                 if not self._passes_near_top_pump_filter(symbol, features):
                                     pass
+                                elif not self._passes_macro_top_filter(symbol)[0]:
+                                    pass  # iter 44
                                 else:
-                                    # Daily-timeframe post-pump gate (2026-05-12).
                                     pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
                                     if pp_ok:
                                         self.place_limit_order(symbol, curr_price, features=features)

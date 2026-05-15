@@ -279,6 +279,16 @@ class MultiSymbolScalper:
         self.ae_tp_volatile = 0.30
         self.ae_tp_xvolatile = 0.50
 
+        # ── Macro-Top Exhaustion Filter (iter 44, 2026-05-15) ───────────
+        # Catches PENDLE-style top-of-pump entries that the existing
+        # post-pump-bleed filter misses (because the coin hasn't crashed
+        # yet, just showing distribution). All 3 must fire to SKIP:
+        #   30d return >= X% AND within Y% of 30d high AND red_days >= Z
+        self.mt_enabled = True
+        self.mt_min_return_pct = 50.0
+        self.mt_within_high_pct = 90.0
+        self.mt_min_red_days_in_7 = 3
+
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
         # it. The retrace we were averaging-down for never came, and
@@ -569,6 +579,9 @@ class MultiSymbolScalper:
         "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
         "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
         "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
+        # iter 44 — Macro-Top Exhaustion Filter
+        "macroTopFilterEnabled", "macroTopMinReturnPct",
+        "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
         "metricsEnabled",
     )
 
@@ -708,6 +721,11 @@ class MultiSymbolScalper:
         self.ae_tp_normal = float(cfg["adaptiveTpTargetNormal"])
         self.ae_tp_volatile = float(cfg["adaptiveTpTargetVolatile"])
         self.ae_tp_xvolatile = float(cfg["adaptiveTpTargetXVolatile"])
+        # iter 44 — Macro-Top Exhaustion Filter
+        self.mt_enabled = bool(cfg["macroTopFilterEnabled"])
+        self.mt_min_return_pct = float(cfg["macroTopMinReturnPct"])
+        self.mt_within_high_pct = float(cfg["macroTopWithinHighPct"])
+        self.mt_min_red_days_in_7 = int(cfg["macroTopMinRedDaysIn7"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -865,6 +883,72 @@ class MultiSymbolScalper:
                     pass
             return False
         return True
+
+    async def _passes_macro_top_filter(self, symbol: str):
+        """iter 44 (2026-05-15) — Macro-Top Exhaustion Filter.
+
+        Catches the PENDLE/USDT 2026-05-14 pattern: a coin that rallied
+        massively (+84% in 30d) is currently near the top of that rally
+        (within ~7% of 30d high), and is showing 4 red days in last 7
+        (distribution). The existing post-pump-bleed filter misses this
+        because it requires the coin to ALREADY have crashed off-peak.
+
+        Reuses the daily-kline cache (10 min TTL). All 3 must fire:
+          • 30d_return  >= mt_min_return_pct
+          • buy_price / 30d_high * 100  >= mt_within_high_pct
+          • red_days_in_last_7  >= mt_min_red_days_in_7
+
+        Returns (True, None) when the buy is allowed.
+        Returns (False, features_dict) when the buy must be skipped.
+        On any kline-fetch error returns (True, None) — fail open.
+        """
+        if not self.mt_enabled:
+            return True, None
+        candles = await self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 8:
+            return True, None  # not enough data → fail open
+        # Use last 30 candles (excluding any partial today candle)
+        candles = candles[-30:]
+        try:
+            closes = [float(k[4]) for k in candles]
+            opens  = [float(k[1]) for k in candles]
+            highs  = [float(k[2]) for k in candles]
+        except Exception:
+            return True, None
+        if closes[0] <= 0:
+            return True, None
+        last_close = closes[-1]
+        h30 = max(highs)
+        ret30 = (last_close / closes[0] - 1) * 100
+        within_hi = (last_close / h30) * 100 if h30 > 0 else 0
+        red7 = sum(1 for o, cl in zip(opens[-7:], closes[-7:]) if cl < o)
+
+        block = (ret30 >= self.mt_min_return_pct
+                 and within_hi >= self.mt_within_high_pct
+                 and red7 >= self.mt_min_red_days_in_7)
+        if not block:
+            return True, None
+
+        reason = (f"macro-top exhaustion: 30d_return={ret30:+.1f}% "
+                  f"(>= {self.mt_min_return_pct}%) AND "
+                  f"within_30d_high={within_hi:.1f}% "
+                  f"(>= {self.mt_within_high_pct}%) AND "
+                  f"red_days_in_7={red7} (>= {self.mt_min_red_days_in_7})")
+        feats = {
+            "filter": "macro_top",
+            "30d_return_pct": round(ret30, 2),
+            "30d_high": h30,
+            "within_30d_high_pct": round(within_hi, 2),
+            "red_days_in_7": red7,
+            "last_close": last_close,
+        }
+        log.info(f"🪦 [{symbol}] skipped by macro_top: {reason}")
+        if self.metrics is not None:
+            try:
+                self.metrics.signal_skipped(symbol, "macro_top", reason, feats)
+            except Exception:
+                pass
+        return False, feats
 
     async def _fetch_d1_klines(self, symbol: str):
         """Cached fetch of daily klines. One Binance REST call per symbol
@@ -1223,6 +1307,14 @@ class MultiSymbolScalper:
             # where 24h change was only +7.46% (under maxChange24hPct=12)
             # but we entered 0.82% below the 24h peak.
             if not self._passes_near_top_pump_filter(symbol, features):
+                return
+            # Iter 44 (2026-05-15): macro-top exhaustion. Catches
+            # PENDLE-style entries — coin rallied massively (>50% in
+            # 30d), still near top of rally (within 10% of 30d high),
+            # showing distribution (4+ red days in last 7). Fires
+            # BEFORE post-pump-bleed which requires off-peak ≥10%.
+            mt_ok, _ = await self._passes_macro_top_filter(symbol)
+            if not mt_ok:
                 return
             # Daily-timeframe post-pump-bleed gate (2026-05-12). The 24h/1h
             # filters can't see a multi-day downtrend — e.g. JTO pumped a
