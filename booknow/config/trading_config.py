@@ -302,6 +302,37 @@ class TradingConfig:
     pendingPumpThresholdPct: float = 0.5      # peak must be >= +0.5% above limit
     pendingDumpFromPeakPct: float = 0.5       # current must be >= 0.5% below peak
     pendingMinAgeSeconds: int = 60            # wait at least 60s before allowing cancel
+
+    # ── Near-top pump filter (iter 38, 2026-05-15) ───────────────────────
+    # Pre-buy gate that catches the "bought near the top of a 24h pump"
+    # pattern that slipped past every other filter for QNT/USDT on
+    # 2026-05-15:
+    #   • 24h change      = +7.46%   (under fallingKnife maxChange24hPct=12)
+    #   • from 24h high   = -0.82%   (we bought 0.82% below the day's peak)
+    #   • 24h range       = $72.51 → $79.34  (≈ 9.4% intraday)
+    #   • Bought at       = $78.17 → +7.8% above 24h low
+    #
+    # The trade entered RIGHT at the top of a multi-day pump and lost
+    # money. The existing filters missed it because:
+    #   - fallingKnife: +7.46% under the 12% ceiling
+    #   - postPumpBleed: looks for +30% pumps in the lookback window
+    #   - overbought60mPct: only +0.08% in the last 60min
+    #
+    # This filter is intentionally narrow — it ONLY fires when BOTH
+    # conditions are true:
+    #   1. 24h is up materially (≥ nearTopPumpMin24hChangePct)
+    #   2. Current price is within nearTopPumpMaxFromHighPct of the
+    #      24h high (i.e. no healthy pullback yet)
+    #
+    # Worked examples:
+    #   QNT 2026-05-15: +7.46% / -0.82% from high → BOTH gates fire → SKIP ✓
+    #   Coin +8% / -4% from high → first gate fires, second doesn't
+    #     (-4% is a healthy pullback) → ALLOW
+    #   Coin +2% / -0.5% from high → first gate doesn't fire → ALLOW
+    #   BTC +1.5% / 0% from high → first gate doesn't fire → ALLOW
+    nearTopPumpFilterEnabled: bool = True
+    nearTopPumpMin24hChangePct: float = 5.0    # only when 24h pump >= 5%
+    nearTopPumpMaxFromHighPct: float = 2.0     # only when within 2% of 24h high
     # 2026-05-11 iter 3: True (was False). Operator wants instant Buy 1
     # so Buy 2/3 limits go on the book *simultaneously* — no waiting for
     # an aggressive limit to fill before placing the averaging-down legs.

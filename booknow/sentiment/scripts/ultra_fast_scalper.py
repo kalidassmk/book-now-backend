@@ -147,6 +147,18 @@ class MultiSymbolScalper:
         self._d1_cache: dict = {}             # symbol -> {data, ts}
         self._d1_cache_ttl_sec = 600          # 10 min — daily candle, fine
 
+        # ── Near-top pump filter (iter 38, 2026-05-15) ───────────────────
+        # Catches buys placed within X% of the 24h high after a pump.
+        # Defaults: only fires when 24h up ≥ 5% AND price within 2% of
+        # 24h high. Both gates required — a +8% / -4% retrace setup is
+        # still allowed (healthy pullback). Forensic case: QNT/USDT
+        # 2026-05-15 +7.46% / -0.82% from high → would have been
+        # blocked. No extra Binance calls — reuses falling-knife
+        # features dict already computed at this point in the pipeline.
+        self.ntp_enabled = True
+        self.ntp_min_24h_change_pct = 5.0
+        self.ntp_max_from_high_pct = 2.0
+
         # Fast-drop-without-volume filter (Pattern C). Watches price +
         # volume during the limit-buy wait window and cancels the order
         # if the coin is bleeding without capitulation volume.
@@ -475,6 +487,9 @@ class MultiSymbolScalper:
         "ladderTrailingTpEnabled", "ladderTrailingTpPct",
         "pendingPumpDumpCancelEnabled", "pendingPumpThresholdPct",
         "pendingDumpFromPeakPct", "pendingMinAgeSeconds",
+        # iter 38 (2026-05-15)
+        "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
+        "nearTopPumpMaxFromHighPct",
         "metricsEnabled",
     )
 
@@ -584,6 +599,11 @@ class MultiSymbolScalper:
         self.pending_dump_from_peak_pct = float(cfg["pendingDumpFromPeakPct"])
         self.pending_min_age_seconds = int(cfg["pendingMinAgeSeconds"])
 
+        # iter 38 (2026-05-15): near-top pump filter
+        self.ntp_enabled = bool(cfg["nearTopPumpFilterEnabled"])
+        self.ntp_min_24h_change_pct = float(cfg["nearTopPumpMin24hChangePct"])
+        self.ntp_max_from_high_pct = float(cfg["nearTopPumpMaxFromHighPct"])
+
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
 
@@ -677,6 +697,58 @@ class MultiSymbolScalper:
         except Exception as exc:
             log.debug(f"falling_knife fetch failed for {symbol}: {exc}")
             return True, None
+
+    def _passes_near_top_pump_filter(self, symbol: str, features: dict):
+        """Iter 38 near-top pump gate. Reuses features already computed
+        by ``passes_falling_knife`` — zero extra Binance calls.
+
+        Pattern from QNT/USDT 2026-05-15 forensic:
+          • 24h change      = +7.46%   (under fallingKnife maxChange24hPct=12)
+          • from 24h high   = -0.82%   (we bought 0.82% below the day's peak)
+          • Bought at $78.17 — outcome: unrealised loss, panic-cancelled.
+
+        Logic: BOTH conditions must be true for the SKIP to fire:
+          1. ``change_24h_pct >= ntp_min_24h_change_pct``
+          2. ``from_24h_high_pct >= -ntp_max_from_high_pct``  (i.e.
+             current price is within ntp_max_from_high_pct % of the
+             24h high — no healthy retrace yet).
+
+        Returns True if the buy is allowed, False if it must be skipped.
+        On missing/None features, returns True (cannot decide → defer to
+        other gates).
+        """
+        if not self.ntp_enabled:
+            return True
+        if not features:
+            return True
+        try:
+            change_24h = float(features.get("change_24h_pct") or 0.0)
+            from_high = float(features.get("from_24h_high_pct") or 0.0)
+        except (TypeError, ValueError):
+            return True
+
+        first_gate = change_24h >= self.ntp_min_24h_change_pct
+        # from_high is typically negative (e.g. -0.82% = 0.82% below
+        # 24h peak). "Within max_from_high_pct of the peak" means
+        # from_high >= -max_from_high_pct.
+        second_gate = from_high >= -self.ntp_max_from_high_pct
+        if first_gate and second_gate:
+            reason = (
+                f"near top of 24h pump: 24h_change=+{change_24h:.2f}% "
+                f"(≥ {self.ntp_min_24h_change_pct:.1f}%) AND "
+                f"from_24h_high={from_high:.2f}% "
+                f"(within {self.ntp_max_from_high_pct:.1f}% of peak)"
+            )
+            log.info(f"🚧 [{symbol}] skipped by near_top_pump: {reason}")
+            if self.metrics is not None:
+                try:
+                    self.metrics.signal_skipped(
+                        symbol, "near_top_pump", reason, features,
+                    )
+                except Exception:
+                    pass
+            return False
+        return True
 
     async def _fetch_d1_klines(self, symbol: str):
         """Cached fetch of daily klines. One Binance REST call per symbol
@@ -1028,6 +1100,13 @@ class MultiSymbolScalper:
                     decision="pass" if ok else "skipped",
                 )
             if not ok:
+                return
+            # Iter 38 (2026-05-15): near-top pump gate. Reuses the
+            # `features` dict just produced by passes_falling_knife
+            # (no extra Binance call). Catches the QNT/USDT pattern
+            # where 24h change was only +7.46% (under maxChange24hPct=12)
+            # but we entered 0.82% below the 24h peak.
+            if not self._passes_near_top_pump_filter(symbol, features):
                 return
             # Daily-timeframe post-pump-bleed gate (2026-05-12). The 24h/1h
             # filters can't see a multi-day downtrend — e.g. JTO pumped a
