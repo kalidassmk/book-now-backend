@@ -182,6 +182,12 @@ class VirtualScalpExecutor:
         self.mt_min_return_pct = 50.0
         self.mt_within_high_pct = 90.0
         self.mt_min_red_days_in_7 = 3
+
+        # ── iter 45: Volatility Regime Filter ───────────────────────────
+        self.vr_enabled = True
+        self.vr_max_daily_range_pct = 20.0
+        self.vr_big_crash_pct = 15.0
+        self.vr_lookback_days = 5
         # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
         self._ld_kline_cache: dict = {}
         self._ld_kline_ttl_sec = 30
@@ -271,6 +277,9 @@ class VirtualScalpExecutor:
         # iter 44 — Macro-Top Exhaustion Filter
         "macroTopFilterEnabled", "macroTopMinReturnPct",
         "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
+        # iter 45 — Volatility Regime Filter
+        "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
+        "volRegimeBigCrashPct", "volRegimeLookbackDays",
         "metricsEnabled",
     )
 
@@ -334,6 +343,8 @@ class VirtualScalpExecutor:
             "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
             "macroTopFilterEnabled", "macroTopMinReturnPct",
             "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
+            "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
+            "volRegimeBigCrashPct", "volRegimeLookbackDays",
         }
         missing = [k for k in self._REQUIRED_CONFIG_KEYS
                    if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
@@ -394,6 +405,10 @@ class VirtualScalpExecutor:
                     "macroTopMinReturnPct": 50.0,
                     "macroTopWithinHighPct": 90.0,
                     "macroTopMinRedDaysIn7": 3,
+                    "volRegimeFilterEnabled": True,
+                    "volRegimeMaxDailyRangePct": 20.0,
+                    "volRegimeBigCrashPct": 15.0,
+                    "volRegimeLookbackDays": 5,
                 }[k]
 
         # Strict population — direct key access, no .get(default).
@@ -485,6 +500,11 @@ class VirtualScalpExecutor:
         self.mt_min_return_pct = float(cfg["macroTopMinReturnPct"])
         self.mt_within_high_pct = float(cfg["macroTopWithinHighPct"])
         self.mt_min_red_days_in_7 = int(cfg["macroTopMinRedDaysIn7"])
+        # iter 45 — Volatility Regime Filter
+        self.vr_enabled = bool(cfg["volRegimeFilterEnabled"])
+        self.vr_max_daily_range_pct = float(cfg["volRegimeMaxDailyRangePct"])
+        self.vr_big_crash_pct = float(cfg["volRegimeBigCrashPct"])
+        self.vr_lookback_days = int(cfg["volRegimeLookbackDays"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -1885,6 +1905,44 @@ class VirtualScalpExecutor:
             self._d1_cache[symbol] = {"_ts": now, "data": data}
         return data
 
+    def _passes_vol_regime_filter(self, symbol):
+        """iter 45 (Virtual parity) — Volatility Regime Filter.
+
+        Mirrors Fast Scalper. Returns (True, None) when allowed."""
+        if not self.vr_enabled:
+            return True, None
+        candles = self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 3:
+            return True, None
+        recent = candles[-self.vr_lookback_days:]
+        try:
+            highs = [float(k[2]) for k in recent]
+            lows  = [float(k[3]) for k in recent]
+            opens = [float(k[1]) for k in recent]
+            closes= [float(k[4]) for k in recent]
+        except Exception:
+            return True, None
+        if any(l <= 0 for l in lows) or any(o <= 0 for o in opens):
+            return True, None
+        ranges = [(h - l) / l * 100 for h, l in zip(highs, lows)]
+        max_range = max(ranges) if ranges else 0
+        daily_changes = [(c - o) / o * 100 for o, c in zip(opens, closes)]
+        worst_day = min(daily_changes) if daily_changes else 0
+        block_range = max_range > self.vr_max_daily_range_pct
+        block_crash = worst_day <= -self.vr_big_crash_pct
+        if not (block_range or block_crash):
+            return True, None
+        triggers = []
+        if block_range: triggers.append(f"max_5d_range={max_range:.1f}% > {self.vr_max_daily_range_pct}%")
+        if block_crash: triggers.append(f"worst_day={worst_day:+.1f}% <= -{self.vr_big_crash_pct}%")
+        reason = "vol regime: " + " AND ".join(triggers)
+        feats = {"filter":"vol_regime","max_5d_range_pct":round(max_range,2),"worst_5d_day_pct":round(worst_day,2)}
+        print(f"🌪️ [{symbol}] virtual skip vol_regime: {reason}")
+        if self.metrics is not None:
+            try: self.metrics.signal_skipped(symbol, "vol_regime", reason, feats)
+            except Exception: pass
+        return False, feats
+
     def _passes_macro_top_filter(self, symbol):
         """iter 44 (Virtual parity) — Macro-Top Exhaustion Filter.
 
@@ -2101,8 +2159,11 @@ class VirtualScalpExecutor:
                                     # iter 38 (Virtual parity): near-top pump filter
                                     if not self._passes_near_top_pump_filter(symbol, features):
                                         pass
-                                    # iter 44 (Virtual parity): macro-top exhaustion
+                                    # iter 44: macro-top exhaustion
                                     elif not self._passes_macro_top_filter(symbol)[0]:
+                                        pass
+                                    # iter 45: volatility regime
+                                    elif not self._passes_vol_regime_filter(symbol)[0]:
                                         pass
                                     else:
                                         pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
@@ -2125,6 +2186,8 @@ class VirtualScalpExecutor:
                                     pass
                                 elif not self._passes_macro_top_filter(symbol)[0]:
                                     pass  # iter 44
+                                elif not self._passes_vol_regime_filter(symbol)[0]:
+                                    pass  # iter 45
                                 else:
                                     pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
                                     if pp_ok:

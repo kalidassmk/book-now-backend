@@ -417,7 +417,36 @@ class TradingConfig:
     macroTopFilterEnabled: bool = True
     macroTopMinReturnPct: float = 50.0       # 30-day return >= this
     macroTopWithinHighPct: float = 90.0      # buy_price / 30d_high >= this
-    macroTopMinRedDaysIn7: int = 3           # need this many red days in last 7  # only when drop in [0, this]
+    macroTopMinRedDaysIn7: int = 3           # need this many red days in last 7
+
+    # ── Volatility Regime Filter (iter 45, 2026-05-15) ───────────────────
+    # Catches the MLN/USDT pattern: a coin recently crashed and is now
+    # in an extreme volatility regime. The deep trace showed:
+    #
+    #   2026-05-13  MLN  -28.43%  (massive crash, daily range $3.15→$2.08)
+    #   2026-05-14  MLN  +27.85%  (dead-cat bounce, range $2.17→$3.92)
+    #   2026-05-15  MLN  +9.68%   (today: range $2.79→$4.08)
+    #
+    # We bought during a small intraday rally. The chaos continued and
+    # price dropped 9.46% from our fill before partially recovering.
+    # iter39 caught it at −2.5% cat-stop but it would be better to not
+    # have entered at all.
+    #
+    # iter45 blocks when EITHER:
+    #   1. Max daily range (high-low)/low > volRegimeMaxDailyRangePct (20%)
+    #      over the last 5 days — signals violent oscillation
+    #   2. Any day in last 5 closed ≤ open × (1 - volRegimeBigCrashPct/100)
+    #      — a recent flash crash. Default 15% (the -28.43% crash easily).
+    #
+    # Validated against 11 historical trades:
+    #   MLN: 80.65% range, -28.43% worst day → BLOCK ✓
+    #   All 10 other trades pass with zero false positives:
+    #   PENDLE 16% / -5%, TIA 16% / -2%, IMX 17% / -3%, FLOKI 10% / -5%,
+    #   IOTA 9% / -7%, NXPC 13% / -6%, MOVR 17% / -6%, LINK 8% / -4%, etc.
+    volRegimeFilterEnabled: bool = True
+    volRegimeMaxDailyRangePct: float = 20.0      # any 5d day range > this
+    volRegimeBigCrashPct: float = 15.0           # any 5d day close ≤ open × (1−this)
+    volRegimeLookbackDays: int = 5               # window size  # only when drop in [0, this]
 
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the

@@ -289,6 +289,15 @@ class MultiSymbolScalper:
         self.mt_within_high_pct = 90.0
         self.mt_min_red_days_in_7 = 3
 
+        # ── Volatility Regime Filter (iter 45, 2026-05-15) ──────────────
+        # Catches the MLN pattern — recently crashed coin in extreme
+        # volatility regime. Blocks if max 5d daily range > 20% OR any
+        # day in last 5 was a ≥-15% crash.
+        self.vr_enabled = True
+        self.vr_max_daily_range_pct = 20.0
+        self.vr_big_crash_pct = 15.0
+        self.vr_lookback_days = 5
+
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
         # it. The retrace we were averaging-down for never came, and
@@ -582,6 +591,9 @@ class MultiSymbolScalper:
         # iter 44 — Macro-Top Exhaustion Filter
         "macroTopFilterEnabled", "macroTopMinReturnPct",
         "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
+        # iter 45 — Volatility Regime Filter
+        "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
+        "volRegimeBigCrashPct", "volRegimeLookbackDays",
         "metricsEnabled",
     )
 
@@ -726,6 +738,11 @@ class MultiSymbolScalper:
         self.mt_min_return_pct = float(cfg["macroTopMinReturnPct"])
         self.mt_within_high_pct = float(cfg["macroTopWithinHighPct"])
         self.mt_min_red_days_in_7 = int(cfg["macroTopMinRedDaysIn7"])
+        # iter 45 — Volatility Regime Filter
+        self.vr_enabled = bool(cfg["volRegimeFilterEnabled"])
+        self.vr_max_daily_range_pct = float(cfg["volRegimeMaxDailyRangePct"])
+        self.vr_big_crash_pct = float(cfg["volRegimeBigCrashPct"])
+        self.vr_lookback_days = int(cfg["volRegimeLookbackDays"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -946,6 +963,69 @@ class MultiSymbolScalper:
         if self.metrics is not None:
             try:
                 self.metrics.signal_skipped(symbol, "macro_top", reason, feats)
+            except Exception:
+                pass
+        return False, feats
+
+    async def _passes_vol_regime_filter(self, symbol: str):
+        """iter 45 (2026-05-15) — Volatility Regime Filter.
+
+        Catches the MLN/USDT 2026-05-15 pattern: a coin recently
+        crashed (-28% on 5/13) and now in an extreme volatility
+        regime. Daily ranges of 28%/28%/46% in 3 consecutive days
+        mean any entry is a gamble — even iter43's deeper offset got
+        filled and then plunged 9.46%.
+
+        Blocks when EITHER:
+          1. Max daily range over last N days > vr_max_daily_range_pct
+          2. Any daily candle in last N days had close ≤ open × (1-vr_big_crash_pct/100)
+
+        Reuses _d1_cache. Returns (True, None) when allowed, (False, feats)
+        when blocked. Fails open on any error.
+        """
+        if not self.vr_enabled:
+            return True, None
+        candles = await self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 3:
+            return True, None
+        recent = candles[-self.vr_lookback_days:]
+        try:
+            highs = [float(k[2]) for k in recent]
+            lows  = [float(k[3]) for k in recent]
+            opens = [float(k[1]) for k in recent]
+            closes= [float(k[4]) for k in recent]
+        except Exception:
+            return True, None
+        if any(l <= 0 for l in lows) or any(o <= 0 for o in opens):
+            return True, None
+
+        # 1. max daily range
+        ranges = [(h - l) / l * 100 for h, l in zip(highs, lows)]
+        max_range = max(ranges) if ranges else 0
+        # 2. worst daily change
+        daily_changes = [(c - o) / o * 100 for o, c in zip(opens, closes)]
+        worst_day = min(daily_changes) if daily_changes else 0
+
+        block_range = max_range > self.vr_max_daily_range_pct
+        block_crash = worst_day <= -self.vr_big_crash_pct
+        if not (block_range or block_crash):
+            return True, None
+
+        triggers = []
+        if block_range:
+            triggers.append(f"max_5d_range={max_range:.1f}% > {self.vr_max_daily_range_pct}%")
+        if block_crash:
+            triggers.append(f"worst_day={worst_day:+.1f}% <= -{self.vr_big_crash_pct}%")
+        reason = "vol regime: " + " AND ".join(triggers)
+        feats = {
+            "filter": "vol_regime",
+            "max_5d_range_pct": round(max_range, 2),
+            "worst_5d_day_pct": round(worst_day, 2),
+        }
+        log.info(f"🌪️ [{symbol}] skipped by vol_regime: {reason}")
+        if self.metrics is not None:
+            try:
+                self.metrics.signal_skipped(symbol, "vol_regime", reason, feats)
             except Exception:
                 pass
         return False, feats
@@ -1315,6 +1395,13 @@ class MultiSymbolScalper:
             # BEFORE post-pump-bleed which requires off-peak ≥10%.
             mt_ok, _ = await self._passes_macro_top_filter(symbol)
             if not mt_ok:
+                return
+            # Iter 45 (2026-05-15): volatility regime. Catches MLN-style
+            # — coin recently crashed (-28% on 5/13), now in extreme
+            # volatility regime (daily ranges 28%/28%/46% over 3 days).
+            # Even iter43's deeper offset gets filled and then plunges.
+            vr_ok, _ = await self._passes_vol_regime_filter(symbol)
+            if not vr_ok:
                 return
             # Daily-timeframe post-pump-bleed gate (2026-05-12). The 24h/1h
             # filters can't see a multi-day downtrend — e.g. JTO pumped a
