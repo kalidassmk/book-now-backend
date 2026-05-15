@@ -185,7 +185,7 @@ class MultiSymbolScalper:
         self.ladder_buy2_offset_pct = 0.5
         self.ladder_buy3_offset_pct = 1.0
         self.ladder_tp_from_avg_pct = 0.6
-        self.ladder_target_net_usdt = 0.20      # iter 19: 0.15→0.20
+        self.ladder_target_net_usdt = 0.15      # iter 42: 0.20→0.15 (faster TP)
         self.ladder_fee_rate_per_side = 0.00075 # 0.075% (BNB discount)
         self.ladder_hard_stop_pct = 1.0
         self.ladder_buy1_market = True

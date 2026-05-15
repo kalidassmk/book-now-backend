@@ -193,7 +193,10 @@ class TradingConfig:
     # instead of +0.983%. That's a more reachable target on the kind of
     # alt moves we see, and the trailing-TP layer still lets winners
     # ride further when momentum continues past the TP level.
-    ladderTargetNetProfitUsdt: float = 0.20
+    # 2026-05-15 iter 42: $0.20 → $0.15. Operator request — slightly more
+    # reachable TP so trades close faster (NXPC pattern: user manually
+    # cancelled the $0.20-target TP and re-priced lower for a quicker exit).
+    ladderTargetNetProfitUsdt: float = 0.15
     # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075
