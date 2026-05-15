@@ -122,6 +122,39 @@ class VirtualScalpExecutor:
         self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
         self.ladder_cooldown_seconds = 14400  # 4 hours
 
+        # ── iter 14: time-based + breakeven force exit (Virtual parity) ─
+        self.ladder_time_exit_enabled = True
+        self.ladder_max_hold_seconds = 14400        # 4h
+        self.ladder_breakeven_exit_enabled = True
+        self.ladder_breakeven_buffer_pct = 0.50
+
+        # ── iter 37: fixed hard-stop fallback + Buy 2 staleness ─────────
+        self.ladder_hard_stop_from_avg_enabled = True
+        self.ladder_hard_stop_from_avg_pct = 1.5
+        self.ladder_buy2_staleness_enabled = True
+        self.ladder_buy2_staleness_minutes = 10
+
+        # ── iter 38: near-top pump pre-buy filter ───────────────────────
+        self.ntp_enabled = True
+        self.ntp_min_24h_change_pct = 5.0
+        self.ntp_max_from_high_pct = 2.0
+
+        # ── iter 39: liquidity-death adaptive exit ──────────────────────
+        self.ld_enabled = True
+        self.ld_catastrophic_drop_pct = 2.5
+        self.ld_min_hold_min = 10
+        self.ld_min_drop_pct = 0.3
+        self.ld_lookback_min = 10
+        self.ld_vol_collapse_threshold = 0.7
+        self.ld_lower_lows_threshold = 0.55
+        self.ld_red_share_threshold = 0.60
+        self.ld_exit_score_threshold = 6
+        self.ld_stagnation_hold_min = 60
+        self.ld_stagnation_max_drop_pct = 1.0
+        # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
+        self._ld_kline_cache: dict = {}
+        self._ld_kline_ttl_sec = 30
+
         # Metrics collector — same Redis as everything else.
         self.metrics = make_collector(self.r, enabled=True) if make_collector else None
 
@@ -174,6 +207,22 @@ class VirtualScalpExecutor:
         "ladderTpFromAvgPct", "ladderTargetNetProfitUsdt",
         "ladderFeeRatePerSide", "ladderHardStopBelowBuy3Pct",
         "ladderBuy1OffsetPct", "ladderCooldownSeconds",
+        # iter 14 (force-exit) — added to Virtual in iter 40 parity port
+        "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
+        "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+        # iter 37 (fallback hard stop + Buy 2 staleness)
+        "ladderHardStopFromAvgEnabled", "ladderHardStopFromAvgPct",
+        "ladderBuy2StalenessEnabled", "ladderBuy2StalenessMinutes",
+        # iter 38 (near-top pump filter)
+        "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
+        "nearTopPumpMaxFromHighPct",
+        # iter 39 (liquidity-death adaptive exit)
+        "liquidityDeathExitEnabled", "liquidityDeathCatastrophicDropPct",
+        "liquidityDeathMinHoldMin", "liquidityDeathMinDropPct",
+        "liquidityDeathLookbackMin", "liquidityDeathVolCollapseThreshold",
+        "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
+        "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
+        "liquidityDeathStagnationMaxDropPct",
         "metricsEnabled",
     )
 
@@ -205,11 +254,58 @@ class VirtualScalpExecutor:
             print(f"❌ [VIRTUAL] TRADING_CONFIG JSON parse failed: {exc} — refusing to trade")
             self.config_loaded = False
             return
-        missing = [k for k in self._REQUIRED_CONFIG_KEYS if k not in cfg]
+        # iter 40 (2026-05-15): for the newly-ported safety nets, gracefully
+        # fall back to defaults if the key isn't in Redis yet — avoids a
+        # cold-start blackhole on the day of the port. (Strict mode is
+        # already enforced on the Fast Scalper, which guarantees every
+        # key gets seeded.)
+        _IT40_OPTIONAL_KEYS = {
+            "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
+            "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+            "ladderHardStopFromAvgEnabled", "ladderHardStopFromAvgPct",
+            "ladderBuy2StalenessEnabled", "ladderBuy2StalenessMinutes",
+            "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
+            "nearTopPumpMaxFromHighPct",
+            "liquidityDeathExitEnabled", "liquidityDeathCatastrophicDropPct",
+            "liquidityDeathMinHoldMin", "liquidityDeathMinDropPct",
+            "liquidityDeathLookbackMin", "liquidityDeathVolCollapseThreshold",
+            "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
+            "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
+            "liquidityDeathStagnationMaxDropPct",
+        }
+        missing = [k for k in self._REQUIRED_CONFIG_KEYS
+                   if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
         if missing:
             print(f"❌ [VIRTUAL] TRADING_CONFIG missing keys {missing} — refusing to trade")
             self.config_loaded = False
             return
+        # Backfill any missing iter40 keys with current defaults (already in self.*)
+        for k in _IT40_OPTIONAL_KEYS:
+            if k not in cfg:
+                cfg[k] = {
+                    "ladderTimeExitEnabled": True,
+                    "ladderMaxHoldSeconds": 14400,
+                    "ladderBreakevenExitEnabled": True,
+                    "ladderBreakevenBufferPct": 0.5,
+                    "ladderHardStopFromAvgEnabled": True,
+                    "ladderHardStopFromAvgPct": 1.5,
+                    "ladderBuy2StalenessEnabled": True,
+                    "ladderBuy2StalenessMinutes": 10,
+                    "nearTopPumpFilterEnabled": True,
+                    "nearTopPumpMin24hChangePct": 5.0,
+                    "nearTopPumpMaxFromHighPct": 2.0,
+                    "liquidityDeathExitEnabled": True,
+                    "liquidityDeathCatastrophicDropPct": 2.5,
+                    "liquidityDeathMinHoldMin": 10,
+                    "liquidityDeathMinDropPct": 0.3,
+                    "liquidityDeathLookbackMin": 10,
+                    "liquidityDeathVolCollapseThreshold": 0.7,
+                    "liquidityDeathLowerLowsThreshold": 0.55,
+                    "liquidityDeathRedShareThreshold": 0.6,
+                    "liquidityDeathExitScoreThreshold": 6,
+                    "liquidityDeathStagnationHoldMin": 60,
+                    "liquidityDeathStagnationMaxDropPct": 1.0,
+                }[k]
 
         # Strict population — direct key access, no .get(default).
         self.live_mode = bool(cfg["virtualScalperLiveMode"])
@@ -244,6 +340,32 @@ class VirtualScalpExecutor:
         self.ladder_hard_stop_pct = float(cfg["ladderHardStopBelowBuy3Pct"])
         self.ladder_buy1_offset_pct = float(cfg["ladderBuy1OffsetPct"])
         self.ladder_cooldown_seconds = int(cfg["ladderCooldownSeconds"])
+        # iter 14
+        self.ladder_time_exit_enabled = bool(cfg["ladderTimeExitEnabled"])
+        self.ladder_max_hold_seconds = int(cfg["ladderMaxHoldSeconds"])
+        self.ladder_breakeven_exit_enabled = bool(cfg["ladderBreakevenExitEnabled"])
+        self.ladder_breakeven_buffer_pct = float(cfg["ladderBreakevenBufferPct"])
+        # iter 37
+        self.ladder_hard_stop_from_avg_enabled = bool(cfg["ladderHardStopFromAvgEnabled"])
+        self.ladder_hard_stop_from_avg_pct = float(cfg["ladderHardStopFromAvgPct"])
+        self.ladder_buy2_staleness_enabled = bool(cfg["ladderBuy2StalenessEnabled"])
+        self.ladder_buy2_staleness_minutes = int(cfg["ladderBuy2StalenessMinutes"])
+        # iter 38
+        self.ntp_enabled = bool(cfg["nearTopPumpFilterEnabled"])
+        self.ntp_min_24h_change_pct = float(cfg["nearTopPumpMin24hChangePct"])
+        self.ntp_max_from_high_pct = float(cfg["nearTopPumpMaxFromHighPct"])
+        # iter 39
+        self.ld_enabled = bool(cfg["liquidityDeathExitEnabled"])
+        self.ld_catastrophic_drop_pct = float(cfg["liquidityDeathCatastrophicDropPct"])
+        self.ld_min_hold_min = int(cfg["liquidityDeathMinHoldMin"])
+        self.ld_min_drop_pct = float(cfg["liquidityDeathMinDropPct"])
+        self.ld_lookback_min = int(cfg["liquidityDeathLookbackMin"])
+        self.ld_vol_collapse_threshold = float(cfg["liquidityDeathVolCollapseThreshold"])
+        self.ld_lower_lows_threshold = float(cfg["liquidityDeathLowerLowsThreshold"])
+        self.ld_red_share_threshold = float(cfg["liquidityDeathRedShareThreshold"])
+        self.ld_exit_score_threshold = int(cfg["liquidityDeathExitScoreThreshold"])
+        self.ld_stagnation_hold_min = int(cfg["liquidityDeathStagnationHoldMin"])
+        self.ld_stagnation_max_drop_pct = float(cfg["liquidityDeathStagnationMaxDropPct"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -370,6 +492,7 @@ class VirtualScalpExecutor:
                 qty_filled=buy1_qty * 0.999,
                 fill_price=signal_price, fill_ts=now_ms, status="filled",
             ),
+            pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
         )
         # 2026-05-11 iter 6: reference price = Buy 1 fill price (= signal
         # in paper since no spread). Keeps semantics identical to live.
@@ -551,6 +674,7 @@ class VirtualScalpExecutor:
                 state=ladder.PENDING_BUY_1,
                 buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
                                  size_usdt=self.ladder_buy1_size, order_id=order_id),
+                pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
             )
             self._paper_ladder_save(state)
             print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
@@ -590,6 +714,7 @@ class VirtualScalpExecutor:
                     qty_filled=base_qty, fill_price=fill_price, fill_ts=now_ms,
                     status="filled",
                 ),
+                pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
             )
             print(f"🪜 [v-ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
             if self.metrics is not None:
@@ -629,6 +754,7 @@ class VirtualScalpExecutor:
             state=ladder.PENDING_BUY_1,
             buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
                              size_usdt=self.ladder_buy1_size, order_id=order_id),
+            pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
         )
         self._paper_ladder_save(state)
         print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
@@ -691,6 +817,324 @@ class VirtualScalpExecutor:
                 self._paper_ladder_tick_one(state, last)
             except Exception as exc:
                 print(f"⚠️ [paper-ladder] tick failed for {sym}: {exc}")
+
+    # ── iter 40 Virtual parity helpers (mirror Fast Scalper iter14/37/38/39)
+    # 2026-05-15: ported from ultra_fast_scalper.py. Logic identical;
+    # implementation is sync because Virtual Scalper uses sync ccxt.
+
+    def _passes_near_top_pump_filter(self, symbol: str, features):
+        """iter 38: SKIP buys when 24h is up >= ntp_min_24h_change_pct AND
+        price is within ntp_max_from_high_pct of the 24h high. Pattern
+        from QNT/USDT 2026-05-15. Reuses features computed by
+        passes_falling_knife — no extra Binance call."""
+        if not self.ntp_enabled:
+            return True
+        if not features:
+            return True
+        try:
+            change_24h = float(features.get("change_24h_pct") or 0.0)
+            from_high = float(features.get("from_24h_high_pct") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        first = change_24h >= self.ntp_min_24h_change_pct
+        second = from_high >= -self.ntp_max_from_high_pct
+        if first and second:
+            reason = (f"near top of 24h pump: 24h_change=+{change_24h:.2f}% "
+                      f"(>= {self.ntp_min_24h_change_pct:.1f}%) AND "
+                      f"from_24h_high={from_high:.2f}% "
+                      f"(within {self.ntp_max_from_high_pct:.1f}% of peak)")
+            print(f"🚧 [{symbol}] virtual skip near_top_pump: {reason}")
+            if self.metrics is not None:
+                try:
+                    self.metrics.signal_skipped(symbol, "near_top_pump", reason, features)
+                except Exception:
+                    pass
+            return False
+        return True
+
+    def _ld_get_recent_1m_klines(self, symbol: str):
+        """Throttled 1m kline fetch for iter39. 30s TTL per symbol so a
+        ladder tick batch doesn't hammer the REST endpoint."""
+        if self.client is None:
+            return None
+        now = time.time()
+        cached = self._ld_kline_cache.get(symbol)
+        if cached and now - cached["ts"] < self._ld_kline_ttl_sec:
+            return cached["candles"]
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            candles = self.client.fetch_ohlcv(ccxt_sym, "1m", limit=self.ld_lookback_min)
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] kline fetch for liquidity-death {symbol} failed: {exc}")
+            return None
+        if not candles:
+            return None
+        self._ld_kline_cache[symbol] = {"ts": now, "candles": candles}
+        return candles
+
+    def _check_liquidity_death(self, state, current_price: float, avg: float,
+                               held_min: float, drop_pct: float):
+        """iter 39: multi-factor adaptive hard-stop. Returns
+        (should_exit, reason). Same algorithm as the Fast Scalper —
+        see _check_liquidity_death there for the full forensic.
+
+        Sync version: fetches its own 1m klines via self.client (cached
+        30s/symbol) since Virtual has no KlinesCache."""
+        if not self.ld_enabled:
+            return False, ""
+        if avg <= 0 or current_price <= 0:
+            return False, ""
+
+        # Tier 1: catastrophic.
+        if (self.ld_catastrophic_drop_pct > 0
+                and drop_pct >= self.ld_catastrophic_drop_pct):
+            return True, f"liquidity_death:catastrophic drop={drop_pct:.2f}%"
+
+        candles = self._ld_get_recent_1m_klines(state.symbol)
+        if not candles or len(candles) < max(3, self.ld_lookback_min // 2):
+            return False, ""
+
+        opens = [float(c[1]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        vols = [float(c[5]) for c in candles]   # base-asset volume
+
+        n = len(candles)
+        recent_usdt = sum(v * c for v, c in zip(vols, closes))
+        vol_per_min = recent_usdt / n if n > 0 else 0.0
+        baseline = state.pre_vol_baseline_usdt or 0.0
+        vol_ratio = (vol_per_min / baseline) if baseline > 0 else 1.0
+
+        lower_lows = sum(1 for i in range(1, n) if lows[i] < lows[i - 1])
+        lower_lows_pct = lower_lows / max(1, n - 1)
+        red = sum(1 for o, c in zip(opens, closes) if c < o)
+        red_share = red / n
+        max_high = max(highs)
+        ever_recovered = max_high >= avg * 0.999
+
+        # Tier 2: score-based.
+        if held_min >= self.ld_min_hold_min and drop_pct >= self.ld_min_drop_pct:
+            score = 0
+            factors = []
+            if vol_ratio < self.ld_vol_collapse_threshold:
+                score += 3; factors.append(f"vol={vol_ratio:.2f}x")
+                if vol_ratio < self.ld_vol_collapse_threshold * 0.5:
+                    score += 2; factors.append("vol_extreme")
+            if not ever_recovered:
+                score += 2; factors.append("never_recovered")
+            if drop_pct >= 1.0:
+                score += 2; factors.append(f"drop={drop_pct:.2f}%")
+            if lower_lows_pct >= self.ld_lower_lows_threshold:
+                score += 2; factors.append(f"ll={lower_lows_pct:.0%}")
+            if red_share >= self.ld_red_share_threshold:
+                score += 1; factors.append(f"red={red_share:.0%}")
+            if score >= self.ld_exit_score_threshold:
+                reason = (f"liquidity_death:score={score} "
+                          + " ".join(factors)
+                          + f" drop={drop_pct:.2f}% held={held_min:.0f}m")
+                return True, reason
+
+        # Tier 3: stagnation.
+        if (held_min >= self.ld_stagnation_hold_min and
+                0 <= drop_pct <= self.ld_stagnation_max_drop_pct and
+                vol_ratio < self.ld_vol_collapse_threshold and
+                (state.tp_target_price <= 0 or
+                 max_high / state.tp_target_price < 0.7)):
+            return True, (f"liquidity_death:stagnation "
+                          f"held={held_min:.0f}m drop={drop_pct:.2f}% "
+                          f"vol={vol_ratio:.2f}x no_tp_approach")
+        return False, ""
+
+    def _maybe_force_exit_ladder_live(self, state, f, last):
+        """iter 14 + 37 + 39 (Virtual): unified force-exit pipeline.
+        Returns True iff the ladder was closed via a force exit (caller
+        should ``return`` immediately, skipping further state-machine
+        handlers for this tick).
+
+        Resolution order (first match wins):
+          0-A liquidity-death (iter 39, multi-factor)
+          0-B fixed hard-stop fallback (iter 37)
+          1   breakeven recovery (iter 14)
+          2   time exit (iter 14)
+        """
+        if state is None or state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return False
+        if not (self.ladder_time_exit_enabled
+                or self.ladder_breakeven_exit_enabled
+                or self.ladder_hard_stop_from_avg_enabled
+                or self.ld_enabled):
+            return False
+
+        filled = [L for L in (state.buy_1, state.buy_2, state.buy_3)
+                  if L and L.qty_filled and L.fill_price]
+        if not filled:
+            return False
+        total_qty = sum(L.qty_filled for L in filled)
+        total_cost = sum(L.qty_filled * L.fill_price for L in filled)
+        avg = total_cost / total_qty if total_qty > 0 else 0
+        if avg <= 0:
+            return False
+
+        # Use the tick's `last` price (already fetched by the scanner)
+        # — avoids a per-tick fetch_ticker round-trip.
+        current_price = float(last or 0)
+        if current_price <= 0:
+            return False
+
+        now_ms = int(time.time() * 1000)
+        signal_ts = int(state.signal_ts or 0)
+        age_sec = (now_ms - signal_ts) / 1000.0 if signal_ts else 0
+        fill_ts = state.buy_1.fill_ts if state.buy_1 else 0
+        held_min = ((now_ms - fill_ts) / 60_000.0) if fill_ts else 0.0
+        drop_pct = (avg - current_price) / avg * 100
+        be_threshold = avg * (1 + self.ladder_breakeven_buffer_pct / 100.0)
+        hs_threshold = avg * (1 - self.ladder_hard_stop_from_avg_pct / 100.0)
+
+        force_reason = None
+
+        # Path 0-A: liquidity-death smart exit
+        ld_exit, ld_reason = self._check_liquidity_death(
+            state, current_price, avg, held_min, drop_pct,
+        )
+        if ld_exit:
+            force_reason = ld_reason
+
+        # Path 0-B: fixed hard-stop fallback
+        if (force_reason is None
+                and self.ladder_hard_stop_from_avg_enabled
+                and self.ladder_hard_stop_from_avg_pct > 0
+                and current_price <= hs_threshold):
+            force_reason = "hard_stop_from_avg"
+
+        # Path 1: breakeven recovery
+        ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+        if (force_reason is None
+                and self.ladder_breakeven_exit_enabled
+                and ever_underwater
+                and current_price >= be_threshold):
+            force_reason = "breakeven_recovery"
+
+        # Path 2: time exit
+        if (force_reason is None
+                and self.ladder_time_exit_enabled
+                and age_sec >= self.ladder_max_hold_seconds):
+            force_reason = "time_exit"
+
+        if force_reason is None:
+            return False
+
+        # Cancel TP if any
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        if state.tp_order_id:
+            try:
+                self.client.cancel_order(state.tp_order_id, ccxt_sym)
+            except Exception:
+                pass
+            state.tp_order_id = None
+        # Cancel any unfilled buy legs
+        for leg in (state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try:
+                    self.client.cancel_order(leg.order_id, ccxt_sym)
+                except Exception:
+                    pass
+                leg.status = "cancelled"
+                leg.order_id = None
+
+        sell_qty = self._round_step(total_qty * 0.999, f["step_size"])
+        if sell_qty <= 0:
+            print(f"⚠️ [v-ladder] {state.symbol} force-exit qty rounded to 0; clearing")
+            self._paper_ladder_close(state, current_price, force_reason)
+            return True
+
+        exit_price = current_price
+        try:
+            sold = self.client.create_market_sell_order(ccxt_sym, sell_qty)
+            exit_price = float(sold.get("average") or sold.get("price") or current_price)
+            print(f"🚪 [v-ladder] {state.symbol} {force_reason} — sold {sell_qty} @ ~${exit_price:.6g}")
+        except Exception as exc:
+            print(f"❌ [v-ladder] {state.symbol} force-exit market sell failed: {exc}; clearing anyway")
+
+        # Compute PnL (fee-adjusted)
+        pnl = (exit_price - avg) * total_qty
+        pnl -= 2 * self.ladder_fee_rate_per_side * total_cost
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, avg, exit_price,
+                                           reason=force_reason, pnl_usdt=pnl)
+            except Exception:
+                pass
+        print(f"🪜 [v-ladder] {state.symbol} CLOSED reason={force_reason} "
+              f"net=${pnl:+.4f} age={age_sec/60:.1f}m avg=${avg:.6g} exit=${exit_price:.6g}")
+        self._paper_ladder_close(state, exit_price, force_reason)
+        return True
+
+    def _maybe_cancel_stale_buy2(self, state, last):
+        """iter 37 (Virtual): if Buy 2 LIMIT hasn't filled within
+        ladder_buy2_staleness_minutes after Buy 1's fill, cancel Buy 2
+        (and Buy 3 if any). Refreshes TP at the new (Buy 1 only) avg.
+        Returns True if a cancel happened."""
+        if not self.ladder_buy2_staleness_enabled:
+            return False
+        if state.state != ladder.ACTIVE_1:
+            return False
+        if not (state.buy_2 and state.buy_2.order_id
+                and state.buy_1 and state.buy_1.fill_ts):
+            return False
+        if state.buy_2.status in ("filled", "cancelled"):
+            return False
+        staleness_ms = self.ladder_buy2_staleness_minutes * 60 * 1000
+        age = int(time.time() * 1000) - int(state.buy_1.fill_ts)
+        if age < staleness_ms:
+            return False
+
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        try:
+            self.client.cancel_order(state.buy_2.order_id, ccxt_sym)
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] {state.symbol} stale buy 2 cancel failed: {exc}")
+        state.buy_2.status = "cancelled"
+        state.buy_2.order_id = None
+        if state.buy_3 and state.buy_3.order_id:
+            try:
+                self.client.cancel_order(state.buy_3.order_id, ccxt_sym)
+            except Exception:
+                pass
+            state.buy_3.status = "cancelled"
+            state.buy_3.order_id = None
+
+        # Refresh TP at Buy 1-only avg.
+        f = self._get_filters(state.symbol)
+        if f is not None:
+            tick = f.get("tick_size") or 0.00000001
+            try:
+                self._ladder_refresh_tp_live(state, f, tick)
+            except Exception as exc:
+                print(f"⚠️ [v-ladder] {state.symbol} TP refresh after stale buy 2 failed: {exc}")
+        self._paper_ladder_save(state)
+        print(f"⏱️  [v-ladder] {state.symbol} buy 2 cancelled — stale "
+              f"({age/60000:.1f}m >= {self.ladder_buy2_staleness_minutes}m); "
+              f"new TP={state.tp_target_price:.6g}")
+        return True
+
+    def _ladder_update_underwater(self, state, last):
+        """Mirror of the paper-tick underwater accumulator. Required so
+        the iter14 breakeven-recovery exit knows whether the ladder ever
+        went underwater. Called from _ladder_tick_one_live every tick."""
+        if state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return
+        avg = state.weighted_avg()
+        if avg <= 0 or not last or last <= 0:
+            return
+        now_ms = int(time.time() * 1000)
+        if last < avg:
+            if state.below_avg_started_ts == 0:
+                state.below_avg_started_ts = now_ms
+        else:
+            if state.below_avg_started_ts > 0:
+                state.total_underwater_ms += (now_ms - state.below_avg_started_ts)
+                state.below_avg_started_ts = 0
 
     def _paper_ladder_tick_one(self, state, last):
         """Dispatch: live mode polls Binance, paper mode simulates."""
@@ -794,6 +1238,21 @@ class VirtualScalpExecutor:
         if f is None: return
         tick = f.get('tick_size') or 0.00000001
         now_ms = int(time.time() * 1000)
+
+        # iter 40 (Virtual parity, 2026-05-15): unified force-exit
+        # pipeline. Checks liquidity-death (iter39), fixed hard-stop
+        # fallback (iter37), breakeven-recovery (iter14), time-exit
+        # (iter14) BEFORE the normal state-machine handlers. If any
+        # fires, the ladder is closed and we return.
+        try:
+            self._ladder_update_underwater(state, last)
+            if self._maybe_force_exit_ladder_live(state, f, last):
+                return
+            # iter 37: Buy 2 staleness — cancel stale Buy 2 LIMIT
+            if self._maybe_cancel_stale_buy2(state, last):
+                return
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] {sym} force-exit pipeline error: {exc}")
 
         # 1. PENDING_BUY_1 (slow-path limit): poll Buy 1, then place legs
         if state.state == ladder.PENDING_BUY_1 and state.buy_1 and state.buy_1.order_id:
@@ -1309,10 +1768,17 @@ class VirtualScalpExecutor:
                                         decision="pass" if ok else "skipped",
                                     )
                                 if ok:
-                                    # Daily-timeframe post-pump gate (2026-05-12).
-                                    pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
-                                    if pp_ok:
-                                        self._paper_ladder_start(symbol, curr_price, features=features)
+                                    # iter 38 (Virtual parity): near-top pump
+                                    # filter. Blocks buying within 2% of the
+                                    # 24h high after a ≥5% 24h pump (QNT
+                                    # pattern). Reuses features dict.
+                                    if not self._passes_near_top_pump_filter(symbol, features):
+                                        pass  # already logged + counted
+                                    else:
+                                        # Daily-timeframe post-pump gate (2026-05-12).
+                                        pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                        if pp_ok:
+                                            self._paper_ladder_start(symbol, curr_price, features=features)
                                 else:
                                     print(f"🔪 [{symbol}] virtual buy skipped by filter")
                         # Legacy single-limit path: still honoured when
@@ -1325,10 +1791,14 @@ class VirtualScalpExecutor:
                                     decision="pass" if ok else "skipped",
                                 )
                             if ok:
-                                # Daily-timeframe post-pump gate (2026-05-12).
-                                pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
-                                if pp_ok:
-                                    self.place_limit_order(symbol, curr_price, features=features)
+                                # iter 38 (Virtual parity)
+                                if not self._passes_near_top_pump_filter(symbol, features):
+                                    pass
+                                else:
+                                    # Daily-timeframe post-pump gate (2026-05-12).
+                                    pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                    if pp_ok:
+                                        self.place_limit_order(symbol, curr_price, features=features)
                             else:
                                 print(f"🔪 [{symbol}] virtual buy skipped by filter")
 
