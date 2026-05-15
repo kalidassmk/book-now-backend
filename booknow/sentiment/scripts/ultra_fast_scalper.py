@@ -245,6 +245,19 @@ class MultiSymbolScalper:
         self.ld_stagnation_hold_min = 60
         self.ld_stagnation_max_drop_pct = 1.0
 
+        # ── Post-Buy-2 Careful Monitor (iter 41, 2026-05-15) ────────────
+        # When Buy 2 fills, switch to a specialised monitor with a grace
+        # period, tighter break-even, quick-profit lock-in, and a tighter
+        # hard stop. Avoids panic-selling right after averaging down,
+        # but caps worst case more aggressively than ACTIVE_1.
+        self.a2_enabled = True
+        self.a2_grace_minutes = 5
+        self.a2_quick_profit_pct = 0.2
+        self.a2_tight_breakeven_buffer_pct = 0.15
+        self.a2_patience_minutes = 20
+        self.a2_no_recovery_drop_pct = 0.5
+        self.a2_hard_stop_pct = 1.5
+
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
         # it. The retrace we were averaging-down for never came, and
@@ -521,6 +534,11 @@ class MultiSymbolScalper:
         "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
         "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
         "liquidityDeathStagnationMaxDropPct",
+        # iter 41 (2026-05-15) — Post-Buy-2 careful monitor
+        "active2MonitorEnabled", "active2GracePeriodMinutes",
+        "active2QuickProfitPct", "active2TightBreakevenBufferPct",
+        "active2PatienceMinutes", "active2NoRecoveryDropPct",
+        "active2HardStopPct",
         "metricsEnabled",
     )
 
@@ -635,6 +653,14 @@ class MultiSymbolScalper:
         self.ld_exit_score_threshold = int(cfg["liquidityDeathExitScoreThreshold"])
         self.ld_stagnation_hold_min = int(cfg["liquidityDeathStagnationHoldMin"])
         self.ld_stagnation_max_drop_pct = float(cfg["liquidityDeathStagnationMaxDropPct"])
+        # iter 41 (2026-05-15) — Post-Buy-2 careful monitor
+        self.a2_enabled = bool(cfg["active2MonitorEnabled"])
+        self.a2_grace_minutes = int(cfg["active2GracePeriodMinutes"])
+        self.a2_quick_profit_pct = float(cfg["active2QuickProfitPct"])
+        self.a2_tight_breakeven_buffer_pct = float(cfg["active2TightBreakevenBufferPct"])
+        self.a2_patience_minutes = int(cfg["active2PatienceMinutes"])
+        self.a2_no_recovery_drop_pct = float(cfg["active2NoRecoveryDropPct"])
+        self.a2_hard_stop_pct = float(cfg["active2HardStopPct"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -1845,6 +1871,119 @@ class MultiSymbolScalper:
             except Exception as exc:
                 log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
 
+    def _check_active2_monitor(self, state, current_price: float, avg: float,
+                                drop_pct: float):
+        """Iter 41 (2026-05-15) — Post-Buy-2 Careful Monitor.
+
+        Only fires when state.state == ACTIVE_2 (Buy 2 filled, double
+        exposure). Six priority-ordered checks; first match wins:
+
+          1. GRACE PERIOD (first N min after Buy 2 fill):
+             Skip all sub-checks below. Only the iter39 catastrophic
+             floor (called later) can fire here. Gives the average-down
+             time to work.
+
+          2. QUICK PROFIT: current >= avg × (1 + a2_quick_profit_pct/100).
+             Average-down succeeded — lock in any profit before it
+             reverses. Default +0.2% above new avg.
+
+          3. TIGHT BREAKEVEN: ever_underwater_since_buy2 AND current
+             >= avg × (1 + a2_tight_breakeven_buffer_pct/100).
+             Exit at flat the moment we touch the buffer (default 0.15%
+             — JUST covers fees). Tighter than ACTIVE_1's 0.5% because
+             after averaging down we should grab break-even when
+             offered, not wait for more recovery that may not come.
+
+          4. NO RECOVERY: held_since_buy2 >= a2_patience_minutes AND
+             drop_pct >= a2_no_recovery_drop_pct AND no candle since
+             Buy 2 fill reached avg × 0.999. Accept a minimal loss
+             rather than letting it grow into a heavy one.
+
+          5. HARD STOP: drop_pct >= a2_hard_stop_pct (default 1.5%).
+             Cap the worst case. Tighter than iter37's fallback because
+             ACTIVE_2 has 2× the exposure.
+
+          6. Fall through — let iter39 / iter37 / iter14 run as normal
+             safety nets.
+
+        Returns (should_exit, reason). Caller is _maybe_force_exit_ladder.
+        """
+        if not self.a2_enabled:
+            return False, ""
+        if state.state != ladder.ACTIVE_2:
+            return False, ""
+        if not (state.buy_2 and state.buy_2.fill_ts and state.buy_2.fill_price):
+            return False, ""
+
+        now_ms = int(time.time() * 1000)
+        held_since_b2_min = (now_ms - int(state.buy_2.fill_ts)) / 60_000.0
+
+        # 1. GRACE PERIOD — patient first N min
+        if held_since_b2_min < self.a2_grace_minutes:
+            return False, ""
+
+        # 2. QUICK PROFIT — exit on any positive return after grace
+        qp_threshold = avg * (1 + self.a2_quick_profit_pct / 100.0)
+        if current_price >= qp_threshold:
+            return True, (f"active2_quick_profit "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_quick_profit_pct}%)=${qp_threshold:.6g} "
+                          f"held={held_since_b2_min:.0f}m")
+
+        # We need klines to evaluate #3 and #4. Pull last N+5 candles since
+        # we want to look back to the Buy 2 fill timestamp.
+        candles = None
+        if self.klines_cache is not None and self.klines_cache.has(state.symbol, "1m"):
+            try:
+                df = self.klines_cache.get_klines(state.symbol, "1m", 60)
+                if df is not None and not df.empty:
+                    candles = df.to_dict("records")
+            except Exception:
+                pass
+
+        # 3. TIGHT BREAKEVEN — ever underwater since Buy 2 + buffer hit
+        tb_threshold = avg * (1 + self.a2_tight_breakeven_buffer_pct / 100.0)
+        ever_underwater_since_b2 = False
+        ever_recovered_since_b2 = False
+        if candles:
+            for c in candles:
+                try:
+                    ts = int(c.get("timestamp") or 0)
+                    if ts < int(state.buy_2.fill_ts):
+                        continue
+                    if float(c.get("low") or 0) < avg:
+                        ever_underwater_since_b2 = True
+                    if float(c.get("high") or 0) >= avg * 0.999:
+                        ever_recovered_since_b2 = True
+                except Exception:
+                    continue
+        # Fall back to the ladder's general underwater flag if kline data
+        # is missing — better than nothing.
+        if not candles:
+            ever_underwater_since_b2 = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+            ever_recovered_since_b2 = True   # assume yes when we can't tell
+
+        if ever_underwater_since_b2 and current_price >= tb_threshold:
+            return True, (f"active2_tight_breakeven "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_tight_breakeven_buffer_pct}%)=${tb_threshold:.6g}")
+
+        # 4. NO RECOVERY — patient wait expired
+        if (held_since_b2_min >= self.a2_patience_minutes
+                and drop_pct >= self.a2_no_recovery_drop_pct
+                and not ever_recovered_since_b2):
+            return True, (f"active2_no_recovery "
+                          f"held={held_since_b2_min:.0f}m drop={drop_pct:.2f}% "
+                          f"never_touched_avg")
+
+        # 5. HARD STOP — cap worst case (tighter than iter37)
+        if (self.a2_hard_stop_pct > 0
+                and drop_pct >= self.a2_hard_stop_pct):
+            return True, (f"active2_hard_stop drop={drop_pct:.2f}% "
+                          f">= {self.a2_hard_stop_pct}%")
+
+        return False, ""
+
     def _check_liquidity_death(self, state, current_price: float, avg: float,
                                held_min: float, drop_pct: float):
         """Iter 39 (2026-05-15) — adaptive multi-factor hard-stop.
@@ -2037,6 +2176,22 @@ class MultiSymbolScalper:
 
         force_reason = None
 
+        # Path -1 (iter 41, 2026-05-15): POST-BUY-2 CAREFUL MONITOR.
+        # When the ladder has entered ACTIVE_2 (Buy 2 filled — double
+        # exposure), use a specialised decision tree:
+        #   1. grace period (no exits except catastrophic)
+        #   2. quick profit (lock any +0.2% above new avg)
+        #   3. tight breakeven (0.15% buffer instead of 0.5%)
+        #   4. no-recovery exit (small loss after patience window)
+        #   5. tighter hard stop (1.5% from new avg)
+        # Falls through to iter39/iter37/iter14 if no tier fires.
+        drop_pct_calc = (avg - current_price) / avg * 100
+        a2_exit, a2_reason = self._check_active2_monitor(
+            state, current_price, avg, drop_pct_calc,
+        )
+        if a2_exit:
+            force_reason = a2_reason
+
         # Path 0-A (iter 39, 2026-05-15): LIQUIDITY-DEATH adaptive exit.
         # Smarter than iter37's fixed-pct hard stop. Combines drop %
         # with volume collapse, lower-lows, never-recovered flags, and
@@ -2069,7 +2224,12 @@ class MultiSymbolScalper:
         # interesting flag is "ever went underwater" — covered by
         # total_underwater_ms > 0 OR currently underwater.
         ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
-        if force_reason is None and self.ladder_breakeven_exit_enabled and ever_underwater:
+        # iter 41: skip the generic iter14 breakeven exit when in ACTIVE_2 —
+        # the post-Buy-2 monitor has a tighter version (0.15% vs 0.5%).
+        if (force_reason is None
+                and state.state != ladder.ACTIVE_2
+                and self.ladder_breakeven_exit_enabled
+                and ever_underwater):
             if current_price >= be_threshold:
                 force_reason = "breakeven_recovery"
 

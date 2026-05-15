@@ -299,7 +299,50 @@ class TradingConfig:
     liquidityDeathRedShareThreshold: float = 0.60    # ≥60% red candles
     liquidityDeathExitScoreThreshold: int = 6        # sum of factors to exit
     liquidityDeathStagnationHoldMin: int = 60        # Tier 3 hold floor
-    liquidityDeathStagnationMaxDropPct: float = 1.0  # only when drop in [0, this]
+    liquidityDeathStagnationMaxDropPct: float = 1.0
+
+    # ── Post-Buy-2 Careful Monitor (iter 41, 2026-05-15) ──────────────────
+    # Once Buy 2 fills, the ladder has DOUBLE exposure ($96 instead of
+    # $48) and we've already averaged down once. That's a different
+    # risk profile than ACTIVE_1:
+    #
+    #  • DON'T panic-sell on the same triggers as ACTIVE_1 (5-min grace).
+    #  • DO grab any profit immediately (averaging down worked — exit).
+    #  • DO exit at break-even with a TIGHTER buffer (just covers fees).
+    #  • DO accept a small loss if the trade is clearly stuck (better
+    #    than waiting for the smarter iter39 to fire on a larger loss).
+    #  • DO cap the worst case TIGHTER than ACTIVE_1.
+    #
+    # Decision tree (priority order, first match wins):
+    #
+    #   0. CATASTROPHIC: drop >= 2.5%  (iter39 floor still in force)
+    #   1. GRACE PERIOD (first 5 min after Buy 2 fill): only #0 fires.
+    #      Give the average-down time to work.
+    #   2. QUICK PROFIT: current >= avg × (1 + quickProfitPct/100).
+    #      Lock in any profit (default +0.2% above new avg).
+    #   3. TIGHT BREAKEVEN: ever_underwater_after_buy2 AND
+    #      current >= avg × (1 + tightBreakevenBufferPct/100).
+    #      Exit at flat (default +0.15% — JUST covers fees).
+    #   4. NO RECOVERY: held >= patienceMin AND drop >= noRecoveryDropPct
+    #      AND never reached avg × 0.999 since Buy 2 fill.
+    #      Accept a minimal loss to free capital.
+    #   5. HARD STOP: drop >= hardStopPct (tighter than iter37's 1.5%).
+    #      Cap worst case at ~$1.44 on $96 ladder.
+    #   6. Fall through to iter39 / iter37 / iter14 (still active as
+    #      safety nets if none of the above fires).
+    #
+    # Worked example: Buy 1 = $78.17, Buy 2 = $77.78 (-0.5%), new
+    # avg = $77.97.
+    #   • +0.2% quick profit  ⇒ exit at $78.13   (lock small win)
+    #   • +0.15% breakeven    ⇒ exit at $78.09   (after going underwater)
+    #   • −1.5% hard stop     ⇒ exit at $76.80   (cap worst case)
+    active2MonitorEnabled: bool = True
+    active2GracePeriodMinutes: int = 5          # patient grace window
+    active2QuickProfitPct: float = 0.2          # any profit → exit
+    active2TightBreakevenBufferPct: float = 0.15 # tighter than ACTIVE_1's 0.5%
+    active2PatienceMinutes: int = 20            # how long before no-recovery exit
+    active2NoRecoveryDropPct: float = 0.5       # min loss to accept on no-recovery
+    active2HardStopPct: float = 1.5             # worst-case cap from new avg  # only when drop in [0, this]
 
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the

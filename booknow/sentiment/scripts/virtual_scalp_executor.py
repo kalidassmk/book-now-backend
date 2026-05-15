@@ -151,6 +151,14 @@ class VirtualScalpExecutor:
         self.ld_exit_score_threshold = 6
         self.ld_stagnation_hold_min = 60
         self.ld_stagnation_max_drop_pct = 1.0
+        # ── iter 41: Post-Buy-2 Careful Monitor ─────────────────────────
+        self.a2_enabled = True
+        self.a2_grace_minutes = 5
+        self.a2_quick_profit_pct = 0.2
+        self.a2_tight_breakeven_buffer_pct = 0.15
+        self.a2_patience_minutes = 20
+        self.a2_no_recovery_drop_pct = 0.5
+        self.a2_hard_stop_pct = 1.5
         # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
         self._ld_kline_cache: dict = {}
         self._ld_kline_ttl_sec = 30
@@ -223,6 +231,11 @@ class VirtualScalpExecutor:
         "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
         "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
         "liquidityDeathStagnationMaxDropPct",
+        # iter 41 (Post-Buy-2 Careful Monitor)
+        "active2MonitorEnabled", "active2GracePeriodMinutes",
+        "active2QuickProfitPct", "active2TightBreakevenBufferPct",
+        "active2PatienceMinutes", "active2NoRecoveryDropPct",
+        "active2HardStopPct",
         "metricsEnabled",
     )
 
@@ -272,6 +285,10 @@ class VirtualScalpExecutor:
             "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
             "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
             "liquidityDeathStagnationMaxDropPct",
+            "active2MonitorEnabled", "active2GracePeriodMinutes",
+            "active2QuickProfitPct", "active2TightBreakevenBufferPct",
+            "active2PatienceMinutes", "active2NoRecoveryDropPct",
+            "active2HardStopPct",
         }
         missing = [k for k in self._REQUIRED_CONFIG_KEYS
                    if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
@@ -305,6 +322,13 @@ class VirtualScalpExecutor:
                     "liquidityDeathExitScoreThreshold": 6,
                     "liquidityDeathStagnationHoldMin": 60,
                     "liquidityDeathStagnationMaxDropPct": 1.0,
+                    "active2MonitorEnabled": True,
+                    "active2GracePeriodMinutes": 5,
+                    "active2QuickProfitPct": 0.2,
+                    "active2TightBreakevenBufferPct": 0.15,
+                    "active2PatienceMinutes": 20,
+                    "active2NoRecoveryDropPct": 0.5,
+                    "active2HardStopPct": 1.5,
                 }[k]
 
         # Strict population — direct key access, no .get(default).
@@ -366,6 +390,14 @@ class VirtualScalpExecutor:
         self.ld_exit_score_threshold = int(cfg["liquidityDeathExitScoreThreshold"])
         self.ld_stagnation_hold_min = int(cfg["liquidityDeathStagnationHoldMin"])
         self.ld_stagnation_max_drop_pct = float(cfg["liquidityDeathStagnationMaxDropPct"])
+        # iter 41 — Post-Buy-2 careful monitor
+        self.a2_enabled = bool(cfg["active2MonitorEnabled"])
+        self.a2_grace_minutes = int(cfg["active2GracePeriodMinutes"])
+        self.a2_quick_profit_pct = float(cfg["active2QuickProfitPct"])
+        self.a2_tight_breakeven_buffer_pct = float(cfg["active2TightBreakevenBufferPct"])
+        self.a2_patience_minutes = int(cfg["active2PatienceMinutes"])
+        self.a2_no_recovery_drop_pct = float(cfg["active2NoRecoveryDropPct"])
+        self.a2_hard_stop_pct = float(cfg["active2HardStopPct"])
         if self.metrics is not None:
             self.metrics.enabled = bool(cfg["metricsEnabled"])
         self.config_loaded = True
@@ -872,6 +904,77 @@ class VirtualScalpExecutor:
         self._ld_kline_cache[symbol] = {"ts": now, "candles": candles}
         return candles
 
+    def _check_active2_monitor(self, state, current_price: float, avg: float,
+                                drop_pct: float):
+        """iter 41 (Virtual parity): Post-Buy-2 Careful Monitor.
+
+        Mirrors the Fast Scalper algorithm — see ``_check_active2_monitor``
+        there for the full design rationale. Differences are purely
+        sync (uses ``self._ld_get_recent_1m_klines`` for kline access)."""
+        if not self.a2_enabled:
+            return False, ""
+        if state.state != ladder.ACTIVE_2:
+            return False, ""
+        if not (state.buy_2 and state.buy_2.fill_ts and state.buy_2.fill_price):
+            return False, ""
+
+        now_ms = int(time.time() * 1000)
+        held_since_b2_min = (now_ms - int(state.buy_2.fill_ts)) / 60_000.0
+
+        # 1. Grace period
+        if held_since_b2_min < self.a2_grace_minutes:
+            return False, ""
+
+        # 2. Quick profit
+        qp_threshold = avg * (1 + self.a2_quick_profit_pct / 100.0)
+        if current_price >= qp_threshold:
+            return True, (f"active2_quick_profit "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_quick_profit_pct}%)=${qp_threshold:.6g} "
+                          f"held={held_since_b2_min:.0f}m")
+
+        # Pull klines for #3 + #4
+        candles = self._ld_get_recent_1m_klines(state.symbol) or []
+
+        # 3. Tight breakeven
+        tb_threshold = avg * (1 + self.a2_tight_breakeven_buffer_pct / 100.0)
+        ever_underwater_since_b2 = False
+        ever_recovered_since_b2 = False
+        for c in candles:
+            try:
+                ts = int(c[0])
+                if ts < int(state.buy_2.fill_ts):
+                    continue
+                if float(c[3]) < avg:    # low < avg
+                    ever_underwater_since_b2 = True
+                if float(c[2]) >= avg * 0.999:  # high >= avg×0.999
+                    ever_recovered_since_b2 = True
+            except Exception:
+                continue
+        if not candles:
+            ever_underwater_since_b2 = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+            ever_recovered_since_b2 = True
+
+        if ever_underwater_since_b2 and current_price >= tb_threshold:
+            return True, (f"active2_tight_breakeven "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_tight_breakeven_buffer_pct}%)=${tb_threshold:.6g}")
+
+        # 4. No recovery
+        if (held_since_b2_min >= self.a2_patience_minutes
+                and drop_pct >= self.a2_no_recovery_drop_pct
+                and not ever_recovered_since_b2):
+            return True, (f"active2_no_recovery "
+                          f"held={held_since_b2_min:.0f}m drop={drop_pct:.2f}% "
+                          f"never_touched_avg")
+
+        # 5. Hard stop
+        if self.a2_hard_stop_pct > 0 and drop_pct >= self.a2_hard_stop_pct:
+            return True, (f"active2_hard_stop drop={drop_pct:.2f}% "
+                          f">= {self.a2_hard_stop_pct}%")
+
+        return False, ""
+
     def _check_liquidity_death(self, state, current_price: float, avg: float,
                                held_min: float, drop_pct: float):
         """iter 39: multi-factor adaptive hard-stop. Returns
@@ -993,12 +1096,23 @@ class VirtualScalpExecutor:
 
         force_reason = None
 
-        # Path 0-A: liquidity-death smart exit
-        ld_exit, ld_reason = self._check_liquidity_death(
-            state, current_price, avg, held_min, drop_pct,
+        # Path -1 (iter 41): POST-BUY-2 CAREFUL MONITOR — runs FIRST
+        # whenever the ladder is in ACTIVE_2. Uses a specialised tree
+        # with grace period + quick-profit + tight-breakeven + no-recovery
+        # + tighter hard-stop. Falls through to the other paths below.
+        a2_exit, a2_reason = self._check_active2_monitor(
+            state, current_price, avg, drop_pct,
         )
-        if ld_exit:
-            force_reason = ld_reason
+        if a2_exit:
+            force_reason = a2_reason
+
+        # Path 0-A: liquidity-death smart exit
+        if force_reason is None:
+            ld_exit, ld_reason = self._check_liquidity_death(
+                state, current_price, avg, held_min, drop_pct,
+            )
+            if ld_exit:
+                force_reason = ld_reason
 
         # Path 0-B: fixed hard-stop fallback
         if (force_reason is None
@@ -1007,9 +1121,11 @@ class VirtualScalpExecutor:
                 and current_price <= hs_threshold):
             force_reason = "hard_stop_from_avg"
 
-        # Path 1: breakeven recovery
+        # Path 1: breakeven recovery — but skip in ACTIVE_2 (iter 41 has
+        # a tighter breakeven exit which took precedence above).
         ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
         if (force_reason is None
+                and state.state != ladder.ACTIVE_2
                 and self.ladder_breakeven_exit_enabled
                 and ever_underwater
                 and current_price >= be_threshold):
