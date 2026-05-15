@@ -224,6 +224,48 @@ class TradingConfig:
     ladderBreakevenExitEnabled: bool = True
     ladderBreakevenBufferPct: float = 0.50
 
+    # ── Hard stop from avg (iter 37, 2026-05-15) ─────────────────────────
+    # Caps the worst-case loss on a ladder that goes deeply underwater.
+    # The existing ladderHardStopBelowBuy3Pct only engages AFTER Buy 3
+    # fills, but Buy 3 is currently disabled (size=0) — so there is no
+    # hard stop at all today. A ladder that keeps falling can lose the
+    # full $96 minus whatever the panic-sell catches.
+    #
+    # Pattern from QNT / HBAR forensic (2026-05-14): both averaged-down
+    # ladders kept dropping for hours; user panic-sold at −0.3% to
+    # −0.5% from avg per leg. With $96 deployed, anything past −1.5%
+    # from avg is catastrophic for daily P&L.
+    #
+    # New logic: in any ACTIVE_* state, if live price <= avg ×
+    # (1 - ladderHardStopFromAvgPct/100), force-exit at market on the
+    # filled qty. Reason recorded as "hard_stop_from_avg".
+    #
+    # Default 1.5 % → max ~$1.50 realised loss on a $96 ladder when both
+    # legs filled; ~$0.75 when only Buy 1 filled. Painful but bounded.
+    # Set to 0 to disable.
+    ladderHardStopFromAvgEnabled: bool = True
+    ladderHardStopFromAvgPct: float = 1.5
+
+    # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
+    # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the
+    # retrace we were averaging-down for never came. Cancel Buy 2 and
+    # let the original TP order ride on Buy 1 alone (TP is still placed
+    # at avg×(1+tp_pct) which, with only Buy 1, equals Buy 1×(1+tp_pct)
+    # — fully reachable on normal momentum).
+    #
+    # Pattern from FLOKI vs HBAR / QNT: FLOKI's Buy 2 filled in 2 min
+    # (fast retrace = healthy mean-reversion = winner). HBAR's Buy 2
+    # took 21 min (sustained downtrend = avg-down deepens the hole).
+    # Cancelling stale Buy 2 prevents adding capital to a losing trend.
+    #
+    # The TP order placed when Buy 1 filled was sized for total qty
+    # (Buy 1 + Buy 2) at the avg=Buy 1×0.9975 price. If Buy 2 never
+    # fills, the bot will refresh the TP from `total_qty()` which only
+    # counts filled legs → effectively sells Buy 1 qty at Buy 1 ×
+    # (1 + tp_pct). That's the desired behaviour.
+    ladderBuy2StalenessEnabled: bool = True
+    ladderBuy2StalenessMinutes: int = 10
+
     # ── Trailing TP (iter 15) ────────────────────────────────────────────
     # Captures bigger upside on winners. When the static TP (set to net
     # ladderTargetNetProfitUsdt) is *reached*, instead of selling we cancel

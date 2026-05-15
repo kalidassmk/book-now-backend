@@ -199,6 +199,25 @@ class MultiSymbolScalper:
         self.ladder_breakeven_exit_enabled = True
         self.ladder_breakeven_buffer_pct = 0.50     # iter 36: 0.20→0.50 covers fees (0.15%) + slippage (~0.30%)
 
+        # ── Hard stop from avg (iter 37, 2026-05-15) ───────────────────
+        # Caps worst-case realised loss per ladder. Existing hard stop
+        # only fires in ACTIVE_3 (Buy 3 filled), but Buy 3 is disabled
+        # so it never engages. With $96 deployed and no floor, a
+        # downtrending ladder bleeds until break-even-recovery or
+        # time-exit catches it — both can lock in heavy losses.
+        # 1.5% from avg ⇒ ~$1.50 worst-case on full $96 ladder.
+        self.ladder_hard_stop_from_avg_enabled = True
+        self.ladder_hard_stop_from_avg_pct = 1.5
+
+        # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
+        # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
+        # it. The retrace we were averaging-down for never came, and
+        # filling Buy 2 in a sustained downtrend deepens the hole. Quick
+        # retraces (FLOKI: 2 min) are winners; slow drifts (HBAR: 21 min)
+        # are losers.
+        self.ladder_buy2_staleness_enabled = True
+        self.ladder_buy2_staleness_minutes = 10
+
         # Trailing-TP (iter 15) — once static TP target is reached we
         # cancel the limit TP and trail the running peak. Sells when price
         # retraces by ladder_trailing_tp_pct% from peak. Captures bigger
@@ -450,6 +469,9 @@ class MultiSymbolScalper:
         "ladderCooldownSeconds",
         "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
         "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+        # iter 37 (2026-05-15)
+        "ladderHardStopFromAvgEnabled", "ladderHardStopFromAvgPct",
+        "ladderBuy2StalenessEnabled", "ladderBuy2StalenessMinutes",
         "ladderTrailingTpEnabled", "ladderTrailingTpPct",
         "pendingPumpDumpCancelEnabled", "pendingPumpThresholdPct",
         "pendingDumpFromPeakPct", "pendingMinAgeSeconds",
@@ -550,6 +572,11 @@ class MultiSymbolScalper:
         self.ladder_max_hold_seconds = int(cfg["ladderMaxHoldSeconds"])
         self.ladder_breakeven_exit_enabled = bool(cfg["ladderBreakevenExitEnabled"])
         self.ladder_breakeven_buffer_pct = float(cfg["ladderBreakevenBufferPct"])
+        # iter 37 (2026-05-15)
+        self.ladder_hard_stop_from_avg_enabled = bool(cfg["ladderHardStopFromAvgEnabled"])
+        self.ladder_hard_stop_from_avg_pct = float(cfg["ladderHardStopFromAvgPct"])
+        self.ladder_buy2_staleness_enabled = bool(cfg["ladderBuy2StalenessEnabled"])
+        self.ladder_buy2_staleness_minutes = int(cfg["ladderBuy2StalenessMinutes"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -1717,7 +1744,11 @@ class MultiSymbolScalper:
         """
         if state is None or state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
             return False
-        if not (self.ladder_time_exit_enabled or self.ladder_breakeven_exit_enabled):
+        # iter 37: hard_stop_from_avg is also a valid reason to enter
+        # this function. If all three exits are off, skip.
+        if not (self.ladder_time_exit_enabled
+                or self.ladder_breakeven_exit_enabled
+                or self.ladder_hard_stop_from_avg_enabled):
             return False
 
         now_ms = int(time.time() * 1000)
@@ -1746,15 +1777,31 @@ class MultiSymbolScalper:
 
         # Break-even threshold: avg × (1 + buffer%). Covers spread + slippage.
         be_threshold = avg * (1 + self.ladder_breakeven_buffer_pct / 100.0)
+        # iter 37: hard-stop-from-avg threshold. Floor below which we
+        # market-sell to cap worst-case loss.
+        hs_threshold = avg * (1 - self.ladder_hard_stop_from_avg_pct / 100.0)
 
         force_reason = None
+        # Path 0 (iter 37): HARD STOP FROM AVG — wins over all other paths.
+        # If price has fallen >= ladder_hard_stop_from_avg_pct from
+        # weighted-avg, dump immediately. This bounds the realised loss
+        # per ladder to ~$1.50 on a full $96 deployment.
+        # Pattern from 2026-05-14 forensic: QNT / HBAR / and similar
+        # losers kept bleeding for hours; break-even-recovery and
+        # time-exit caught them too late, at heavier losses than the
+        # operator could tolerate.
+        if (self.ladder_hard_stop_from_avg_enabled
+                and self.ladder_hard_stop_from_avg_pct > 0
+                and current_price <= hs_threshold):
+            force_reason = "hard_stop_from_avg"
+
         # Path 1: break-even recovery. Only fires when we've gone
         # underwater AT ANY POINT in this ladder's life. The state flag
         # below_avg_started_ts is "currently underwater"; the more
         # interesting flag is "ever went underwater" — covered by
         # total_underwater_ms > 0 OR currently underwater.
         ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
-        if self.ladder_breakeven_exit_enabled and ever_underwater:
+        if force_reason is None and self.ladder_breakeven_exit_enabled and ever_underwater:
             if current_price >= be_threshold:
                 force_reason = "breakeven_recovery"
 
@@ -2147,6 +2194,50 @@ class MultiSymbolScalper:
             if o2_status in ("canceled", "cancelled", "expired"):
                 await self._handle_external_cancel(state, "buy 2")
                 return
+
+            # iter 37 (2026-05-15): Buy 2 staleness cancel.
+            # If Buy 2 LIMIT is still open (not closed, not cancelled)
+            # and more than N minutes have passed since Buy 1 filled,
+            # cancel Buy 2. The retrace we were averaging-down for never
+            # materialised. Pattern from forensic: FLOKI Buy 2 filled
+            # in 2 min → winner; HBAR Buy 2 took 21 min → averaged-down
+            # into a sustained downtrend and lost. Cancelling here keeps
+            # Buy 1 + the existing TP order alive; when the TP refreshes
+            # it'll target avg=Buy1 × (1+tp_pct) which is fully reachable.
+            if (self.ladder_buy2_staleness_enabled
+                    and o2 and o2_status not in ("closed", "filled")
+                    and state.buy_1 and state.buy_1.fill_ts):
+                staleness_ms = self.ladder_buy2_staleness_minutes * 60 * 1000
+                age_since_buy1_fill = int(time.time() * 1000) - int(state.buy_1.fill_ts)
+                if age_since_buy1_fill >= staleness_ms:
+                    try:
+                        await self.client.cancel_order(state.buy_2.order_id, state.symbol)
+                    except Exception as exc:
+                        log.warning(f"⚠️ [ladder] {state.symbol} stale buy 2 cancel failed: {exc}")
+                    state.buy_2.status = "cancelled"
+                    state.buy_2.order_id = None
+                    # Also cancel Buy 3 (if any) — same logic, the
+                    # retrace never came.
+                    if state.buy_3 and state.buy_3.order_id:
+                        try:
+                            await self.client.cancel_order(state.buy_3.order_id, state.symbol)
+                        except Exception:
+                            pass
+                        state.buy_3.status = "cancelled"
+                        state.buy_3.order_id = None
+                    # Refresh TP at the new (Buy 1 only) weighted avg so
+                    # it actually fires at a price the market can reach.
+                    try:
+                        await self._ladder_refresh_tp(state, f, tick)
+                    except Exception as exc:
+                        log.warning(f"⚠️ [ladder] {state.symbol} TP refresh after stale buy 2 failed: {exc}")
+                    ladder.save_state(self.redis, state)
+                    log.info(f"⏱️  [ladder] {state.symbol} buy 2 cancelled — stale "
+                             f"({age_since_buy1_fill/60000:.1f} min ≥ "
+                             f"{self.ladder_buy2_staleness_minutes} min since Buy 1 fill); "
+                             f"new TP={state.tp_target_price:.6g}")
+                    return
+
             if o2 and o2_status == "closed":
                 qty = float(o2.get("filled") or 0)
                 price = float(o2.get("average") or o2.get("price") or state.buy_2.target_price)
