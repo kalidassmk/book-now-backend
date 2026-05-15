@@ -218,8 +218,32 @@ class MultiSymbolScalper:
         # downtrending ladder bleeds until break-even-recovery or
         # time-exit catches it — both can lock in heavy losses.
         # 1.5% from avg ⇒ ~$1.50 worst-case on full $96 ladder.
+        # Iter 39 (2026-05-15): kept as a SECONDARY safety net beneath
+        # the smarter liquidity-death exit — fires only when the smart
+        # exit is disabled or its catastrophic floor (2.5%) hasn't yet
+        # been hit. See ``_check_liquidity_death`` below.
         self.ladder_hard_stop_from_avg_enabled = True
         self.ladder_hard_stop_from_avg_pct = 1.5
+
+        # ── Liquidity-Death adaptive exit (iter 39, 2026-05-15) ────────
+        # Replaces "fixed price drop = sell" with a multi-factor
+        # detector. Strongest predictor of "won't bounce" from the
+        # QNT/HBAR/FLOKI forensic was 5-min volume / pre-signal-vol
+        # baseline. Defaults below capture that with three tiers:
+        #   • Catastrophic (drop ≥ 2.5%)            — instant exit
+        #   • Liquidity-death score (drop ≥ 0.3 +)  — exit on factor combo
+        #   • Stagnation (held ≥ 60min, dead vol)   — exit dead capital
+        self.ld_enabled = True
+        self.ld_catastrophic_drop_pct = 2.5
+        self.ld_min_hold_min = 10
+        self.ld_min_drop_pct = 0.3
+        self.ld_lookback_min = 10
+        self.ld_vol_collapse_threshold = 0.7
+        self.ld_lower_lows_threshold = 0.55
+        self.ld_red_share_threshold = 0.60
+        self.ld_exit_score_threshold = 6
+        self.ld_stagnation_hold_min = 60
+        self.ld_stagnation_max_drop_pct = 1.0
 
         # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ───────────────
         # If Buy 2 LIMIT doesn't fill within N minutes of Buy 1, cancel
@@ -490,6 +514,13 @@ class MultiSymbolScalper:
         # iter 38 (2026-05-15)
         "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
         "nearTopPumpMaxFromHighPct",
+        # iter 39 (2026-05-15) — liquidity-death adaptive exit
+        "liquidityDeathExitEnabled", "liquidityDeathCatastrophicDropPct",
+        "liquidityDeathMinHoldMin", "liquidityDeathMinDropPct",
+        "liquidityDeathLookbackMin", "liquidityDeathVolCollapseThreshold",
+        "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
+        "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
+        "liquidityDeathStagnationMaxDropPct",
         "metricsEnabled",
     )
 
@@ -592,6 +623,18 @@ class MultiSymbolScalper:
         self.ladder_hard_stop_from_avg_pct = float(cfg["ladderHardStopFromAvgPct"])
         self.ladder_buy2_staleness_enabled = bool(cfg["ladderBuy2StalenessEnabled"])
         self.ladder_buy2_staleness_minutes = int(cfg["ladderBuy2StalenessMinutes"])
+        # iter 39 (2026-05-15) — liquidity-death adaptive exit
+        self.ld_enabled = bool(cfg["liquidityDeathExitEnabled"])
+        self.ld_catastrophic_drop_pct = float(cfg["liquidityDeathCatastrophicDropPct"])
+        self.ld_min_hold_min = int(cfg["liquidityDeathMinHoldMin"])
+        self.ld_min_drop_pct = float(cfg["liquidityDeathMinDropPct"])
+        self.ld_lookback_min = int(cfg["liquidityDeathLookbackMin"])
+        self.ld_vol_collapse_threshold = float(cfg["liquidityDeathVolCollapseThreshold"])
+        self.ld_lower_lows_threshold = float(cfg["liquidityDeathLowerLowsThreshold"])
+        self.ld_red_share_threshold = float(cfg["liquidityDeathRedShareThreshold"])
+        self.ld_exit_score_threshold = int(cfg["liquidityDeathExitScoreThreshold"])
+        self.ld_stagnation_hold_min = int(cfg["liquidityDeathStagnationHoldMin"])
+        self.ld_stagnation_max_drop_pct = float(cfg["liquidityDeathStagnationMaxDropPct"])
         self.ladder_trailing_tp_enabled = bool(cfg["ladderTrailingTpEnabled"])
         self.ladder_trailing_tp_pct = float(cfg["ladderTrailingTpPct"])
         self.pending_pump_dump_enabled = bool(cfg["pendingPumpDumpCancelEnabled"])
@@ -1461,6 +1504,7 @@ class MultiSymbolScalper:
                         label="buy_1", target_price=buy1_price,
                         size_usdt=self.ladder_buy1_size, order_id=str(order_id),
                     ),
+                    pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
                 )
                 ladder.save_state(self.redis, state)
                 log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
@@ -1509,6 +1553,7 @@ class MultiSymbolScalper:
                         qty_filled=base_qty, fill_price=fill_price, fill_ts=now_ms,
                         status="filled",
                     ),
+                    pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
                 )
                 log.info(f"🪜 [ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
                 if self.metrics is not None:
@@ -1550,6 +1595,7 @@ class MultiSymbolScalper:
                     label="buy_1", target_price=buy1_price,
                     size_usdt=self.ladder_buy1_size, order_id=str(order_id),
                 ),
+                pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
             )
             ladder.save_state(self.redis, state)
             log.info(f"🪜 [ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
@@ -1799,6 +1845,135 @@ class MultiSymbolScalper:
             except Exception as exc:
                 log.warning(f"⚠️ [ladder] tick failed for {symbol}: {exc}")
 
+    def _check_liquidity_death(self, state, current_price: float, avg: float,
+                               held_min: float, drop_pct: float):
+        """Iter 39 (2026-05-15) — adaptive multi-factor hard-stop.
+
+        Background: the QNT/HBAR/FLOKI forensic showed that the fixed
+        1.5%-from-avg hard stop never fires on the real loss pattern:
+        all three coins dropped only 0.36-0.63% but two were losers
+        and one was a winner. The discriminating factor was VOLUME —
+        winners had 2.6× pre-signal vol, losers had 0.28-0.63×.
+
+        Three tiers:
+          • Tier 1 (catastrophic): drop ≥ ld_catastrophic_drop_pct →
+            instant exit, no further checks. Hard ceiling on loss.
+          • Tier 2 (score-based): only when held ≥ ld_min_hold_min AND
+            drop ≥ ld_min_drop_pct. Score points from vol-collapse,
+            never-recovered, depth, lower-lows, red-share. Exit when
+            score ≥ ld_exit_score_threshold.
+          • Tier 3 (stagnation): held ≥ ld_stagnation_hold_min AND
+            drop in [0, ld_stagnation_max_drop_pct] AND vol-collapsed
+            AND not approaching TP. Frees stuck-but-not-dying capital
+            (HBAR pattern: -0.28% for 5h).
+
+        Returns (should_exit: bool, reason: str). On any internal
+        failure returns (False, ""), letting the rest of the force-exit
+        pipeline run as fallback.
+        """
+        if not self.ld_enabled:
+            return False, ""
+        if avg <= 0 or current_price <= 0:
+            return False, ""
+
+        # Tier 1: catastrophic — no diagnostics needed, just dump.
+        if (self.ld_catastrophic_drop_pct > 0
+                and drop_pct >= self.ld_catastrophic_drop_pct):
+            return True, f"liquidity_death:catastrophic drop={drop_pct:.2f}%"
+
+        # Below catastrophic floor: need klines to score liquidity.
+        if self.klines_cache is None:
+            return False, ""
+        try:
+            if not self.klines_cache.has(state.symbol, "1m"):
+                return False, ""
+            df = self.klines_cache.get_klines(state.symbol, "1m",
+                                              self.ld_lookback_min)
+        except Exception:
+            return False, ""
+        if df is None or df.empty or len(df) < max(3, self.ld_lookback_min // 2):
+            return False, ""
+
+        # Compute factors from the kline window.
+        try:
+            closes = df["close"].astype(float).tolist()
+            opens = df["open"].astype(float).tolist()
+            highs = df["high"].astype(float).tolist()
+            lows = df["low"].astype(float).tolist()
+            vols = df["volume"].astype(float).tolist()   # base-asset volume
+        except Exception:
+            return False, ""
+
+        n = len(df)
+        # Convert base-vol to USDT-equivalent using each candle's close.
+        recent_vol_usdt = sum(v * c for v, c in zip(vols, closes))
+        vol_per_min = recent_vol_usdt / n if n > 0 else 0.0
+
+        baseline = state.pre_vol_baseline_usdt or 0.0
+        vol_ratio = (vol_per_min / baseline) if baseline > 0 else 1.0
+
+        lower_lows = sum(1 for i in range(1, n) if lows[i] < lows[i - 1])
+        lower_lows_pct = lower_lows / max(1, n - 1)
+
+        red = sum(1 for o, c in zip(opens, closes) if c < o)
+        red_share = red / n
+
+        max_high = max(highs)
+        ever_recovered = max_high >= avg * 0.999    # touched breakeven since fill
+
+        # Tier 2: score-based. Don't even score until we have a real
+        # drop and the trade has had time to develop.
+        tier2_eligible = (
+            held_min >= self.ld_min_hold_min and
+            drop_pct >= self.ld_min_drop_pct
+        )
+        if tier2_eligible:
+            score = 0
+            factors = []
+            if vol_ratio < self.ld_vol_collapse_threshold:
+                score += 3
+                factors.append(f"vol={vol_ratio:.2f}x")
+                # Extreme bonus when vol is HALF the already-low threshold.
+                if vol_ratio < self.ld_vol_collapse_threshold * 0.5:
+                    score += 2
+                    factors.append("vol_extreme")
+            if not ever_recovered:
+                score += 2
+                factors.append("never_recovered")
+            if drop_pct >= 1.0:
+                score += 2
+                factors.append(f"drop={drop_pct:.2f}%")
+            if lower_lows_pct >= self.ld_lower_lows_threshold:
+                score += 2
+                factors.append(f"ll={lower_lows_pct:.0%}")
+            if red_share >= self.ld_red_share_threshold:
+                score += 1
+                factors.append(f"red={red_share:.0%}")
+
+            if score >= self.ld_exit_score_threshold:
+                reason = (f"liquidity_death:score={score} "
+                          + " ".join(factors)
+                          + f" drop={drop_pct:.2f}% held={held_min:.0f}m")
+                return True, reason
+
+        # Tier 3: stagnation — no drop big enough to score, but the
+        # position has been sitting forever with no buyers.
+        tier3_eligible = (
+            held_min >= self.ld_stagnation_hold_min and
+            0 <= drop_pct <= self.ld_stagnation_max_drop_pct and
+            vol_ratio < self.ld_vol_collapse_threshold and
+            # Price never came close to TP (peak / TP target ratio < 0.7).
+            (state.tp_target_price <= 0
+             or max_high / state.tp_target_price < 0.7)
+        )
+        if tier3_eligible:
+            reason = (f"liquidity_death:stagnation "
+                      f"held={held_min:.0f}m drop={drop_pct:.2f}% "
+                      f"vol={vol_ratio:.2f}x no_tp_approach")
+            return True, reason
+
+        return False, ""
+
     async def _maybe_force_exit_ladder(self, state, f):
         """Iter 14 time-based + break-even exit logic.
 
@@ -1861,15 +2036,29 @@ class MultiSymbolScalper:
         hs_threshold = avg * (1 - self.ladder_hard_stop_from_avg_pct / 100.0)
 
         force_reason = None
-        # Path 0 (iter 37): HARD STOP FROM AVG — wins over all other paths.
-        # If price has fallen >= ladder_hard_stop_from_avg_pct from
-        # weighted-avg, dump immediately. This bounds the realised loss
-        # per ladder to ~$1.50 on a full $96 deployment.
-        # Pattern from 2026-05-14 forensic: QNT / HBAR / and similar
-        # losers kept bleeding for hours; break-even-recovery and
-        # time-exit caught them too late, at heavier losses than the
-        # operator could tolerate.
-        if (self.ladder_hard_stop_from_avg_enabled
+
+        # Path 0-A (iter 39, 2026-05-15): LIQUIDITY-DEATH adaptive exit.
+        # Smarter than iter37's fixed-pct hard stop. Combines drop %
+        # with volume collapse, lower-lows, never-recovered flags, and
+        # a stagnation tier for "dead-but-not-dropping" positions like
+        # HBAR (sat -0.28% for 5h, vol ratio 0.28x). Always evaluated
+        # first; falls through to the iter37 fixed stop if disabled or
+        # if no tier fires.
+        drop_pct = (avg - current_price) / avg * 100
+        fill_ts = state.buy_1.fill_ts if state.buy_1 else 0
+        held_min = ((now_ms - fill_ts) / 60_000.0) if fill_ts else 0.0
+        ld_exit, ld_reason = self._check_liquidity_death(
+            state, current_price, avg, held_min, drop_pct,
+        )
+        if ld_exit:
+            force_reason = ld_reason
+
+        # Path 0-B (iter 37): fixed-pct HARD STOP FROM AVG — fallback.
+        # Only engages if the smarter liquidity-death exit didn't fire.
+        # Retained as a belt-and-suspenders cap in case the kline
+        # cache is unavailable or the operator disables iter39.
+        if (force_reason is None
+                and self.ladder_hard_stop_from_avg_enabled
                 and self.ladder_hard_stop_from_avg_pct > 0
                 and current_price <= hs_threshold):
             force_reason = "hard_stop_from_avg"

@@ -246,6 +246,61 @@ class TradingConfig:
     ladderHardStopFromAvgEnabled: bool = True
     ladderHardStopFromAvgPct: float = 1.5
 
+    # ── Liquidity-Death adaptive hard-stop (iter 39, 2026-05-15) ──────────
+    # Forensic of QNT/HBAR/FLOKI on 2026-05-14/15 showed the real signal
+    # for "this coin won't pump back" is VOLUME COLLAPSE, not price drop:
+    #
+    #   Metric             QNT (loss)   HBAR (loss)   FLOKI (win)
+    #   --------------     ----------   -----------   -----------
+    #   Drop max           -0.36%       -0.63%        -0.40%   ← all similar
+    #   Vol ratio (hold/pre) 0.63x      0.28x         2.60x    ← 4-9× gap
+    #   Trades/min          16           60           793       ← 13-50× gap
+    #
+    # All three coins dropped a similar amount; the fixed 1.5 % hard
+    # stop wouldn't have fired on ANY. The difference between win and
+    # loss was whether volume returned. When volume dies, the price
+    # can't bounce; the ladder just rots underwater until the operator
+    # panic-sells.
+    #
+    # New algorithm — multi-factor "Dead Coin Score":
+    #
+    #   Tier 1 (catastrophic): drop ≥ ldCatastrophicDropPct  → EXIT NOW
+    #     (replaces the iter37 fixed 1.5%; widened to 2.5% because the
+    #      smart tiers below catch losers EARLIER on liquidity signals.)
+    #
+    #   Tier 2 (liquidity-death score):  only when held ≥ ldMinHoldMin
+    #     AND drop ≥ ldMinDropPct. Score points from N factors:
+    #       +3  vol_ratio < ldVolCollapseThreshold
+    #       +2  vol_ratio < ldVolCollapseThreshold × 0.5  (extreme)
+    #       +2  no candle since fill reached avg × 0.999 (never recovered)
+    #       +2  drop ≥ 1.0%
+    #       +2  lower-lows share ≥ ldLowerLowsThreshold
+    #       +1  red-candle share ≥ ldRedShareThreshold
+    #     Exit when score ≥ ldExitScoreThreshold.
+    #
+    #   Tier 3 (stagnation): held ≥ ldStagnationHoldMin AND drop in
+    #     [-1%, 0%] AND vol_ratio < ldVolCollapseThreshold AND price
+    #     hasn't approached TP. Frees capital from "dead but not dropping"
+    #     positions like HBAR which sat at -0.28% for 5h.
+    #
+    # Worked examples (validated on the forensic data):
+    #   QNT  vol=0.63x ll=34% red=46% drop=0.20%  → score ≈ 3  → HOLD ✓
+    #     (QNT actually recovered to +$0.04 net; user panic-cancelled.)
+    #   HBAR vol=0.28x ll=38% red=47% drop=0.28%  → caught by Tier 3 ✓
+    #     after 60min instead of bleeding 5h.
+    #   FLOKI vol=2.60x → no factors fire → HOLD ✓ → TP hit at +$0.23.
+    liquidityDeathExitEnabled: bool = True
+    liquidityDeathCatastrophicDropPct: float = 2.5   # absolute floor
+    liquidityDeathMinHoldMin: int = 10               # wait this long before evaluating
+    liquidityDeathMinDropPct: float = 0.3            # need at least this much loss
+    liquidityDeathLookbackMin: int = 10              # # of 1m candles to analyse
+    liquidityDeathVolCollapseThreshold: float = 0.7  # vol_now < 70% baseline = dead
+    liquidityDeathLowerLowsThreshold: float = 0.55   # ≥55% lower-lows in window
+    liquidityDeathRedShareThreshold: float = 0.60    # ≥60% red candles
+    liquidityDeathExitScoreThreshold: int = 6        # sum of factors to exit
+    liquidityDeathStagnationHoldMin: int = 60        # Tier 3 hold floor
+    liquidityDeathStagnationMaxDropPct: float = 1.0  # only when drop in [0, this]
+
     # ── Buy 2 staleness cancel (iter 37, 2026-05-15) ─────────────────────
     # If Buy 2 LIMIT hasn't filled within N minutes after Buy 1, the
     # retrace we were averaging-down for never came. Cancel Buy 2 and

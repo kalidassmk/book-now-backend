@@ -111,6 +111,12 @@ class LadderState:
     peak_since_signal: float = 0.0
     closed_ts: int = 0
     exit_reason: str = ""
+    # 2026-05-15 iter 39: per-minute USDT volume baseline from the
+    # 60 min BEFORE Buy 1 was placed. Used by the liquidity-death
+    # exit to score "vol_now vs vol_pre" — the strongest predictor
+    # of "this coin won't pump back" identified in the HBAR/QNT/FLOKI
+    # forensic. Defaults to 0 if features didn't include it (old states).
+    pre_vol_baseline_usdt: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         d = {
@@ -129,6 +135,7 @@ class LadderState:
             "peak_since_signal": self.peak_since_signal,
             "closed_ts": self.closed_ts,
             "exit_reason": self.exit_reason,
+            "pre_vol_baseline_usdt": self.pre_vol_baseline_usdt,
         }
         for tag, leg in (("buy_1", self.buy_1), ("buy_2", self.buy_2), ("buy_3", self.buy_3)):
             d[tag] = asdict(leg) if leg is not None else None
@@ -157,6 +164,7 @@ class LadderState:
             peak_since_signal=float(d.get("peak_since_signal") or 0),
             closed_ts=int(d.get("closed_ts") or 0),
             exit_reason=d.get("exit_reason") or "",
+            pre_vol_baseline_usdt=float(d.get("pre_vol_baseline_usdt") or 0),
         )
 
     # ── helpers ──────────────────────────────────────────────────────────
