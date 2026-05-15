@@ -476,7 +476,7 @@ class TradingConfig:
     #                       candles are red  (default 70%)
     marketStressExitEnabled: bool = True
     marketStressMinHoldMin: int = 30
-    marketStressMinDropPct: float = 0.5
+    marketStressMinDropPct: float = 1.0      # iter 46 tuned 2026-05-15: 0.5 → 1.0 (kills 3 false positives)
     marketStressBtcWeaknessPct: float = 0.5
     marketStressBtcLookbackMin: int = 30
     marketStressVolSpikeMult: float = 5.0

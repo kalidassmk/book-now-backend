@@ -304,7 +304,7 @@ class MultiSymbolScalper:
         # LINK pattern (BTC-led drop with volume capitulation).
         self.ms_enabled = True
         self.ms_min_hold_min = 30
-        self.ms_min_drop_pct = 0.5
+        self.ms_min_drop_pct = 1.0   # iter 46 tuned: 0.5 → 1.0 (no false positives)
         self.ms_btc_weakness_pct = 0.5
         self.ms_btc_lookback_min = 30
         self.ms_vol_spike_mult = 5.0
