@@ -675,6 +675,13 @@ class TradingConfig:
     pumpRiderWatchlistMaxAgeSec: int = 1800          # 30-min freshness
     iter56WatchlistAppliedAt: str = "2026-05-23"
 
+    # ── Telegram alerts (iter 58, 2026-05-23) ────────────────────────────
+    # Operator request: get pushed to phone whenever the bot buys, fills,
+    # or sells a coin.  Requires TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID
+    # env vars; see booknow/util/alerts.py for setup steps.
+    alertsEnabled: bool = True
+    iter58AlertsAppliedAt: str = "2026-05-23"
+
     # ── Velocity-aware TSL (iter 57, 2026-05-23) ─────────────────────────
     # The ORCAUSDT post-mortem: bought $1.397, peak $1.400 (10:50), low
     # $1.395 (10:56).  Old TSL fired the moment trail-stop was breached

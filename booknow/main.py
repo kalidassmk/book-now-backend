@@ -385,6 +385,25 @@ async def _bootstrap() -> None:
                     "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
                     order_id, symbol, price,
                 )
+                # iter 58 — Telegram alert BEFORE state cleanup so we
+                # still have buy_price + entry_time for realised P&L.
+                try:
+                    from booknow.util.alerts import alert_sold
+                    from time import time as _now
+                    cfg_alerts = await config_service.get()
+                    if getattr(cfg_alerts, "alertsEnabled", True):
+                        hold_s = int(max(0, _now() - pos.entry_time))
+                        await alert_sold(
+                            symbol=symbol,
+                            buy_price=pos.buy_price,
+                            sell_price=price,
+                            qty=pos.qty,
+                            reason="TP",
+                            hold_seconds=hold_s,
+                        )
+                except Exception as e:
+                    log.debug("[+TARGET HIT] alert_sold failed for %s: %s", symbol, e)
+
                 trade_state.mark_sold(symbol)
                 tsl.reset(symbol)
                 trailing_tp.unregister(symbol)
@@ -440,6 +459,15 @@ async def _bootstrap() -> None:
     await http_server.start()
 
     log.info("Engine running. Press Ctrl-C to stop.")
+
+    # iter 58 — fire-and-forget startup alert so the operator knows
+    # Telegram is wired correctly the moment the engine is up.
+    try:
+        from booknow.util.alerts import alert_startup, is_configured
+        if getattr(initial_config, "alertsEnabled", True) and is_configured():
+            await alert_startup(version_tag="iter58")
+    except Exception as e:
+        log.debug("startup alert failed: %s", e)
 
     # Idle until interrupted. Subsequent phases will spawn their own
     # tasks here; main.py's job is to supervise them and shut down
