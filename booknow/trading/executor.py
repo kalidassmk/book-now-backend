@@ -50,6 +50,7 @@ import uuid
 from decimal import Decimal, ROUND_CEILING
 from typing import Any, Dict, Mapping, Optional
 
+import httpx
 import redis.asyncio as aioredis
 
 from booknow.binance.delist import DelistService
@@ -118,6 +119,7 @@ class TradeExecutor:
         config_service: TradingConfigService,
         dust_service: Optional[DustService] = None,
         coin_analyzer=None,           # CoinAnalyzer; optional
+        dashboard_url: str = "",      # iter 48: /api/check-coin host
         live_mode: bool = False,
     ):
         self._redis = redis_client
@@ -129,6 +131,10 @@ class TradeExecutor:
         self._config = config_service
         self._dust = dust_service
         self._analyzer = coin_analyzer
+        self._dashboard_url = dashboard_url.rstrip("/")
+        # Shared HTTP client for /api/check-coin and any other dashboard
+        # calls.  Reused across try_buy invocations.
+        self._http: Optional[httpx.AsyncClient] = None
         self.live_mode = live_mode
         self._guard = _get_rate_limit_guard()
 
@@ -142,6 +148,44 @@ class TradeExecutor:
         access from outside the class.
         """
         self._dust = dust_service
+
+    async def _check_coin_blocked(
+        self, symbol: str, timeout_s: float, fail_closed: bool,
+    ) -> Optional[str]:
+        """Call the dashboard's /api/check-coin endpoint to run the full
+        pre-buy filter pipeline.
+
+        Returns a non-empty string (the blocker reason) when the buy
+        should be SKIPPED, or ``None`` when it can proceed.
+
+        Network/timeout/parse errors are governed by ``fail_closed``:
+          - True  → return a synthetic "filter-unreachable" reason (skip).
+          - False → return None (proceed without filtering — risky).
+        """
+        if not self._dashboard_url:
+            # No URL configured → skip the check (legacy behaviour).
+            return None
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=timeout_s)
+        url = f"{self._dashboard_url}/api/check-coin"
+        try:
+            resp = await self._http.get(url, params={"symbol": symbol},
+                                        timeout=timeout_s)
+            if resp.status_code != 200:
+                if fail_closed:
+                    return f"check-coin HTTP {resp.status_code}"
+                return None
+            data = resp.json()
+            verdict = data.get("verdict") or {}
+            if verdict.get("blocked"):
+                blocker = verdict.get("blocker") or "unknown"
+                reason = verdict.get("blocker_reason") or ""
+                return f"{blocker}: {reason}" if reason else blocker
+            return None
+        except httpx.TimeoutException:
+            return "check-coin timeout" if fail_closed else None
+        except Exception as e:
+            return f"check-coin error: {e}" if fail_closed else None
 
     # ── Auto-trader entry ───────────────────────────────────────────────
 
@@ -185,6 +229,36 @@ class TradeExecutor:
                 logger.warning("[%s] CoinAnalyzer error for %s: %s — fast-scalp fallback (proceeding)", rule_label, symbol, e)
         else:
             logger.debug("[%s] Fast-scalp mode: skipping CoinAnalyzer for %s", rule_label, symbol)
+
+        # ── iter 48: dashboard filter pipeline (falling-knife, vol-regime, ──
+        # post-pump, near-top, macro-top, overbought, VWAP, RSI, EMA-slope,
+        # market-stress, bad-hours, blacklist).  Same gate the Pattern Bot
+        # already uses; brings the R1/R2/R3 rules into parity with the
+        # Fast/Virtual Scalper subprocesses.
+        if cfg.useCheckCoinFilterEnabled:
+            block_reason = await self._check_coin_blocked(
+                symbol=symbol,
+                timeout_s=float(cfg.checkCoinTimeoutSec),
+                fail_closed=bool(cfg.checkCoinFailClosed),
+            )
+            if block_reason:
+                logger.info(
+                    "[%s] Skip %s — filter blocked: %s", rule_label, symbol, block_reason,
+                )
+                try:
+                    await self._redis.lpush(
+                        f"METRICS:SKIP:{time.strftime('%Y-%m-%d')}",
+                        json.dumps({
+                            "ts": int(time.time() * 1000),
+                            "symbol": symbol,
+                            "rule": "rules_pre_buy_filter",
+                            "reason": block_reason,
+                            "rule_label": rule_label,
+                        }),
+                    )
+                except Exception:
+                    pass
+                return
 
         # ── Place the buy order ──────────────────────────────────────
         if self._guard.is_banned():

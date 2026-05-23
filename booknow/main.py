@@ -117,6 +117,13 @@ async def _bootstrap() -> None:
         initial_config.buyAmountUsdt, initial_config.profitAmountUsdt,
         initial_config.tslPct, initial_config.maxHoldSeconds,
     )
+    log.info(
+        "  iter48 protections: hardSL=%.2f%% checkCoinFilter=%s failClosed=%s dashboard=%s",
+        getattr(initial_config, "hardStopLossPct", 0.0),
+        getattr(initial_config, "useCheckCoinFilterEnabled", False),
+        getattr(initial_config, "checkCoinFailClosed", False),
+        settings.dashboard_url,
+    )
 
     # WS-API client — always instantiated (it doesn't connect until used).
     # Live methods (signed orders) only fire when settings.live_mode is True.
@@ -185,6 +192,7 @@ async def _bootstrap() -> None:
         config_service=config_service,
         dust_service=None,            # filled in below in live mode
         coin_analyzer=coin_analyzer,
+        dashboard_url=settings.dashboard_url,   # iter 48: /api/check-coin
         live_mode=settings.live_mode,
     )
 
@@ -194,6 +202,7 @@ async def _bootstrap() -> None:
         tsl=tsl,
         executor=trade_executor,
         max_hold_seconds=initial_config.maxHoldSeconds,
+        config_service=config_service,          # iter 48: read hardStopLossPct
     )
     await position_monitor.start()
     log.info(

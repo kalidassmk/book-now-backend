@@ -29,6 +29,7 @@ from typing import Any, Dict, Optional, Protocol
 
 import redis.asyncio as aioredis
 
+from booknow.config.trading_config import TradingConfigService
 from booknow.processors.base import AsyncProcessor
 from booknow.repository import redis_keys
 from booknow.trading.state import Position, TradeState
@@ -85,6 +86,7 @@ class PositionMonitor(AsyncProcessor):
         tsl: TrailingStopLoss,
         executor: ExitExecutor,
         max_hold_seconds: int = 3600,  # 1 h default; live cfg.maxHoldSeconds wins regardless
+        config_service: Optional[TradingConfigService] = None,
     ):
         super().__init__()
         self._redis = redis_client
@@ -92,6 +94,7 @@ class PositionMonitor(AsyncProcessor):
         self._tsl = tsl
         self._executor = executor
         self.max_hold_seconds = max_hold_seconds
+        self._config = config_service
 
     async def _tick(self) -> None:
         positions = self._state.snapshot()
@@ -100,6 +103,16 @@ class PositionMonitor(AsyncProcessor):
 
         prices = await self._read_current_prices(list(positions.keys()))
         now_ts = time()
+
+        # Pull config once per tick (Redis hit; cheap).  Lets the operator
+        # tune hardStopLossPct from the dashboard without a restart.
+        hard_sl_pct: float = 0.0
+        if self._config is not None:
+            try:
+                cfg = await self._config.get()
+                hard_sl_pct = float(getattr(cfg, "hardStopLossPct", 0.0) or 0.0)
+            except Exception as e:
+                self.log.warning("[Monitor] config fetch failed: %s", e)
 
         for symbol, pos in positions.items():
             cp = prices.get(symbol)
@@ -113,13 +126,28 @@ class PositionMonitor(AsyncProcessor):
             if price <= 0:
                 continue
 
-            # 1) Trailing stop-loss
+            # 1) Hard stop-loss (iter 48) — fires regardless of TSL state.
+            #    A trade that drops straight down without ever peaking
+            #    above the buy price would skate past the trailing-stop
+            #    until the 1h max-hold timer kicks in.  Hard-SL caps
+            #    that loss at a configurable %.
+            if hard_sl_pct > 0 and pos.buy_price > 0:
+                drop_pct = float((pos.buy_price - price) / pos.buy_price * 100)
+                if drop_pct >= hard_sl_pct:
+                    self.log.warning(
+                        "[Monitor] HARD-SL %s drop=%.3f%% (buy=%s now=%s, limit=%.2f%%) — force exit",
+                        symbol, drop_pct, pos.buy_price, price, hard_sl_pct,
+                    )
+                    await self._safe_exit(symbol, price, "HARD_SL")
+                    continue
+
+            # 2) Trailing stop-loss
             if self._tsl.check_and_track(symbol, price):
                 self.log.info("[Monitor] TSL triggered for %s — forcing market exit", symbol)
                 await self._safe_exit(symbol, price, "TSL")
                 continue
 
-            # 2) Max-hold timer
+            # 3) Max-hold timer
             if self.max_hold_seconds > 0:
                 held = now_ts - pos.entry_time
                 if held >= self.max_hold_seconds:

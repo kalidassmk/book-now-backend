@@ -587,6 +587,33 @@ class TradingConfig:
     # re-enter the same trade.
     ladderCooldownSeconds: int = 14400   # 4 hours
 
+    # ── Hard stop-loss + pre-buy filter pipeline (iter 48, 2026-05-23) ──
+    # Operator request: R1/R2/R3 rules historically had NO hard stop-loss
+    # and NO falling-knife/vol-regime/etc. filters — only the scalpers did.
+    # That caused FIDA-style buys where a "falling knife" got bought blindly
+    # by R3 and held with only the trailing-stop-loss (which doesn't fire
+    # if the price drops immediately without first peaking).
+    #
+    # Two protections added in iter 48:
+    #
+    # 1. Hard stop-loss in PositionMonitor: market-sell when price drops
+    #    hardStopLossPct% below the buy price, regardless of TSL state.
+    #    Tight default (0.5%) matches the operator's risk preference.
+    #
+    # 2. Pre-buy filter call: try_buy() consults the dashboard's existing
+    #    /api/check-coin endpoint (the same one Pattern Bot uses). That
+    #    endpoint runs the full filter stack — falling-knife, vol-regime,
+    #    post-pump, near-top, macro-top, overbought, VWAP, RSI, EMA-slope,
+    #    market-stress, bad-hours, blacklist. If verdict.blocked, the
+    #    buy is skipped. On network error checkCoinFailClosed=True means
+    #    "don't trade if we can't check" (safer); set False to fall back
+    #    to permissive on dashboard outage.
+    hardStopLossPct: float = 0.5
+    useCheckCoinFilterEnabled: bool = True
+    checkCoinFailClosed: bool = True
+    checkCoinTimeoutSec: float = 1.5
+    iter48HardSlAndFiltersAppliedAt: str = "2026-05-23"
+
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
 
