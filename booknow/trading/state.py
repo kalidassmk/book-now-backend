@@ -36,6 +36,8 @@ class Position:
     buy_price: Decimal = Decimal(0)
     entry_time: float = field(default_factory=time)  # epoch seconds
     open_sell_order_id: Optional[int] = None         # GTC limit-sell on Binance
+    qty: Decimal = Decimal(0)                        # filled base-asset qty (set on buy-fill)
+    base_tp_price: Optional[Decimal] = None          # iter 47 dynamic-TP floor
 
 
 SellListener = Callable[[str], None]

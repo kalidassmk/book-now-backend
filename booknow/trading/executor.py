@@ -118,6 +118,7 @@ class TradeExecutor:
         config_service: TradingConfigService,
         dust_service: Optional[DustService] = None,
         coin_analyzer=None,           # CoinAnalyzer; optional
+        trailing_tp=None,             # TrailingTakeProfit; optional (iter 47)
         live_mode: bool = False,
     ):
         self._redis = redis_client
@@ -129,6 +130,7 @@ class TradeExecutor:
         self._config = config_service
         self._dust = dust_service
         self._analyzer = coin_analyzer
+        self._trailing_tp = trailing_tp
         self.live_mode = live_mode
         self._guard = _get_rate_limit_guard()
 
@@ -142,6 +144,186 @@ class TradeExecutor:
         access from outside the class.
         """
         self._dust = dust_service
+
+    def _register_trailing_tp(
+        self, *, symbol: str, buy_price: Decimal, qty: Decimal,
+        profit_amount_usdt: float,
+    ) -> None:
+        """Compute base_tp + arm the trailing-TP tracker for this symbol.
+
+        ``base_tp`` is the original net-profit target: the price at which
+        the limit-sell would yield exactly +``profit_amount_usdt`` after
+        round-trip fees on a ``buy_price × qty`` position.
+        """
+        if self._trailing_tp is None or qty <= 0 or buy_price <= 0:
+            return
+        # Same formula used in _place_limit_sell, kept here so we can also
+        # arm the trail when the limit-sell is placed from on_buy_filled.
+        total_cost = buy_price * qty
+        target_total = total_cost + Decimal(str(profit_amount_usdt))
+        base_tp = target_total / qty
+        # The initial limit-sell sits at base_tp too; ratchet starts only
+        # when price rises above it.
+        self._trailing_tp.register(
+            symbol=symbol,
+            base_tp_price=base_tp,
+            current_tp_price=base_tp,
+            qty=qty,
+            profit_amount_usdt=profit_amount_usdt,
+        )
+        # Also persist the floor on the in-memory Position so the monitor
+        # can read it back without going through trailing_tp.
+        pos = self._state.get_position(symbol)
+        if pos is not None:
+            pos.qty = qty
+            pos.base_tp_price = base_tp
+
+    async def on_buy_filled(
+        self,
+        *,
+        symbol: str,
+        order_id: int,
+        filled_qty: Decimal,
+        fill_price: Decimal,
+        sell_pct: float,
+    ) -> Optional[int]:
+        """Called from the user-data-stream executionReport handler when a
+        BUY limit-order fills.
+
+        Steps:
+          1. Refresh the BUY row in Redis with the real ``executedQty`` /
+             ``status=FILLED`` (was 0 / NEW at the moment of placement).
+          2. Place the GTC limit-sell at the net-profit target using the
+             real qty.  Pin the new sell-orderId on TradeState.
+          3. Register the position with TrailingTakeProfit so the
+             PositionMonitor's ratchet logic can take over.
+
+        Idempotent: if a sell order has already been placed on this
+        Position (e.g. the buy was reported FILLED at place time), we
+        bail out without placing a duplicate.
+        """
+        if not self.live_mode:
+            return None
+        if filled_qty <= 0 or fill_price <= 0:
+            logger.warning(
+                "[on_buy_filled] %s skipped — bad fill (qty=%s price=%s)",
+                symbol, filled_qty, fill_price,
+            )
+            return None
+
+        pos = self._state.get_position(symbol)
+        if pos is None:
+            logger.info("[on_buy_filled] %s not in TradeState — ignoring fill", symbol)
+            return None
+        if pos.open_sell_order_id is not None:
+            logger.debug(
+                "[on_buy_filled] %s already has sell-order #%s — skipping duplicate",
+                symbol, pos.open_sell_order_id,
+            )
+            return pos.open_sell_order_id
+
+        cfg = await self._config.get()
+
+        # 1) Refresh the BUY row.
+        try:
+            raw = await self._redis.hget(redis_keys.BUY_KEY, symbol)
+            if raw:
+                buy = json.loads(raw)
+            else:
+                buy = {}
+            buy["status"] = "FILLED"
+            buy["executedQty"] = str(filled_qty)
+            buy["buyPrice"] = float(fill_price)
+            buy["orderId"] = order_id
+            await self._redis.hset(redis_keys.BUY_KEY, symbol, json.dumps(buy))
+        except Exception as e:
+            logger.warning("[on_buy_filled] %s BUY refresh failed: %s", symbol, e)
+
+        # 2) Place the limit-sell now that we know the real qty.
+        sell_order_id = await self._place_limit_sell(
+            symbol=symbol,
+            qty=filled_qty,
+            buy_price=fill_price,
+            sell_pct=sell_pct,
+            profit_amount_usdt=cfg.profitAmountUsdt,
+        )
+        if sell_order_id is not None:
+            self._state.record_open_sell_order(symbol, sell_order_id)
+
+        # 3) Arm the trailing-TP tracker.
+        if cfg.dynamicTpEnabled:
+            self._register_trailing_tp(
+                symbol=symbol,
+                buy_price=fill_price,
+                qty=filled_qty,
+                profit_amount_usdt=cfg.profitAmountUsdt,
+            )
+
+        logger.info(
+            "[+TP ARMED] %s qty=%s buy=%s sell-order=#%s",
+            symbol, filled_qty, fill_price, sell_order_id,
+        )
+        return sell_order_id
+
+    async def move_limit_sell(
+        self, *, symbol: str, new_price: Decimal,
+    ) -> Optional[int]:
+        """Cancel the open limit-sell for a position and place a new one
+        at ``new_price``.  Used by the trailing-TP ratchet.
+
+        Returns the new orderId, or None on failure.  Best-effort: if the
+        cancel fails with -2011 (Unknown order), the previous limit-sell
+        already filled — in that case we DON'T place a new sell (we'd
+        oversell) and return None.
+        """
+        if not self.live_mode:
+            return None
+        pos = self._state.get_position(symbol)
+        if pos is None or pos.qty <= 0:
+            return None
+        old_order_id = pos.open_sell_order_id
+
+        # 1) Cancel the old limit-sell.
+        if old_order_id is not None:
+            try:
+                await self._ws_api.cancel_order(symbol=symbol, order_id=old_order_id)
+            except Exception as e:
+                msg = str(e)
+                if "-2011" in msg or "Unknown order" in msg:
+                    # Already filled / cancelled — don't oversell.
+                    logger.info(
+                        "[MoveTP] %s old sell-order #%s already gone — skipping replace",
+                        symbol, old_order_id,
+                    )
+                    return None
+                logger.warning(
+                    "[MoveTP] %s cancel old sell-order #%s failed: %s — aborting move",
+                    symbol, old_order_id, e,
+                )
+                return None
+            pos.open_sell_order_id = None
+
+        # 2) Place the new limit-sell.
+        try:
+            qty = await self._filters.round_quantity(symbol, pos.qty)
+            sell_price = await self._filters.round_price(symbol, new_price)
+            resp = await self._ws_api.place_order(
+                symbol=symbol, side="SELL", order_type="LIMIT",
+                quantity=str(qty), price=str(sell_price), time_in_force="GTC",
+            )
+            new_order_id = resp.get("orderId") if isinstance(resp, dict) else None
+            if new_order_id is not None:
+                self._state.record_open_sell_order(symbol, int(new_order_id))
+                if self._trailing_tp is not None:
+                    self._trailing_tp.update_current_tp(symbol, sell_price)
+                logger.info(
+                    "[MoveTP] %s new sell-order #%s @ %s",
+                    symbol, new_order_id, sell_price,
+                )
+                return int(new_order_id)
+        except Exception as e:
+            logger.error("[MoveTP] %s place new sell-order failed: %s", symbol, e)
+        return None
 
     # ── Auto-trader entry ───────────────────────────────────────────────
 
@@ -225,7 +407,13 @@ class TradeExecutor:
             self._tsl.start_tracking(symbol, buy_price)
 
             # ── Limit-sell at the +$0.20 (or +sellPct) target ──────
-            if self.live_mode:
+            # 2026-05-23: only place the limit-sell here if the buy already
+            # filled (rare for LIMIT orders — usually status=NEW).  Going
+            # ahead with executedQty=0 used to crash with DivisionByZero
+            # and left positions unprotected.  For NEW orders we defer to
+            # the buy-fill execution-report handler (see on_buy_filled),
+            # which uses the actual filled qty.
+            if self.live_mode and order_status == "FILLED" and _to_decimal(executed_qty) > 0:
                 sell_order_id = await self._place_limit_sell(
                     symbol=symbol,
                     qty=_to_decimal(executed_qty),
@@ -235,6 +423,14 @@ class TradeExecutor:
                 )
                 if sell_order_id is not None:
                     self._state.record_open_sell_order(symbol, sell_order_id)
+                # Register the position with the trailing-TP tracker.
+                if self._trailing_tp is not None and cfg.dynamicTpEnabled:
+                    self._register_trailing_tp(
+                        symbol=symbol,
+                        buy_price=buy_price,
+                        qty=_to_decimal(executed_qty),
+                        profit_amount_usdt=cfg.profitAmountUsdt,
+                    )
 
             logger.info(
                 "[%s] BUY %s @ %s qty=%s (target +%.2f%%, +%s USDT)",
@@ -283,8 +479,17 @@ class TradeExecutor:
             return
         qty = _to_decimal(buy.get("executedQty"))
         if qty <= 0:
-            logger.warning("[ForceExit:%s] BUY row has no executedQty for %s", reason, symbol)
-            return
+            # Fallback to the in-memory Position.qty (set on buy-fill).
+            pos_for_qty = self._state.get_position(symbol)
+            if pos_for_qty is not None and pos_for_qty.qty > 0:
+                qty = pos_for_qty.qty
+                logger.info(
+                    "[ForceExit:%s] %s BUY row missing executedQty — using Position.qty=%s",
+                    reason, symbol, qty,
+                )
+            else:
+                logger.warning("[ForceExit:%s] no qty for %s — aborting exit", reason, symbol)
+                return
         try:
             qty = await self._filters.round_quantity(symbol, qty)
         except Exception as e:
@@ -364,6 +569,8 @@ class TradeExecutor:
             logger.error("[ForceExit:%s] redis cleanup failed for %s: %s", reason, symbol, e)
         self._state.mark_sold(symbol)
         self._tsl.reset(symbol)
+        if self._trailing_tp is not None:
+            self._trailing_tp.unregister(symbol)
         logger.info("[FORCE-EXIT:%s] %s @ %s done", reason, symbol, sell_price)
 
     # ── Manual / dashboard flow ────────────────────────────────────────
