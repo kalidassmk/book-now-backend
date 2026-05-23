@@ -36,6 +36,7 @@ from booknow.trading.state import Position, TradeState
 from booknow.trading.trailing_tp import (
     FloorSell,
     MoveUp,
+    PumpTrailExit,
     TrailingTakeProfit,
 )
 from booknow.trading.tsl import TrailingStopLoss
@@ -164,9 +165,9 @@ class PositionMonitor(AsyncProcessor):
                 await self._safe_exit(symbol, price, "TSL")
                 continue
 
-            # 3) Dynamic take-profit ratchet (iter 47).  Only ticks once
-            #    the buy has filled and the trailing-TP tracker has been
-            #    armed via on_buy_filled.
+            # 3) Dynamic take-profit ratchet (iter 47) + pump-mode trail (iter 59).
+            #    Only ticks once the buy has filled and the trailing-TP
+            #    tracker has been armed via on_buy_filled.
             if self._trailing_tp is not None and self._trailing_tp.is_tracking(symbol):
                 action = self._trailing_tp.on_price_tick(symbol, price)
                 if isinstance(action, MoveUp):
@@ -179,14 +180,34 @@ class PositionMonitor(AsyncProcessor):
                     )
                     await self._safe_exit(symbol, price, "TRAIL_FLOOR")
                     continue
+                elif isinstance(action, PumpTrailExit):
+                    # iter 59 — pump-mode peak-trail triggered.
+                    self.log.info(
+                        "[Monitor] PUMP_TRAIL for %s at %s (peak %s) — market sell",
+                        symbol, price, action.peak_price,
+                    )
+                    await self._safe_exit(symbol, price, "PUMP_TRAIL")
+                    continue
 
-            # 4) Max-hold timer
-            if self.max_hold_seconds > 0:
+            # 4) Max-hold timer.  iter 59: pump-mode positions use a
+            #    longer hold so multi-hour pumps can run.
+            effective_max_hold = self.max_hold_seconds
+            if (self._trailing_tp is not None
+                    and self._trailing_tp.is_pump_mode(symbol)
+                    and self._config is not None):
+                try:
+                    cfg_now = await self._config.get()
+                    effective_max_hold = int(getattr(
+                        cfg_now, "pumpModeMaxHoldSeconds", self.max_hold_seconds,
+                    ) or self.max_hold_seconds)
+                except Exception:
+                    pass
+            if effective_max_hold > 0:
                 held = now_ts - pos.entry_time
-                if held >= self.max_hold_seconds:
+                if held >= effective_max_hold:
                     self.log.info(
                         "[Monitor] Max-hold %ds exceeded for %s (held %.0fs) — forcing market exit",
-                        self.max_hold_seconds, symbol, held,
+                        effective_max_hold, symbol, held,
                     )
                     await self._safe_exit(symbol, price, "MAX_HOLD")
 

@@ -57,7 +57,16 @@ class FloorSell:
     base_tp_price: Decimal
 
 
-Action = Union[NoneAction, MoveUp, FloorSell]
+@dataclass(frozen=True)
+class PumpTrailExit:
+    """iter 59 — pump-mode positions exit at market when price drops
+    pumpModeTrailPct% from the running peak.  No static TP; the trail
+    is the only profit-taking mechanism (plus HARD-SL as the floor)."""
+    peak_price: Decimal
+    trigger_price: Decimal
+
+
+Action = Union[NoneAction, MoveUp, FloorSell, PumpTrailExit]
 
 
 @dataclass
@@ -71,6 +80,10 @@ class _State:
     buy_price: Decimal = Decimal(0)  # iter 54: used to compute fee offset on ratchet
     fee_rate: float = 0.00075        # iter 54: round-trip fee per side
     armed: bool = False            # True once price first reached base_tp
+    # iter 59 — pump-mode state
+    pump_mode: bool = False          # if True, use peak-trail exit instead of static TP
+    peak_price: Decimal = Decimal(0)  # running peak since buy (for pump-trail)
+    pump_trail_pct: float = 1.5      # exit when price drops X% from peak
 
 
 class TrailingTakeProfit:
@@ -96,12 +109,18 @@ class TrailingTakeProfit:
         profit_amount_usdt: float,
         buy_price: Decimal = Decimal(0),
         fee_rate: float = 0.00075,
+        pump_mode: bool = False,
+        pump_trail_pct: float = 1.5,
     ) -> None:
-        """Called on buy-fill once the initial limit-sell is placed.
+        """Called on buy-fill once the initial limit-sell is placed (or
+        skipped in pump mode).
 
         iter 54: ``buy_price`` + ``fee_rate`` arrive so the ratchet
         (MoveUp) can include the round-trip fee component in its offset.
-        Otherwise each MoveUp would only add gross profit, not net.
+
+        iter 59: ``pump_mode`` switches the exit logic from
+        static-TP-plus-ratchet to peak-trail-exit (sell at market when
+        price drops ``pump_trail_pct`` % from the running peak).
         """
         with self._lock:
             self._states[symbol] = _State(
@@ -111,6 +130,9 @@ class TrailingTakeProfit:
                 profit_amount_usdt=profit_amount_usdt,
                 buy_price=buy_price,
                 fee_rate=fee_rate,
+                pump_mode=pump_mode,
+                peak_price=buy_price,
+                pump_trail_pct=pump_trail_pct,
             )
         logger.info(
             "[TrailingTP] %s registered  base_tp=%s  current_tp=%s  qty=%s",
@@ -135,6 +157,13 @@ class TrailingTakeProfit:
         with self._lock:
             return symbol in self._states
 
+    def is_pump_mode(self, symbol: str) -> bool:
+        """iter 59 — inspector for the position monitor to choose the
+        right max-hold timer (4h pump vs 1h normal)."""
+        with self._lock:
+            st = self._states.get(symbol)
+            return bool(st and st.pump_mode)
+
     def on_price_tick(self, symbol: str, price: Decimal) -> Action:
         """The single decision point.
 
@@ -150,6 +179,26 @@ class TrailingTakeProfit:
         with self._lock:
             st = self._states.get(symbol)
             if st is None:
+                return NoneAction()
+
+            # ── iter 59: pump-mode — peak-trail market exit ──────────────
+            if st.pump_mode:
+                # Update peak if price made a new high.
+                if price > st.peak_price:
+                    st.peak_price = price
+                    logger.debug(
+                        "[TrailingTP] %s pump-mode new peak %s", symbol, price,
+                    )
+                    return NoneAction()
+                # Exit when price drops trail % from peak.
+                trail_mult = Decimal(1) - (Decimal(str(st.pump_trail_pct)) / Decimal(100))
+                trail_floor = st.peak_price * trail_mult
+                if price <= trail_floor:
+                    logger.info(
+                        "[TrailingTP] %s PUMP-TRAIL EXIT — price %s <= peak %s × (1 - %.2f%%) = %s",
+                        symbol, price, st.peak_price, st.pump_trail_pct, trail_floor,
+                    )
+                    return PumpTrailExit(peak_price=st.peak_price, trigger_price=price)
                 return NoneAction()
 
             base = st.base_tp_price

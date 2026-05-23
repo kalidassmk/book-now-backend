@@ -166,6 +166,62 @@ class TradeExecutor:
         """
         self._dust = dust_service
 
+    async def _detect_pump_mode(self, symbol: str, cfg) -> bool:
+        """iter 59 — fetch last 30 1m klines + 24h ticker to decide
+        whether to put this fresh fill into pump mode.
+
+        Pump if any of:
+          1. last 5min change >= pumpModeMin5mChangePct
+          2. last 30min change >= pumpModeMin30mChangePct
+          3. last 15 1m candles green >= pumpModeGreenCount
+             AND last-5min vol >= pumpModeVolSurgeMult × prior-25min
+        """
+        if not bool(getattr(cfg, "pumpModeEnabled", False)):
+            return False
+        try:
+            if self._http is None:
+                self._http = httpx.AsyncClient(timeout=3)
+            ks_resp = await self._http.get(
+                f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=30",
+                timeout=3,
+            )
+            if ks_resp.status_code != 200:
+                return False
+            ks = ks_resp.json()
+            if not isinstance(ks, list) or len(ks) < 15:
+                return False
+            closes = [float(k[4]) for k in ks]
+            opens  = [float(k[1]) for k in ks]
+            qvols  = [float(k[7]) for k in ks]
+            c_now = closes[-1]
+            # change %
+            chg_5m = (c_now - closes[-6]) / closes[-6] * 100 if closes[-6] > 0 else 0
+            chg_30m = (c_now - closes[0]) / closes[0] * 100 if closes[0] > 0 else 0
+            # green count last 15
+            green = sum(1 for i in range(max(0, len(ks)-15), len(ks)) if closes[i] > opens[i])
+            # vol surge: 5m avg vs prior 25m avg
+            v5 = sum(qvols[-5:]) / 5
+            v25 = sum(qvols[-30:-5]) / 25 if len(qvols) >= 30 else 1
+            vol_surge = v5 / v25 if v25 > 0 else 0
+            min_5m = float(getattr(cfg, "pumpModeMin5mChangePct", 2.0))
+            min_30m = float(getattr(cfg, "pumpModeMin30mChangePct", 3.0))
+            min_green = int(getattr(cfg, "pumpModeGreenCount", 10))
+            min_vol = float(getattr(cfg, "pumpModeVolSurgeMult", 3.0))
+            is_pump = (
+                chg_5m >= min_5m
+                or chg_30m >= min_30m
+                or (green >= min_green and vol_surge >= min_vol)
+            )
+            if is_pump:
+                logger.info(
+                    "[PUMP-MODE] %s detected (chg_5m=%.2f%% chg_30m=%.2f%% green=%d/15 vol_surge=%.2fx)",
+                    symbol, chg_5m, chg_30m, green, vol_surge,
+                )
+            return is_pump
+        except Exception as e:
+            logger.debug("[PUMP-MODE] detection failed for %s: %s", symbol, e)
+            return False
+
     async def _check_coin_blocked(
         self, symbol: str, timeout_s: float, fail_closed: bool,
     ) -> Optional[str]:
@@ -207,6 +263,7 @@ class TradeExecutor:
     def _register_trailing_tp(
         self, *, symbol: str, buy_price: Decimal, qty: Decimal,
         profit_amount_usdt: float, fee_rate: float = 0.00075,
+        pump_mode: bool = False, pump_trail_pct: float = 1.5,
     ) -> None:
         """Compute base_tp + arm the trailing-TP tracker for this symbol.
 
@@ -234,6 +291,8 @@ class TradeExecutor:
             profit_amount_usdt=profit_amount_usdt,
             buy_price=buy_price,
             fee_rate=fee_rate,
+            pump_mode=pump_mode,
+            pump_trail_pct=pump_trail_pct,
         )
         # Also persist the floor on the in-memory Position so the monitor
         # can read it back without going through trailing_tp.
@@ -319,7 +378,10 @@ class TradeExecutor:
         self._tsl.reset(symbol)
         self._tsl.start_tracking(symbol, fill_price)
 
-        # 4) Place the limit-sell now that we know the real qty.
+        # 4) iter 59 — pump-mode detection at fill time.
+        is_pump = await self._detect_pump_mode(symbol, cfg)
+
+        # 5) Place the limit-sell now that we know the real qty.
         # iter 52 — apply fee-buffer (default 0.999) BEFORE calling
         # _place_limit_sell so a base-asset fee deduction doesn't cause
         # Binance to reject for insufficient balance (MEUSDT incident).
@@ -328,17 +390,27 @@ class TradeExecutor:
             sell_qty = filled_qty * Decimal(str(fee_buf))
         else:
             sell_qty = filled_qty
-        sell_order_id = await self._place_limit_sell(
-            symbol=symbol,
-            qty=sell_qty,
-            buy_price=fill_price,
-            sell_pct=sell_pct,
-            profit_amount_usdt=cfg.profitAmountUsdt,
-        )
-        if sell_order_id is not None:
-            self._state.record_open_sell_order(symbol, sell_order_id)
 
-        # 5) Arm the trailing-TP tracker.
+        sell_order_id = None
+        if not is_pump:
+            # Normal mode: place static +$0.40 net limit-sell.
+            sell_order_id = await self._place_limit_sell(
+                symbol=symbol,
+                qty=sell_qty,
+                buy_price=fill_price,
+                sell_pct=sell_pct,
+                profit_amount_usdt=cfg.profitAmountUsdt,
+            )
+            if sell_order_id is not None:
+                self._state.record_open_sell_order(symbol, sell_order_id)
+        else:
+            # Pump mode: NO static TP — peak-trail exit will handle profit.
+            logger.info(
+                "[PUMP-MODE] %s: skipping static TP — will exit on peak-trail",
+                symbol,
+            )
+
+        # 6) Arm the trailing-TP tracker.
         if cfg.dynamicTpEnabled:
             self._register_trailing_tp(
                 symbol=symbol,
@@ -346,6 +418,8 @@ class TradeExecutor:
                 qty=filled_qty,
                 profit_amount_usdt=cfg.profitAmountUsdt,
                 fee_rate=float(getattr(cfg, "ladderFeeRatePerSide", 0.00075) or 0.00075),
+                pump_mode=is_pump,
+                pump_trail_pct=float(getattr(cfg, "pumpModeTrailPct", 1.5)),
             )
 
         logger.info(

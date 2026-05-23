@@ -638,8 +638,40 @@ class TradingConfig:
     #    key first and skips when present.  Stops the rapid-fire pattern
     #    where stale ST timing data + cleared _triggered = instant re-buy.
     sellQtyFeeBuffer: float = 0.999
-    rulesCooldownSeconds: int = 300
+    # iter 59 (2026-05-23): cooldown 5min → 4h after the COS double-loss.
+    # Bought COS at $0.001428 → stopped out 4s later, then re-bought at
+    # $0.001493 24min later (higher price!) → stopped out again.  Both
+    # losses while the same coin was still mid-pump.  4h cooldown
+    # prevents the same-coin retry pattern.
+    rulesCooldownSeconds: int = 14400  # 4h (was 300 = 5min)
     iter52CooldownFeeBufferAppliedAt: str = "2026-05-23"
+
+    # ── Pump-mode TP (iter 59, 2026-05-23) ────────────────────────────
+    # When a coin is clearly pumping at buy-fill time, the static
+    # $0.40 net TP caps the winner too early.  COS pumped from $0.001428
+    # (our buy) to $0.001569 (peak) — would have netted ~+$7.85 with
+    # peak-trail instead of −$0.69 with static TP.
+    #
+    # Pump detection (any of these triggers pump mode):
+    #   1. last 5min price change >= pumpModeMin5mChangePct
+    #   2. last 30min price change >= pumpModeMin30mChangePct
+    #   3. last 15/30 1m candles green >= pumpModeGreenCount
+    #      AND last-5min vol >= pumpModeVolSurgeMult × prior-25min
+    #
+    # When in pump mode:
+    #   - SKIP placing the static +$0.40 limit-sell (let winners run)
+    #   - Track peak from fill price
+    #   - Exit at MARKET when price <= peak × (1 - pumpModeTrailPct/100)
+    #   - Max-hold extended to pumpModeMaxHoldSeconds (4h default)
+    #   - HARD-SL at hardStopLossPct still fires (-0.5%) as floor
+    pumpModeEnabled: bool = True
+    pumpModeMin5mChangePct: float = 2.0
+    pumpModeMin30mChangePct: float = 3.0
+    pumpModeGreenCount: int = 10        # out of last 15 1m candles
+    pumpModeVolSurgeMult: float = 3.0
+    pumpModeTrailPct: float = 1.5       # exit when price <= peak × (1 - 1.5%)
+    pumpModeMaxHoldSeconds: int = 14400 # 4h pump max-hold
+    iter59PumpModeAppliedAt: str = "2026-05-23"
 
     # ── PumpRider detector (iter 55, 2026-05-23) ─────────────────────────
     # New subprocess that catches volume-leads-price pumps directly on 1m
