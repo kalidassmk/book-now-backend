@@ -146,6 +146,53 @@ async def manual_limit_buy(
     return resp
 
 
+@router.post("/order/pattern-buy/{symbol}")
+async def pattern_bot_buy(
+    symbol: str,
+    sell_pct: float = Query(default=5.0, ge=0.0, le=20.0),
+    rule_label: str = Query(default="PATTERN_BOT"),
+    state: AppState = Depends(get_state),
+) -> Any:
+    """Delegation endpoint used by the frontend's pattern-bot-worker.
+
+    Routes a Pattern Bot signal through the same try_buy() path R1/R2/R3
+    use, which gives the position the full iter47 + iter48 protection set:
+      - check-coin filter pipeline (pre-buy)
+      - hard stop-loss (HARD_SL)
+      - dynamic chasing TP (MOVE_UP / FLOOR_SELL)
+      - TSL, max-hold
+    The trade lands in TradeState so the PositionMonitor manages exits.
+
+    Returns a small JSON ack; the actual buy is async.
+    """
+    cp = await _resolve_current_price(state, symbol)
+    if cp is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No live price for {symbol}. Is the pipeline running?",
+        )
+    # try_buy runs every gate (autoBuyEnabled, is_already_bought, delist,
+    # check-coin, rate-limit) and short-circuits on any failure.  Caller
+    # gets a 202-style "accepted, executing async" reply; the real status
+    # shows up in METRICS:SKIP or BUY hash + logs.
+    try:
+        await state.trade_executor.try_buy(
+            symbol=symbol,
+            current_price_data=cp,
+            sell_pct=sell_pct,
+            rule_label=rule_label,
+        )
+    except Exception as e:
+        logger.error("[pattern-buy] try_buy failed for %s: %s", symbol, e)
+        raise HTTPException(status_code=500, detail=f"try_buy error: {e}")
+    return {
+        "status": "accepted",
+        "symbol": symbol,
+        "rule_label": rule_label,
+        "current_price": cp.get("price"),
+    }
+
+
 # ── Analysis ─────────────────────────────────────────────────────────────
 
 
