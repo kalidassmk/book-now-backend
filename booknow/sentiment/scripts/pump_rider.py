@@ -76,6 +76,10 @@ DEFAULTS: Dict[str, Any] = {
     "pumpRiderTopSymbols": 50,               # scan top-N by FAST_MOVE score
     "pumpRiderCooldownSec": 600,             # 10 min per-symbol cooldown
     "pumpRiderSellPctLabel": 5.0,            # passed to try_buy (cfg.profitAmountUsdt wins downstream)
+    # iter 56 (2026-05-23) — Early Pump watchlist intersection
+    "pumpRiderWatchlistMode": "prefer",      # "off" | "prefer" | "require"
+    "pumpRiderWatchlistScoreMin": 60,        # Early Pump score floor
+    "pumpRiderWatchlistMaxAgeSec": 1800,     # ignore EP detections older than 30 min
 }
 POLL_INTERVAL_S = float(os.getenv("PUMP_RIDER_POLL_S", "10"))
 BACKEND_BASE = os.getenv("BOOKNOW_BACKEND_BASE", "http://backend:8083")
@@ -83,10 +87,46 @@ BINANCE_BASE = "https://api.binance.com"
 
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_ANALYSE_HOST = os.getenv("REDIS_ANALYSE_HOST", REDIS_HOST)
+REDIS_ANALYSE_PORT = int(os.getenv("REDIS_ANALYSE_PORT", "6379"))
 
 
 def get_redis() -> redis.Redis:
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+
+def get_redis_analyse() -> redis.Redis:
+    """Separate client for the analyse-DB (where Early Pump writes its
+    detections).  In Docker Compose this is the `redis-analyse` service."""
+    return redis.Redis(host=REDIS_ANALYSE_HOST, port=REDIS_ANALYSE_PORT, decode_responses=True)
+
+
+def get_early_pump_watchlist(r_an: redis.Redis, max_age_sec: int,
+                              min_score: int) -> Dict[str, int]:
+    """Pull EARLY_PUMP:LATEST (per-symbol latest detection) and filter.
+
+    Returns ``{symbol: score}`` for detections that are ≥ ``min_score`` AND
+    no older than ``max_age_sec``.  Used to gate / boost PumpRider buys.
+    """
+    out: Dict[str, int] = {}
+    try:
+        raw = r_an.hgetall("EARLY_PUMP:LATEST") or {}
+    except Exception as exc:
+        log.warning(f"EARLY_PUMP:LATEST read failed: {exc}")
+        return out
+    now_ms = time.time() * 1000
+    cutoff_ms = now_ms - max_age_sec * 1000
+    for sym, raw_val in raw.items():
+        try:
+            ev = json.loads(raw_val)
+            score = int(ev.get("score") or 0)
+            ts = int(ev.get("ts") or 0)
+        except Exception:
+            continue
+        if score < min_score or ts < cutoff_ms:
+            continue
+        out[sym] = score
+    return out
 
 
 def load_config(r: redis.Redis) -> Dict[str, Any]:
@@ -323,7 +363,7 @@ def update_status(r: redis.Redis, fields: Dict[str, Any]) -> None:
         pass
 
 
-def cycle(r: redis.Redis) -> None:
+def cycle(r: redis.Redis, r_an: redis.Redis) -> None:
     cfg = load_config(r)
     if not cfg["pumpRiderEnabled"]:
         update_status(r, {"last_poll_ts": int(time.time() * 1000), "enabled": 0})
@@ -335,10 +375,36 @@ def cycle(r: redis.Redis) -> None:
         update_status(r, {"last_poll_ts": int(time.time() * 1000), "scanned": 0})
         return
 
+    # iter 56 — Early-Pump watchlist intersection.
+    mode = str(cfg.get("pumpRiderWatchlistMode", "off") or "off").lower()
+    watchlist: Dict[str, int] = {}
+    if mode in ("prefer", "require"):
+        watchlist = get_early_pump_watchlist(
+            r_an,
+            int(cfg["pumpRiderWatchlistMaxAgeSec"]),
+            int(cfg["pumpRiderWatchlistScoreMin"]),
+        )
+
+    if mode == "require":
+        # Hard intersection: only consider coins that are BOTH on PumpRider's
+        # scan list AND on the Early-Pump watchlist.
+        symbols = [s for s in symbols if s in watchlist]
+        # Also add EP-only coins (they won't be in FAST_MOVE if they're
+        # still drifting flat).  Cap to keep API budget reasonable.
+        for s in watchlist:
+            if s not in symbols and len(symbols) < int(cfg["pumpRiderTopSymbols"]) * 2:
+                symbols.append(s)
+    elif mode == "prefer":
+        # Re-rank: watchlisted symbols first, then everything else.
+        watch_first = [s for s in symbols if s in watchlist]
+        rest = [s for s in symbols if s not in watchlist]
+        symbols = watch_first + rest
+
     fired = 0
     skipped_cooldown = 0
     skipped_inpos = 0
     failed_24h = 0
+    watchlist_hits = 0
 
     for sym in symbols:
         # Fast-path skips (no Binance call needed)
@@ -353,6 +419,11 @@ def cycle(r: redis.Redis) -> None:
         if not ev:
             continue
 
+        # Watchlist enrichment + (in require mode) gating handled above
+        if sym in watchlist:
+            ev["early_pump_score"] = watchlist[sym]
+            watchlist_hits += 1
+
         # Final 24h-vol liquidity floor (one extra HTTP call only on hits)
         ticker = fetch_24h_ticker(sym)
         if not ticker:
@@ -365,6 +436,7 @@ def cycle(r: redis.Redis) -> None:
         if qv_24h < float(cfg["pumpRiderMinVol24hUsd"]):
             continue
         ev["vol_24h_usd"] = round(qv_24h, 0)
+        ev["watchlist_mode"] = mode
 
         publish_detection(r, ev)
         ok = delegate_buy(sym, ev, cfg)
@@ -377,6 +449,9 @@ def cycle(r: redis.Redis) -> None:
     update_status(r, {
         "last_poll_ts": int(time.time() * 1000),
         "scanned": len(symbols),
+        "watchlist_mode": mode,
+        "watchlist_size": len(watchlist),
+        "watchlist_hits": watchlist_hits,
         "fired": fired,
         "skipped_cooldown": skipped_cooldown,
         "skipped_inposition": skipped_inpos,
@@ -387,18 +462,28 @@ def cycle(r: redis.Redis) -> None:
 
 def main() -> None:
     r = get_redis()
+    r_an = get_redis_analyse()
     try:
         r.ping()
     except Exception as exc:
         log.error(f"redis ping failed: {exc}")
         sys.exit(1)
+    try:
+        r_an.ping()
+        log.info(
+            f"[PUMP_RIDER] analyse Redis connected ({REDIS_ANALYSE_HOST}:{REDIS_ANALYSE_PORT})"
+        )
+    except Exception as exc:
+        log.warning(
+            f"analyse-Redis ping failed: {exc} — watchlist mode will degrade to 'off'"
+        )
     log.info(
         f"[PUMP_RIDER] starting — poll={POLL_INTERVAL_S}s backend={BACKEND_BASE}"
     )
     while True:
         t0 = time.time()
         try:
-            cycle(r)
+            cycle(r, r_an)
         except Exception as exc:
             log.error(f"cycle error: {exc}", exc_info=True)
         elapsed = time.time() - t0

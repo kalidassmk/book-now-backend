@@ -658,6 +658,23 @@ class TradingConfig:
     pumpRiderSellPctLabel: float = 5.0               # forwarded to try_buy (profitAmountUsdt wins)
     iter55PumpRiderAppliedAt: str = "2026-05-23"
 
+    # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
+    # The 51-event Early Pump backtest (today, 2026-05-23) showed the
+    # signal alone is unprofitable across every TP/SL combo (best:
+    # -$2/10 trades at score 80+).  But the underlying factor structure
+    # (green-candle share, vol building, HH/HL, trade-freq surge, buy
+    # pressure) is real — it just doesn't pump fast enough alone.
+    # Combining with PumpRider's reactive vol-spike trigger should
+    # filter to fewer-but-better setups.
+    #   off:     ignore Early Pump (legacy behaviour)
+    #   prefer:  scan watchlist symbols first (rank-boost, no gate)
+    #   require: ONLY buy on coins that are BOTH on PumpRider scan AND
+    #            on the Early-Pump watchlist (intersection-only)
+    pumpRiderWatchlistMode: str = "prefer"
+    pumpRiderWatchlistScoreMin: int = 60
+    pumpRiderWatchlistMaxAgeSec: int = 1800          # 30-min freshness
+    iter56WatchlistAppliedAt: str = "2026-05-23"
+
     # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
     # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
     # See trailing_tp.py for the state machine.  This iter also fixes the
