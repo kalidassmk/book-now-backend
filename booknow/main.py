@@ -67,6 +67,7 @@ from booknow.subsystems import SubsystemRegistry
 from booknow.trading.executor import TradeExecutor
 from booknow.trading.monitor import LoggingExecutor, PositionMonitor
 from booknow.trading.state import TradeState
+from booknow.trading.trailing_tp import TrailingTakeProfit
 from booknow.trading.tsl import TrailingStopLoss
 
 
@@ -175,6 +176,14 @@ async def _bootstrap() -> None:
     trade_state = TradeState()
     tsl = TrailingStopLoss(trailing_percentage=initial_config.tslPct)
 
+    # iter 47 (2026-05-23) — dynamic chasing take-profit.  The executor
+    # arms it on buy-fill; the position monitor consults it each tick to
+    # decide MOVE-UP (ratchet limit-sell higher) vs FLOOR-SELL (market
+    # exit at base TP).
+    trailing_tp = TrailingTakeProfit(
+        move_step_pct=initial_config.dynamicTpMoveStepPct,
+    )
+
     # CoinAnalyzer — used by both the trade-executor's pre-buy gate and
     # the /api/v1/analyze/{symbol} endpoint. One per engine, shared.
     coin_analyzer = CoinAnalyzer()
@@ -193,6 +202,7 @@ async def _bootstrap() -> None:
         dust_service=None,            # filled in below in live mode
         coin_analyzer=coin_analyzer,
         dashboard_url=settings.dashboard_url,   # iter 48: /api/check-coin
+        trailing_tp=trailing_tp,                # iter 47: ratcheting TP
         live_mode=settings.live_mode,
     )
 
@@ -203,6 +213,7 @@ async def _bootstrap() -> None:
         executor=trade_executor,
         max_hold_seconds=initial_config.maxHoldSeconds,
         config_service=config_service,          # iter 48: read hardStopLossPct
+        trailing_tp=trailing_tp,                # iter 47: MOVE_UP / FLOOR_SELL
     )
     await position_monitor.start()
     log.info(
@@ -316,9 +327,54 @@ async def _bootstrap() -> None:
                 order_id = event.get("i")
                 if not symbol or order_id is None:
                     return
+                side = event.get("S")
                 pos = trade_state.get_position(symbol)
                 if pos is None:
                     return
+
+                # ── BUY fill (iter 47): arm the limit-sell + dynamic TP ──
+                if side == "BUY":
+                    # Avoid double-arming if a previous fill already triggered us.
+                    if pos.open_sell_order_id is not None:
+                        return
+                    from decimal import Decimal as _D
+                    import json as _json
+                    filled_qty = _D(str(event.get("z") or event.get("l") or "0"))
+                    # 'L' = last fill price; fall back to 'p' (order price) for ack-style fills.
+                    fill_price_raw = event.get("L") or event.get("p") or "0"
+                    try:
+                        fill_price = _D(str(fill_price_raw))
+                    except Exception:
+                        fill_price = _D(0)
+                    # Recover sell_pct from the BUY row we wrote at try_buy time.
+                    # In live deployments profitAmountUsdt > 0 so sell_pct is
+                    # ignored downstream, but we forward the recorded value
+                    # for correctness in case the operator flips to %-mode.
+                    sell_pct = 9.0
+                    try:
+                        raw = await redis.hget("BUY", symbol)
+                        if raw:
+                            row = _json.loads(raw)
+                            sell_pct = float(row.get("selP") or sell_pct)
+                    except Exception:
+                        pass
+                    log.info(
+                        "[BUY FILLED] %s order #%s qty=%s price=%s — arming TP",
+                        symbol, order_id, filled_qty, fill_price,
+                    )
+                    try:
+                        await trade_executor.on_buy_filled(
+                            symbol=symbol,
+                            order_id=int(order_id),
+                            filled_qty=filled_qty,
+                            fill_price=fill_price,
+                            sell_pct=sell_pct,
+                        )
+                    except Exception as e:
+                        log.error("[BUY FILLED] on_buy_filled failed for %s: %s", symbol, e, exc_info=True)
+                    return
+
+                # ── SELL fill: existing close-position cleanup ──
                 if pos.open_sell_order_id is None or pos.open_sell_order_id != order_id:
                     return
                 price = event.get("p") or event.get("L") or "0"
@@ -328,6 +384,7 @@ async def _bootstrap() -> None:
                 )
                 trade_state.mark_sold(symbol)
                 tsl.reset(symbol)
+                trailing_tp.unregister(symbol)
                 # Sweep the leftover base-asset dust.
                 base = symbol[:-4] if symbol.endswith("USDT") else symbol
                 try:

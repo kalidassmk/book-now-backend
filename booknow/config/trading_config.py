@@ -614,6 +614,17 @@ class TradingConfig:
     checkCoinTimeoutSec: float = 1.5
     iter48HardSlAndFiltersAppliedAt: str = "2026-05-23"
 
+    # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
+    # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
+    # See trailing_tp.py for the state machine.  This iter also fixes the
+    # DivisionByZero bug where _place_limit_sell was called with
+    # executedQty=0 (the normal state of a fresh LIMIT buy that hasn't
+    # filled yet).  The fix: defer the limit-sell to the buy-fill
+    # executionReport handler in main.py.
+    dynamicTpEnabled: bool = True
+    dynamicTpMoveStepPct: float = 0.3       # move TP up after +0.3% above current TP
+    iter47DynamicTpAppliedAt: str = "2026-05-23"
+
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
 
