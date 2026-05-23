@@ -64,10 +64,12 @@ Action = Union[NoneAction, MoveUp, FloorSell]
 class _State:
     """Per-symbol ratchet state."""
 
-    base_tp_price: Decimal         # the floor — original +profit_usdt target
+    base_tp_price: Decimal         # the floor — original +profit_usdt target (NET)
     current_tp_price: Decimal      # where the active limit-sell sits
     qty: Decimal                   # filled base-asset qty
     profit_amount_usdt: float      # spread above current price for new TPs
+    buy_price: Decimal = Decimal(0)  # iter 54: used to compute fee offset on ratchet
+    fee_rate: float = 0.00075        # iter 54: round-trip fee per side
     armed: bool = False            # True once price first reached base_tp
 
 
@@ -92,14 +94,23 @@ class TrailingTakeProfit:
         current_tp_price: Decimal,
         qty: Decimal,
         profit_amount_usdt: float,
+        buy_price: Decimal = Decimal(0),
+        fee_rate: float = 0.00075,
     ) -> None:
-        """Called on buy-fill once the initial limit-sell is placed."""
+        """Called on buy-fill once the initial limit-sell is placed.
+
+        iter 54: ``buy_price`` + ``fee_rate`` arrive so the ratchet
+        (MoveUp) can include the round-trip fee component in its offset.
+        Otherwise each MoveUp would only add gross profit, not net.
+        """
         with self._lock:
             self._states[symbol] = _State(
                 base_tp_price=base_tp_price,
                 current_tp_price=current_tp_price,
                 qty=qty,
                 profit_amount_usdt=profit_amount_usdt,
+                buy_price=buy_price,
+                fee_rate=fee_rate,
             )
         logger.info(
             "[TrailingTP] %s registered  base_tp=%s  current_tp=%s  qty=%s",
@@ -164,15 +175,22 @@ class TrailingTakeProfit:
             # 3. Ratchet up — price has run above current TP by step%.
             step_multiplier = Decimal(1) + Decimal(str(self.move_step_pct)) / Decimal(100)
             if price > current * step_multiplier:
-                # New TP target: current price + same dollar net offset.
-                #   new_tp = price + profit_amount_usdt / qty
+                # iter 54: new_tp = current_price + (NET_profit / qty) + per-unit-fees
+                # so realised NET at this new TP equals (price - buy_price) + profit_amount.
+                # Without the fee component the ratchet only adds gross profit.
                 if st.qty <= 0:
                     return NoneAction()
-                offset_per_unit = Decimal(str(st.profit_amount_usdt)) / st.qty
+                net_offset_per_unit = Decimal(str(st.profit_amount_usdt)) / st.qty
+                # Approximate fee per unit using current price (close to buy_price
+                # when ratchet just started; small drift is acceptable for fees).
+                fee_anchor = st.buy_price if st.buy_price > 0 else price
+                fee_offset_per_unit = Decimal(2) * Decimal(str(st.fee_rate)) * fee_anchor
+                offset_per_unit = net_offset_per_unit + fee_offset_per_unit
                 new_tp = price + offset_per_unit
                 logger.info(
-                    "[TrailingTP] %s MOVE-UP %s → %s (price=%s, step=+%.2f%%)",
+                    "[TrailingTP] %s MOVE-UP %s → %s (price=%s, step=+%.2f%%, net_off=%s, fee_off=%s)",
                     symbol, current, new_tp, price, self.move_step_pct,
+                    net_offset_per_unit, fee_offset_per_unit,
                 )
                 return MoveUp(new_tp_price=new_tp, profit_amount_usdt=st.profit_amount_usdt)
 

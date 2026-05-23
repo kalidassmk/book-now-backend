@@ -206,20 +206,23 @@ class TradeExecutor:
 
     def _register_trailing_tp(
         self, *, symbol: str, buy_price: Decimal, qty: Decimal,
-        profit_amount_usdt: float,
+        profit_amount_usdt: float, fee_rate: float = 0.00075,
     ) -> None:
         """Compute base_tp + arm the trailing-TP tracker for this symbol.
 
-        ``base_tp`` is the original net-profit target: the price at which
+        ``base_tp`` is the original NET-profit target: the price at which
         the limit-sell would yield exactly +``profit_amount_usdt`` after
         round-trip fees on a ``buy_price × qty`` position.
+
+        iter 54: base_tp = (cost + net_profit + 2 × fee_rate × cost) / qty
+        — matches the new _place_limit_sell formula so the trailing-TP
+        tracker's floor matches the actual resting LIMIT SELL price.
         """
         if self._trailing_tp is None or qty <= 0 or buy_price <= 0:
             return
-        # Same formula used in _place_limit_sell, kept here so we can also
-        # arm the trail when the limit-sell is placed from on_buy_filled.
         total_cost = buy_price * qty
-        target_total = total_cost + Decimal(str(profit_amount_usdt))
+        fees = Decimal(2) * Decimal(str(fee_rate)) * total_cost
+        target_total = total_cost + Decimal(str(profit_amount_usdt)) + fees
         base_tp = target_total / qty
         # The initial limit-sell sits at base_tp too; ratchet starts only
         # when price rises above it.
@@ -229,6 +232,8 @@ class TradeExecutor:
             current_tp_price=base_tp,
             qty=qty,
             profit_amount_usdt=profit_amount_usdt,
+            buy_price=buy_price,
+            fee_rate=fee_rate,
         )
         # Also persist the floor on the in-memory Position so the monitor
         # can read it back without going through trailing_tp.
@@ -340,6 +345,7 @@ class TradeExecutor:
                 buy_price=fill_price,
                 qty=filled_qty,
                 profit_amount_usdt=cfg.profitAmountUsdt,
+                fee_rate=float(getattr(cfg, "ladderFeeRatePerSide", 0.00075) or 0.00075),
             )
 
         logger.info(
@@ -567,6 +573,7 @@ class TradeExecutor:
                         buy_price=buy_price,
                         qty=_to_decimal(executed_qty),
                         profit_amount_usdt=cfg.profitAmountUsdt,
+                        fee_rate=float(getattr(cfg, "ladderFeeRatePerSide", 0.00075) or 0.00075),
                     )
 
             logger.info(
@@ -943,17 +950,34 @@ class TradeExecutor:
         sell_pct: float,
         profit_amount_usdt: float,
     ) -> Optional[int]:
-        """GTC LIMIT SELL at the +$0.20 (or +sell_pct%) target."""
+        """GTC LIMIT SELL at the +profit_amount_usdt NET target.
+
+        iter 54 (2026-05-23): formula now correctly accounts for the
+        round-trip fees so ``profit_amount_usdt`` is the NET dollar
+        amount the operator pockets after exit, matching the Fast
+        Scalper's existing behaviour.  Before this iter the formula
+        was treating it as gross — a $0.20 target actually netted ~$0.06
+        after 2× 0.075% fees on a $96 leg.
+        """
         try:
             qty = await self._filters.round_quantity(symbol, qty)
+            # iter 54: pull fee rate from config (default 0.00075 = 0.075% per side)
+            try:
+                cfg_for_fee = await self._config.get()
+                fee_rate = float(getattr(cfg_for_fee, "ladderFeeRatePerSide", 0.00075) or 0.00075)
+            except Exception:
+                fee_rate = 0.00075
+
             if profit_amount_usdt > 0:
-                # sellPrice = (cost + profit) / qty
+                # iter 54: target_total = cost + net_profit + round_trip_fees
+                # so realized NET (after fees deducted on exit) equals profit_amount_usdt.
                 total_cost = buy_price * qty
-                target_total = total_cost + Decimal(str(profit_amount_usdt))
+                fees = Decimal(2) * Decimal(str(fee_rate)) * total_cost
+                target_total = total_cost + Decimal(str(profit_amount_usdt)) + fees
                 sell_price = target_total / qty
                 logger.info(
-                    "[AmountMode] target +$%s → sellPrice %s",
-                    profit_amount_usdt, sell_price,
+                    "[AmountMode] target +$%s NET (cost=$%s + fees=$%s) → sellPrice %s",
+                    profit_amount_usdt, total_cost, fees, sell_price,
                 )
             else:
                 sell_mult = Decimal(1) + Decimal(str(sell_pct)) / Decimal(100)
