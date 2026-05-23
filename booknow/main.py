@@ -174,7 +174,10 @@ async def _bootstrap() -> None:
 
     # ── Phase 9 + 10: state, TSL, monitor, and the real TradeExecutor ─
     trade_state = TradeState()
-    tsl = TrailingStopLoss(trailing_percentage=initial_config.tslPct)
+    tsl = TrailingStopLoss(
+        trailing_percentage=initial_config.tslPct,
+        min_drop_pct_per_minute=getattr(initial_config, "tslMinDropPctPerMin", 0.15),
+    )
 
     # iter 47 (2026-05-23) — dynamic chasing take-profit.  The executor
     # arms it on buy-fill; the position monitor consults it each tick to

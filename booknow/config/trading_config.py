@@ -675,6 +675,15 @@ class TradingConfig:
     pumpRiderWatchlistMaxAgeSec: int = 1800          # 30-min freshness
     iter56WatchlistAppliedAt: str = "2026-05-23"
 
+    # ── Velocity-aware TSL (iter 57, 2026-05-23) ─────────────────────────
+    # The ORCAUSDT post-mortem: bought $1.397, peak $1.400 (10:50), low
+    # $1.395 (10:56).  Old TSL fired the moment trail-stop was breached
+    # — but the dip took 6 minutes (0.06%/min), basically noise.  iter
+    # 57 adds a velocity gate: TSL only fires if drop velocity (% per
+    # minute from the peak) >= tslMinDropPctPerMin.  Slow drifts wait;
+    # HARD-SL at -0.5% from buy is still the catastrophic floor.
+    tslMinDropPctPerMin: float = 0.15
+
     # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
     # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
     # See trailing_tp.py for the state machine.  This iter also fixes the
