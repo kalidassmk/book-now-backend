@@ -283,7 +283,23 @@ class TradeExecutor:
         except Exception as e:
             logger.warning("[on_buy_filled] %s BUY refresh failed: %s", symbol, e)
 
-        # 2) Place the limit-sell now that we know the real qty.
+        # 2) Refresh in-memory Position with the REAL fill data so the
+        #    monitor's TSL / HARD_SL / MAX_HOLD start their clocks here,
+        #    not at limit-buy placement time.
+        try:
+            pos.buy_price = fill_price
+            pos.entry_time = time.time()
+        except Exception:
+            pass
+
+        # 3) Start TSL fresh at the actual fill price.  iter 51 — the
+        #    earlier start_tracking-at-placement call was removed because
+        #    it caused TSL.peak to track price drift while we didn't yet
+        #    own the asset, triggering exits the moment the buy filled.
+        self._tsl.reset(symbol)
+        self._tsl.start_tracking(symbol, fill_price)
+
+        # 4) Place the limit-sell now that we know the real qty.
         sell_order_id = await self._place_limit_sell(
             symbol=symbol,
             qty=filled_qty,
@@ -294,7 +310,7 @@ class TradeExecutor:
         if sell_order_id is not None:
             self._state.record_open_sell_order(symbol, sell_order_id)
 
-        # 3) Arm the trailing-TP tracker.
+        # 5) Arm the trailing-TP tracker.
         if cfg.dynamicTpEnabled:
             self._register_trailing_tp(
                 symbol=symbol,
@@ -478,7 +494,14 @@ class TradeExecutor:
             }
             await self._redis.hset(redis_keys.BUY_KEY, symbol, json.dumps(buy_payload))
             self._state.mark_bought(symbol, rule_label, buy_price)
-            self._tsl.start_tracking(symbol, buy_price)
+            # iter 51 (2026-05-23): DO NOT start TSL here for a status=NEW
+            # limit-buy.  TSL.peak would track price drift while we don't
+            # actually own the asset yet, and TSL.check_and_track could
+            # trigger an "exit" within seconds of the eventual fill.  TSL
+            # now starts in on_buy_filled with the real fill price.
+            # We still keep this call for the immediate-FILL branch below
+            # (paper mode, MARKET-style executions reporting FILLED at place
+            # time) so those positions still get TSL coverage from t=0.
 
             # ── Limit-sell at the +$0.20 (or +sellPct) target ──────
             # 2026-05-23: only place the limit-sell here if the buy already
@@ -488,6 +511,8 @@ class TradeExecutor:
             # the buy-fill execution-report handler (see on_buy_filled),
             # which uses the actual filled qty.
             if self.live_mode and order_status == "FILLED" and _to_decimal(executed_qty) > 0:
+                # iter 51: immediate fill — start TSL now since we own it.
+                self._tsl.start_tracking(symbol, buy_price)
                 sell_order_id = await self._place_limit_sell(
                     symbol=symbol,
                     qty=_to_decimal(executed_qty),

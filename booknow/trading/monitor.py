@@ -133,6 +133,16 @@ class PositionMonitor(AsyncProcessor):
             if price <= 0:
                 continue
 
+            # iter 51 (2026-05-23) — skip ALL exit checks while the buy
+            # is still pending (limit-buy placed but not filled).  Without
+            # this gate, TSL.peak tracks price drift on a position we
+            # don't actually own yet, and the first tick after the buy
+            # fills can immediately trigger force-exit — selling at the
+            # buy price for a fees-only loss (the COMPUSDT incident).
+            # pos.qty is set by on_buy_filled → _register_trailing_tp.
+            if pos.qty <= 0:
+                continue
+
             # 1) Hard stop-loss (iter 48) — fires regardless of TSL state.
             #    A trade that drops straight down without ever peaking
             #    above the buy price would skate past the trailing-stop
