@@ -641,6 +641,23 @@ class TradingConfig:
     rulesCooldownSeconds: int = 300
     iter52CooldownFeeBufferAppliedAt: str = "2026-05-23"
 
+    # ── PumpRider detector (iter 55, 2026-05-23) ─────────────────────────
+    # New subprocess that catches volume-leads-price pumps directly on 1m
+    # closes instead of waiting for R1/R2/R3's ST timing data to update.
+    # See booknow/sentiment/scripts/pump_rider.py for the design notes
+    # (MEUSDT 07:47-07:50 pump post-mortem).
+    pumpRiderEnabled: bool = True
+    pumpRiderVolMultipleThreshold: float = 2.5       # last 1m candle vol vs 20-candle baseline
+    pumpRiderMinPriceChangePct: float = 0.8          # last candle close-vs-open %
+    pumpRiderMinPriorVolMultiple: float = 1.5        # warm-up confirmation
+    pumpRiderMinVol24hUsd: float = 1_000_000.0       # liquidity floor
+    pumpRiderMaxCumulativeGainPct: float = 8.0       # skip mature pumps
+    pumpRiderMaxLookbackCandles: int = 10            # look-back window for cum-gain
+    pumpRiderTopSymbols: int = 50                    # scan top-N by FAST_MOVE
+    pumpRiderCooldownSec: int = 600                  # 10 min per-symbol
+    pumpRiderSellPctLabel: float = 5.0               # forwarded to try_buy (profitAmountUsdt wins)
+    iter55PumpRiderAppliedAt: str = "2026-05-23"
+
     # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
     # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
     # See trailing_tp.py for the state machine.  This iter also fixes the

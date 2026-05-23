@@ -118,4 +118,12 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("stale_cleaner.py",),
         kind="persistent",
     ),
+    # iter 55 (2026-05-23) — volume-leads-price pump detector.  Calls
+    # the python backend's /api/v1/order/pattern-buy/{sym} endpoint so
+    # positions inherit iter47/48/52/54 protections.
+    SubprocessTask(
+        name="Pump Rider",
+        cmd_argv=("pump_rider.py",),
+        kind="persistent",
+    ),
 ]
