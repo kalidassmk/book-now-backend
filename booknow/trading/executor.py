@@ -140,6 +140,21 @@ class TradeExecutor:
         self.live_mode = live_mode
         self._guard = _get_rate_limit_guard()
 
+    async def set_rules_cooldown(self, symbol: str) -> None:
+        """iter 52 — Stamp RULES_COOLDOWN:<sym> with the configured TTL so
+        try_buy will skip the same symbol for ``rulesCooldownSeconds``
+        after a successful close.  Called from force_market_exit and the
+        executionReport SELL-fill handler in main.py.
+        """
+        try:
+            cfg = await self._config.get()
+            ttl = int(getattr(cfg, "rulesCooldownSeconds", 300) or 300)
+            if ttl <= 0:
+                return
+            await self._redis.setex(f"RULES_COOLDOWN:{symbol}", ttl, "1")
+        except Exception as e:
+            logger.debug("[cooldown] set %s failed: %s", symbol, e)
+
     def set_dust_service(self, dust_service: Optional[DustService]) -> None:
         """Late-bind the dust service.
 
@@ -300,9 +315,17 @@ class TradeExecutor:
         self._tsl.start_tracking(symbol, fill_price)
 
         # 4) Place the limit-sell now that we know the real qty.
+        # iter 52 — apply fee-buffer (default 0.999) BEFORE calling
+        # _place_limit_sell so a base-asset fee deduction doesn't cause
+        # Binance to reject for insufficient balance (MEUSDT incident).
+        fee_buf = float(getattr(cfg, "sellQtyFeeBuffer", 0.999) or 0.999)
+        if 0 < fee_buf < 1:
+            sell_qty = filled_qty * Decimal(str(fee_buf))
+        else:
+            sell_qty = filled_qty
         sell_order_id = await self._place_limit_sell(
             symbol=symbol,
-            qty=filled_qty,
+            qty=sell_qty,
             buy_price=fill_price,
             sell_pct=sell_pct,
             profit_amount_usdt=cfg.profitAmountUsdt,
@@ -404,6 +427,21 @@ class TradeExecutor:
         if self._state.is_already_bought(symbol):
             logger.debug("[%s] Skip %s — already in position", rule_label, symbol)
             return
+
+        # iter 52: per-symbol cooldown after a successful sell.  Stops the
+        # rapid-fire re-buy pattern (MEUSDT incident) where stale ST
+        # timing data + cleared _triggered set lets the same rule fire
+        # the same symbol every 0.5s.
+        try:
+            cooldown_remaining = await self._redis.ttl(f"RULES_COOLDOWN:{symbol}")
+            if cooldown_remaining and cooldown_remaining > 0:
+                logger.info(
+                    "[%s] Skip %s — rules cooldown active (%ds remaining)",
+                    rule_label, symbol, cooldown_remaining,
+                )
+                return
+        except Exception:
+            pass  # Redis hiccup — proceed (still subject to other gates)
 
         try:
             if await self._delist.is_delisted(symbol):
@@ -589,6 +627,17 @@ class TradeExecutor:
             else:
                 logger.warning("[ForceExit:%s] no qty for %s — aborting exit", reason, symbol)
                 return
+        # iter 52 — apply fee buffer here too so a stranded position
+        # (base-asset fee deduction left us with <executedQty held) can
+        # still be sold by HARD_SL / TSL / MAX_HOLD.  Avoids the MEUSDT
+        # "insufficient balance" loop.
+        try:
+            cfg_for_buf = await self._config.get()
+            fee_buf = float(getattr(cfg_for_buf, "sellQtyFeeBuffer", 0.999) or 0.999)
+            if 0 < fee_buf < 1:
+                qty = qty * Decimal(str(fee_buf))
+        except Exception:
+            pass
         try:
             qty = await self._filters.round_quantity(symbol, qty)
         except Exception as e:
@@ -670,6 +719,9 @@ class TradeExecutor:
         self._tsl.reset(symbol)
         if self._trailing_tp is not None:
             self._trailing_tp.unregister(symbol)
+        # iter 52 — start the per-symbol cooldown so R1/R2/R3 don't
+        # immediately re-buy.
+        await self.set_rules_cooldown(symbol)
         logger.info("[FORCE-EXIT:%s] %s @ %s done", reason, symbol, sell_price)
 
     # ── Manual / dashboard flow ────────────────────────────────────────

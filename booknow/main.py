@@ -385,6 +385,12 @@ async def _bootstrap() -> None:
                 trade_state.mark_sold(symbol)
                 tsl.reset(symbol)
                 trailing_tp.unregister(symbol)
+                # iter 52 — start per-symbol cooldown so R1/R2/R3 don't
+                # immediately re-buy the same coin after a TP hit.
+                try:
+                    await trade_executor.set_rules_cooldown(symbol)
+                except Exception as e:
+                    log.warning("[+TARGET HIT] cooldown set failed for %s: %s", symbol, e)
                 # Sweep the leftover base-asset dust.
                 base = symbol[:-4] if symbol.endswith("USDT") else symbol
                 try:

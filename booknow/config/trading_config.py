@@ -614,6 +614,29 @@ class TradingConfig:
     checkCoinTimeoutSec: float = 1.5
     iter48HardSlAndFiltersAppliedAt: str = "2026-05-23"
 
+    # ── Fee-buffer + per-symbol cooldown (iter 52, 2026-05-23) ──────────
+    # The MEUSDT incident: R3-STRONG fired three times on the same symbol
+    # within 6 seconds (rapid-fire because _triggered clears on mark_sold).
+    # On the 3rd buy, BNB had been exhausted by 4 prior fees so Binance
+    # took that fee from the base asset itself — leaving us with ~973.88
+    # ME held but trying to limit-sell the full 974.61.  Binance rejected
+    # with "insufficient balance" — TP never placed, HARD-SL also couldn't
+    # market-sell, position stranded at -5% (~$4.80 loss).
+    #
+    # Two safety fixes:
+    #
+    # 1. sellQtyFeeBuffer (default 0.999) — multiply the sell qty by this
+    #    before round_quantity so a fee paid in base asset doesn't cause
+    #    rejection.  Mirrors the Fast Scalper's existing approach.
+    #
+    # 2. rulesCooldownSeconds (default 300) — after a SELL on a symbol,
+    #    Redis key RULES_COOLDOWN:<sym> gets a TTL.  try_buy checks this
+    #    key first and skips when present.  Stops the rapid-fire pattern
+    #    where stale ST timing data + cleared _triggered = instant re-buy.
+    sellQtyFeeBuffer: float = 0.999
+    rulesCooldownSeconds: int = 300
+    iter52CooldownFeeBufferAppliedAt: str = "2026-05-23"
+
     # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
     # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
     # See trailing_tp.py for the state machine.  This iter also fixes the
