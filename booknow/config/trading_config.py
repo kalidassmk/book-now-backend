@@ -45,8 +45,10 @@ class TradingConfig:
     # 2026-05-11 iter 4: TP 1.0 → 0.6 % so a $12 Buy 1 sell nets ~$0.05
     # (gross $0.072 - $0.024 fees). Multi-leg fills scale linearly
     # (~$0.05 per filled $12 leg).
+    # 2026-05-23 iter 53: profitAmountUsdt 0.20 → 0.40 (operator request
+    # — bigger per-win target across all bot paths).
     profitPct: float = 0.6
-    profitAmountUsdt: float = 0.0
+    profitAmountUsdt: float = 0.4
 
     # ── Stop loss (Fast Scalper consumes; Virtual Scalper too) ──────────
     # 2026-05-10: DISABLED by default (set to 0). Operator chose Option B
@@ -196,7 +198,9 @@ class TradingConfig:
     # 2026-05-15 iter 42: $0.20 → $0.15. Operator request — slightly more
     # reachable TP so trades close faster (NXPC pattern: user manually
     # cancelled the $0.20-target TP and re-priced lower for a quicker exit).
-    ladderTargetNetProfitUsdt: float = 0.15
+    # 2026-05-23 iter 53: $0.15 → $0.40. Operator request — bigger per-win
+    # target now that filter stack catches the worst losers.
+    ladderTargetNetProfitUsdt: float = 0.4
     # Per-side fee rate. 0.00075 = 0.075 % (BNB-for-fees discount enabled);
     # set to 0.001 (0.1 %) if BNB-for-fees is OFF.
     ladderFeeRatePerSide: float = 0.00075
