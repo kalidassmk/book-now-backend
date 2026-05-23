@@ -587,26 +587,6 @@ class TradingConfig:
     # re-enter the same trade.
     ladderCooldownSeconds: int = 14400   # 4 hours
 
-    # ── Dynamic / chasing take-profit (iter 47, 2026-05-23) ──────────────
-    # Replaces the static "+$0.20 net" limit-sell with a ratcheting one.
-    #
-    # 1. When the buy fills, place a limit-sell at base_tp = entry +
-    #    (profitAmountUsdt + round-trip fees) / qty.
-    # 2. On each price tick of an open position: if the price rises
-    #    dynamicTpMoveStepPct% above the current limit-sell price, cancel
-    #    the existing limit-sell and place a new one at the new higher
-    #    target (offset by the same +profitAmountUsdt above current price).
-    # 3. If the price falls back to base_tp_price after having been above
-    #    it (i.e. we "armed" the trail and then retraced), force a MARKET
-    #    sell so we still bank the original net-profit floor.
-    #
-    # Differs from iter15 ladderTrailingTpEnabled, which is a peak-trail
-    # market exit only on the ladder/scalper path. iter47 applies to the
-    # R1/R2/R3 rules path used by the python engine itself.
-    dynamicTpEnabled: bool = True
-    dynamicTpMoveStepPct: float = 0.3       # move TP up after +0.3% above current TP
-    iter47DynamicTpAppliedAt: str = "2026-05-23"
-
     # ── Metrics collection ───────────────────────────────────────────────
     metricsEnabled: bool = True
 

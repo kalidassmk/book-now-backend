@@ -32,11 +32,6 @@ import redis.asyncio as aioredis
 from booknow.processors.base import AsyncProcessor
 from booknow.repository import redis_keys
 from booknow.trading.state import Position, TradeState
-from booknow.trading.trailing_tp import (
-    FloorSell,
-    MoveUp,
-    TrailingTakeProfit,
-)
 from booknow.trading.tsl import TrailingStopLoss
 
 
@@ -90,7 +85,6 @@ class PositionMonitor(AsyncProcessor):
         tsl: TrailingStopLoss,
         executor: ExitExecutor,
         max_hold_seconds: int = 3600,  # 1 h default; live cfg.maxHoldSeconds wins regardless
-        trailing_tp: Optional[TrailingTakeProfit] = None,
     ):
         super().__init__()
         self._redis = redis_client
@@ -98,7 +92,6 @@ class PositionMonitor(AsyncProcessor):
         self._tsl = tsl
         self._executor = executor
         self.max_hold_seconds = max_hold_seconds
-        self._trailing_tp = trailing_tp
 
     async def _tick(self) -> None:
         positions = self._state.snapshot()
@@ -126,23 +119,7 @@ class PositionMonitor(AsyncProcessor):
                 await self._safe_exit(symbol, price, "TSL")
                 continue
 
-            # 2) Dynamic take-profit ratchet (iter 47).  Only ticks once
-            #    the buy has filled and the trailing-TP tracker has been
-            #    armed via on_buy_filled.
-            if self._trailing_tp is not None and self._trailing_tp.is_tracking(symbol):
-                action = self._trailing_tp.on_price_tick(symbol, price)
-                if isinstance(action, MoveUp):
-                    await self._safe_move_tp(symbol, action.new_tp_price)
-                    # Don't continue; let TSL+max-hold still apply on the same tick.
-                elif isinstance(action, FloorSell):
-                    self.log.info(
-                        "[Monitor] TRAIL_FLOOR for %s at %s — market sell at base TP",
-                        symbol, price,
-                    )
-                    await self._safe_exit(symbol, price, "TRAIL_FLOOR")
-                    continue
-
-            # 3) Max-hold timer
+            # 2) Max-hold timer
             if self.max_hold_seconds > 0:
                 held = now_ts - pos.entry_time
                 if held >= self.max_hold_seconds:
@@ -159,23 +136,6 @@ class PositionMonitor(AsyncProcessor):
             self.log.error(
                 "[Monitor] force_market_exit(%s, %s) failed: %s",
                 symbol, reason, e, exc_info=True,
-            )
-
-    async def _safe_move_tp(self, symbol: str, new_tp_price: Decimal) -> None:
-        """Best-effort cancel + replace of the resting limit-sell at the
-        new (higher) target price.  Delegates to the executor; logs and
-        swallows errors so the monitor loop keeps ticking on a transient
-        Binance failure.
-        """
-        mover = getattr(self._executor, "move_limit_sell", None)
-        if mover is None:
-            return
-        try:
-            await mover(symbol=symbol, new_price=new_tp_price)
-        except Exception as e:
-            self.log.error(
-                "[Monitor] move_limit_sell(%s, %s) failed: %s",
-                symbol, new_tp_price, e, exc_info=True,
             )
 
     async def _read_current_prices(self, symbols: list[str]) -> Dict[str, Dict[str, Any]]:
