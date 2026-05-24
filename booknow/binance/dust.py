@@ -43,6 +43,12 @@ logger = logging.getLogger("booknow.dust")
 TRANSFER_INTERVAL_S = 30          # was 10s in Java; 30s avoids hammering /sapi
 TRANSFER_GAP_S = 0.5              # space between transfers in one cycle
 
+# iter 68 — per-asset failure cooldown.  When universal_transfer fails
+# (typically "insufficient balance" because the dust is in Spot but we
+# tried Funding→Spot), avoid retrying that asset for this long so we
+# don't spam /sapi every 30s with hopeless retries.
+DEFAULT_FAILURE_COOLDOWN_S = 3600  # 1h
+
 
 def _dust_key(asset: str) -> str:
     return f"{redis_keys.DUST_PREFIX}{asset}"
@@ -64,6 +70,14 @@ class DustService:
 
         self._transfer_task: Optional[asyncio.Task] = None
         self._running = False
+
+        # iter 68 — per-asset failure tracking.
+        # _failure_until[asset] = monotonic time after which we may retry.
+        # _failure_count[asset] = how many times this asset has failed
+        # (used to decide log severity).
+        self._failure_until: dict[str, float] = {}
+        self._failure_count: dict[str, int] = {}
+        self._failure_cooldown_s: int = DEFAULT_FAILURE_COOLDOWN_S
 
     # ── Lifecycle ────────────────────────────────────────────────────────
 
@@ -162,8 +176,26 @@ class DustService:
         keys: List[str] = await self._redis.keys(f"{redis_keys.DUST_PREFIX}*")
         if not keys:
             return
-        logger.info("[DustService] auto-transfer found %d dust asset(s)", len(keys))
-        for key in keys:
+
+        # iter 68 — filter out assets still inside their failure cooldown
+        # before logging "found N dust asset(s)" so the log reflects what
+        # we'll actually attempt.
+        now = time()
+        eligible_keys = []
+        for k in keys:
+            asset_name = k.split(":")[-1] if isinstance(k, str) else None
+            if asset_name and self._failure_until.get(asset_name, 0) > now:
+                continue
+            eligible_keys.append(k)
+
+        if not eligible_keys:
+            return  # everything's in cooldown — silent skip
+        logger.info(
+            "[DustService] auto-transfer found %d dust asset(s) (%d in cooldown)",
+            len(eligible_keys), len(keys) - len(eligible_keys),
+        )
+
+        for key in eligible_keys:
             if self._guard.is_banned() or not self._running:
                 return
             raw = await self._redis.get(key)
@@ -188,6 +220,9 @@ class DustService:
                         asset, free, result["tranId"],
                     )
                     await self.remove(asset)
+                    # Clear failure tracking on success.
+                    self._failure_until.pop(asset, None)
+                    self._failure_count.pop(asset, None)
             except BinanceIpBannedException as e:
                 logger.warning(
                     "[DustService] transfer paused — Binance ban (%ds)",
@@ -197,8 +232,24 @@ class DustService:
             except Exception as e:
                 if self._guard.report_if_banned(e):
                     return
-                logger.error("[DustService] transfer failed for %s: %s", asset, e)
-                # Leave the entry in Redis so the next cycle retries.
+                # iter 68 — record failure + cooldown.  Log first failure
+                # at INFO, subsequent ones at DEBUG so the log doesn't
+                # repeat the same error every hour for stranded dust.
+                cnt = self._failure_count.get(asset, 0) + 1
+                self._failure_count[asset] = cnt
+                self._failure_until[asset] = time() + self._failure_cooldown_s
+                if cnt == 1:
+                    logger.info(
+                        "[DustService] transfer failed for %s: %s — cooldown %ds",
+                        asset, e, self._failure_cooldown_s,
+                    )
+                else:
+                    logger.debug(
+                        "[DustService] transfer failed for %s (#%d): %s — still in cooldown",
+                        asset, cnt, e,
+                    )
+                # Leave the entry in Redis so the next cycle retries
+                # *after* the cooldown.
 
             await asyncio.sleep(TRANSFER_GAP_S)
 

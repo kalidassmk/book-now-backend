@@ -642,6 +642,22 @@ class TradeExecutor:
         except Exception:
             pass  # Redis hiccup — proceed (still subject to other gates)
 
+        # iter 67: global USDT-cooldown — set whenever Binance returns
+        # "insufficient balance" on a buy.  Stops the bot from hammering
+        # the order endpoint (and spamming ERROR logs) when the user is
+        # out of USDT.  Auto-clears via TTL (default 300s), or the user
+        # can manually delete the key after transferring funds.
+        try:
+            ub_remaining = await self._redis.ttl("USDT_INSUFFICIENT_COOLDOWN")
+            if ub_remaining and ub_remaining > 0:
+                logger.info(
+                    "[%s] Skip %s — USDT insufficient cooldown active (%ds remaining)",
+                    rule_label, symbol, ub_remaining,
+                )
+                return
+        except Exception:
+            pass
+
         try:
             if await self._delist.is_delisted(symbol):
                 logger.warning(
@@ -827,6 +843,24 @@ class TradeExecutor:
         except Exception as e:
             if is_ip_ban(e):
                 logger.error("[%s] BUY %s failed — Binance ban (wrapped)", rule_label, symbol)
+                return
+            # iter 67: detect "insufficient balance" (USDT empty) and
+            # convert the noisy stack-trace into a clean info log + set
+            # a short-TTL cooldown so we stop hammering the API.
+            err_msg = str(e)
+            if "insufficient balance" in err_msg.lower():
+                ttl = int(getattr(cfg, "usdtInsufficientCooldownSec", 300) or 300)
+                try:
+                    await self._redis.setex(
+                        "USDT_INSUFFICIENT_COOLDOWN", ttl, "1",
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "[%s] BUY %s skipped — USDT insufficient. "
+                    "Pausing all buys for %ds (set USDT_INSUFFICIENT_COOLDOWN TTL).",
+                    rule_label, symbol, ttl,
+                )
                 return
             logger.error("[%s] Error executing buy for %s: %s", rule_label, symbol, e, exc_info=True)
 

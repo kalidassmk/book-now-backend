@@ -760,6 +760,24 @@ class TradingConfig:
     orderbookDepthTimeoutMs: int = 2000
     iter66OrderbookDepthAppliedAt: str = "2026-05-24"
 
+    # iter 67 (2026-05-24) — Insufficient-USDT cooldown.
+    # When Binance returns "insufficient balance" on a buy, set the
+    # Redis key USDT_INSUFFICIENT_COOLDOWN with this TTL so every
+    # subsequent try_buy short-circuits cleanly (INFO log, no API call,
+    # no stack trace) until the cooldown expires.  User can delete the
+    # key manually after transferring USDT to resume immediately.
+    usdtInsufficientCooldownSec: int = 300  # 5min
+    iter67InsufficientUsdtCooldownAppliedAt: str = "2026-05-24"
+
+    # iter 68 (2026-05-24) — DustService per-asset failure cooldown.
+    # After a transfer fails for an asset (e.g. universal_transfer fails
+    # because the dust is in Spot but we try Funding→Spot), wait this
+    # long before retrying that asset.  Without this we hammer /sapi
+    # every TRANSFER_INTERVAL_S (30s) forever, spamming ERROR logs.
+    dustTransferFailureCooldownSec: int = 3600  # 1h
+    dustTransferLogFailuresAsWarning: bool = False  # first one INFO, rest DEBUG
+    iter68DustFailureCooldownAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:
