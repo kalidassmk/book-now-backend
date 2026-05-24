@@ -290,7 +290,11 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     elif (vol_surge_1m >= normal_v1 and chg_1m >= normal_c1 and c > o):
         tier = "NORMAL"
     # iter 62 — slow steady pump (catches SUPER/EIGEN/ONDO/WLD style)
-    elif chg_1h >= float(cfg.get("pumpRiderSlow1hChgPct", 2.0)):
+    # iter 64 — require mild vol confirmation so price-only drift is rejected.
+    # Pure 1h price grind without vol behind it is not a real pump; demand at
+    # least vol_surge_5m >= pumpRiderSlow1hVolMult (default 1.5x).
+    elif (chg_1h >= float(cfg.get("pumpRiderSlow1hChgPct", 2.0))
+          and vol_surge_5m >= float(cfg.get("pumpRiderSlow1hVolMult", 1.5))):
         tier = "NORMAL"
     elif (vol_surge_5m >= early_v5 and chg_5m >= early_c5):
         tier = "EARLY"

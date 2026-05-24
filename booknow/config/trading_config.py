@@ -717,9 +717,16 @@ class TradingConfig:
     #     (1.5%/h) — too slow for chg_5m/chg_30m rules.  chg_1h ≥ 2%
     #     catches them.
     pumpRiderSlow1hChgPct: float = 2.0    # NORMAL tier if 1h change >= 2%
+    # iter 64 (2026-05-24) — require mild vol confirmation on the chg_1h rule
+    # so pure-price drift (slow grind with no vol behind it) is rejected.
+    # vol_surge_5m >= 1.5 means recent 5m vol must be at least 1.5x the prior
+    # 25m baseline — gentle enough to not block real slow pumps, strict enough
+    # to filter out organic drift on illiquid pairs.
+    pumpRiderSlow1hVolMult: float = 1.5
     earlyPumpAutoBuyScore: int = 85       # 0 = disabled; otherwise min EP score
     earlyPumpAutoBuyMaxAgeSec: int = 300  # only act on detections <5min old
     iter62EpAutoBuyAndChg1hAppliedAt: str = "2026-05-24"
+    iter64Slow1hVolConfirmAppliedAt: str = "2026-05-24"
 
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
