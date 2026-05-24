@@ -426,11 +426,17 @@ class TradeExecutor:
             "[+TP ARMED] %s qty=%s buy=%s sell-order=#%s",
             symbol, filled_qty, fill_price, sell_order_id,
         )
-        # iter 58 — Telegram alert on BUY fill + TP arming.
-        if getattr(cfg, "alertsEnabled", True):
-            try:
-                from booknow.util.alerts import alert_buy_filled
-                # Reconstruct base_tp_price for the alert
+        # iter 60 — dashboard banner alert on BUY fill (always on).
+        try:
+            from booknow.util.alerts import publish_trade_alert, alert_buy_filled
+            await publish_trade_alert(
+                redis_client=self._redis,
+                symbol=symbol,
+                action="FILLED",
+                price=fill_price,
+                extra={"qty": float(filled_qty)},
+            )
+            if getattr(cfg, "alertsEnabled", False):
                 total_cost = fill_price * filled_qty
                 fee_rate = float(getattr(cfg, "ladderFeeRatePerSide", 0.00075) or 0.00075)
                 fees = Decimal(2) * Decimal(str(fee_rate)) * total_cost
@@ -443,8 +449,8 @@ class TradeExecutor:
                     tp_price=base_tp,
                     profit_amount_usdt=float(cfg.profitAmountUsdt),
                 )
-            except Exception as e:
-                logger.debug("alert_buy_filled failed: %s", e)
+        except Exception as e:
+            logger.debug("buy-fill alerts failed: %s", e)
         return sell_order_id
 
     async def move_limit_sell(
@@ -673,10 +679,18 @@ class TradeExecutor:
                 "[%s] BUY %s @ %s qty=%s (target +%.2f%%, +%s USDT)",
                 rule_label, symbol, buy_price, executed_qty, sell_pct, cfg.profitAmountUsdt,
             )
-            # iter 58 — Telegram alert on every BUY (placement, not fill).
-            if getattr(cfg, "alertsEnabled", True):
-                try:
-                    from booknow.util.alerts import alert_buy_placed
+            # iter 60 — always publish to dashboard banner (regardless
+            # of Telegram setting).  Telegram is gated by alertsEnabled.
+            try:
+                from booknow.util.alerts import publish_trade_alert, alert_buy_placed
+                await publish_trade_alert(
+                    redis_client=self._redis,
+                    symbol=symbol,
+                    action="BUY",
+                    price=buy_price,
+                    rule_label=rule_label,
+                )
+                if getattr(cfg, "alertsEnabled", False):
                     await alert_buy_placed(
                         symbol=symbol,
                         price=buy_price,
@@ -685,8 +699,8 @@ class TradeExecutor:
                         leg_usdt=float(cfg.buyAmountUsdt),
                         rule_label=rule_label,
                     )
-                except Exception as e:
-                    logger.debug("alert_buy_placed failed: %s", e)
+            except Exception as e:
+                logger.debug("buy alerts failed: %s", e)
         except BinanceIpBannedException as e:
             logger.error("[%s] BUY %s failed — Binance ban: %s", rule_label, symbol, e)
         except Exception as e:
@@ -829,16 +843,31 @@ class TradeExecutor:
             await self._redis.hdel(redis_keys.BUY_KEY, symbol)
         except Exception as e:
             logger.error("[ForceExit:%s] redis cleanup failed for %s: %s", reason, symbol, e)
-        # iter 58 — Telegram alert BEFORE state cleanup (so we still have
-        # the Position's buy_price + entry_time for realised P&L math).
+        # iter 60 — dashboard banner alert + (optional) Telegram before
+        # state cleanup, so we still have the Position for P&L math.
         try:
             cfg_alerts = await self._config.get()
-            if getattr(cfg_alerts, "alertsEnabled", True):
-                from booknow.util.alerts import alert_sold
-                from time import time as _now
-                pos_for_alert = self._state.get_position(symbol)
-                if pos_for_alert is not None:
-                    hold_s = int(max(0, _now() - pos_for_alert.entry_time))
+            from booknow.util.alerts import publish_trade_alert, alert_sold
+            from time import time as _now
+            pos_for_alert = self._state.get_position(symbol)
+            if pos_for_alert is not None:
+                hold_s = int(max(0, _now() - pos_for_alert.entry_time))
+                try:
+                    bp = float(pos_for_alert.buy_price); sp = float(sell_price); q = float(qty)
+                    gross = (sp - bp) * q
+                    fees = 2 * 0.00075 * (bp * q)
+                    realised_net = gross - fees
+                except Exception:
+                    realised_net = None
+                await publish_trade_alert(
+                    redis_client=self._redis,
+                    symbol=symbol,
+                    action="SELL",
+                    price=sell_price,
+                    realised_net=realised_net,
+                    rule_label=reason,
+                )
+                if getattr(cfg_alerts, "alertsEnabled", False):
                     await alert_sold(
                         symbol=symbol,
                         buy_price=pos_for_alert.buy_price,
@@ -848,7 +877,7 @@ class TradeExecutor:
                         hold_seconds=hold_s,
                     )
         except Exception as e:
-            logger.debug("alert_sold (force_exit) failed: %s", e)
+            logger.debug("sell alerts (force_exit) failed: %s", e)
 
         self._state.mark_sold(symbol)
         self._tsl.reset(symbol)

@@ -385,14 +385,28 @@ async def _bootstrap() -> None:
                     "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
                     order_id, symbol, price,
                 )
-                # iter 58 — Telegram alert BEFORE state cleanup so we
-                # still have buy_price + entry_time for realised P&L.
+                # iter 60 — dashboard banner alert + optional Telegram.
                 try:
-                    from booknow.util.alerts import alert_sold
+                    from booknow.util.alerts import publish_trade_alert, alert_sold
                     from time import time as _now
                     cfg_alerts = await config_service.get()
-                    if getattr(cfg_alerts, "alertsEnabled", True):
-                        hold_s = int(max(0, _now() - pos.entry_time))
+                    hold_s = int(max(0, _now() - pos.entry_time))
+                    try:
+                        bp = float(pos.buy_price); sp = float(price); q = float(pos.qty)
+                        gross = (sp - bp) * q
+                        fees = 2 * 0.00075 * (bp * q)
+                        realised_net = gross - fees
+                    except Exception:
+                        realised_net = None
+                    await publish_trade_alert(
+                        redis_client=redis,
+                        symbol=symbol,
+                        action="SELL",
+                        price=price,
+                        realised_net=realised_net,
+                        rule_label="TP",
+                    )
+                    if getattr(cfg_alerts, "alertsEnabled", False):
                         await alert_sold(
                             symbol=symbol,
                             buy_price=pos.buy_price,
@@ -402,7 +416,7 @@ async def _bootstrap() -> None:
                             hold_seconds=hold_s,
                         )
                 except Exception as e:
-                    log.debug("[+TARGET HIT] alert_sold failed for %s: %s", symbol, e)
+                    log.debug("[+TARGET HIT] alerts failed for %s: %s", symbol, e)
 
                 trade_state.mark_sold(symbol)
                 tsl.reset(symbol)

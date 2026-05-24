@@ -80,6 +80,43 @@ def is_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN) and bool(TELEGRAM_CHAT_ID)
 
 
+async def publish_trade_alert(*, redis_client, symbol: str, action: str,
+                               price=None, realised_net: float = None,
+                               rule_label: str = "", extra: dict = None) -> None:
+    """iter 60 — write a dashboard-banner event to Redis.
+
+    The frontend's /api/alerts/feed reads TRADE_ALERTS:<date> and pushes
+    it to the alert-banner.js overlay on every dashboard page.  This is
+    the in-dashboard replacement for Telegram (which the operator turned
+    off).
+    """
+    import json as _json
+    import time as _time
+    import datetime as _dt
+    try:
+        ev = {
+            "ts": int(_time.time() * 1000),
+            "symbol": symbol,
+            "action": action,
+            "rule_label": rule_label,
+        }
+        if price is not None:
+            try: ev["price"] = float(price)
+            except Exception: pass
+        if realised_net is not None:
+            try: ev["realised_net"] = float(realised_net)
+            except Exception: pass
+        if extra:
+            ev.update(extra)
+        date = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d")
+        key = f"TRADE_ALERTS:{date}"
+        await redis_client.lpush(key, _json.dumps(ev))
+        await redis_client.ltrim(key, 0, 999)
+        await redis_client.expire(key, 7 * 24 * 60 * 60)
+    except Exception as e:
+        logger.debug("publish_trade_alert failed: %s", e)
+
+
 async def send_telegram(message: str, parse_mode: str = "HTML") -> bool:
     """Fire-and-forget POST to the Telegram API.
 
