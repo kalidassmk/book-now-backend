@@ -915,6 +915,56 @@ class TradingConfig:
     weakPumpTakerBuyCeil: float = 0.45     # below this = sellers absorbing
     iter71WeakPumpAppliedAt: str = "2026-05-24"
 
+    # ──────────────────────────────────────────────────────────────────
+    # iter 72 (2026-05-24) — Calm Consolidation Pattern (CCP)
+    # ──────────────────────────────────────────────────────────────────
+    # Detects price flat + volume drying = sellers exhausted /
+    # accumulation phase.  Direction bias from position in range:
+    #   • near 24h low + 7d low → CALM_REVERSAL_UP (best setup)
+    #   • near 24h high         → CALM_BREAKDOWN_RISK (avoid)
+    #   • middle of range       → CALM_NEUTRAL
+    #
+    # Gate (all must pass before scoring):
+    #   • |chg_1h| < ccpMaxAbsChg1hPct
+    #   • |chg_4h| < ccpMaxAbsChg4hPct
+    #   • vol_recent_30m / vol_prior_30m < ccpMaxVolRatio
+    #   • range_recent_30m / range_prior_30m < ccpMaxRangeRatio
+    #   • spike_count over last 12 × 5m bars <= ccpMaxSpikeCount
+    #
+    # Score (0-100) across 7 factors then classified.
+    # Paper mode default; live mode delegates CALM_REVERSAL_UP buys.
+    ccpEnabled: bool = True
+    ccpPaperMode: bool = True
+    ccpPaperModeEndDate: str = "2026-05-31"
+    ccpPollIntervalSec: int = 60
+    ccpCooldownSec: int = 1800
+    ccpMin24hVolUsd: float = 500_000
+    ccpTopSymbols: int = 200
+
+    # Gate thresholds
+    ccpMaxAbsChg1hPct: float = 2.0
+    ccpMaxAbsChg4hPct: float = 3.0
+    ccpMaxVolRatio: float = 0.7
+    ccpMaxRangeRatio: float = 0.5
+    ccpMaxSpikeCount: int = 2
+    ccpSpikePct: float = 0.5
+
+    # Scoring weights
+    ccpWeightVolDrying: int = 25
+    ccpWeightRangeContraction: int = 20
+    ccpWeightSellersExhausted: int = 15
+    ccpWeightDipDepth: int = 15
+    ccpWeightTimeAtLow: int = 10
+    ccpWeightSupportProximity: int = 10
+    ccpWeightLowVolatility: int = 5
+
+    # Classification + live thresholds
+    ccpMinScore: int = 50
+    ccpQualityScore: int = 75
+    ccpLiveScore: int = 75
+    ccpSellPctLabel: float = 5.0
+    iter72CcpAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:

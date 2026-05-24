@@ -147,4 +147,14 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("low_mcap_explosive.py",),
         kind="persistent",
     ),
+    # iter 72 (2026-05-24) — Calm Consolidation Pattern (CCP).
+    # Detects price flat + volume drying up = sellers exhausted /
+    # accumulation phase.  Direction bias from position in 24h/7d
+    # range: near low = REVERSAL_UP setup, near high = BREAKDOWN_RISK.
+    # Paper mode default; live mode delegates CALM_REVERSAL_UP buys.
+    SubprocessTask(
+        name="Calm Consolidation",
+        cmd_argv=("calm_consolidation.py",),
+        kind="persistent",
+    ),
 ]
