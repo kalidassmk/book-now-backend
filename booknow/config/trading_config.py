@@ -890,6 +890,31 @@ class TradingConfig:
     lmcSellPctLabel: float = 5.0
     iter70LmcAppliedAt: str = "2026-05-24"
 
+    # ──────────────────────────────────────────────────────────────────
+    # iter 71 (2026-05-24) — Weak-Pump Filter (Price↑ + Volume↓ = REJECT)
+    # ──────────────────────────────────────────────────────────────────
+    # Classic bearish divergence — when price is rising but volume is
+    # fading, the pump is running out of buyers and is very likely to
+    # reverse.  Added as a filter in /api/check-coin so EVERY buy path
+    # that flows through try_buy is protected: R1/R2/R3 rules,
+    # Pattern Bot, PumpRider, EARLY_PUMP autobuy, and (when they go
+    # live) VSP + LMC.
+    #
+    # Three sub-rules trigger the reject (any of):
+    #   1. Primary: 15m chg >= weakPumpMinChgPct AND
+    #      recent vol / prior vol < weakPumpVolDeclineRatio
+    #   2. Wick: chg up AND green bars have avg upper-wick share >=
+    #      weakPumpUpperWickShare (buyers being absorbed at highs)
+    #   3. TBR: chg up AND taker-buy ratio < weakPumpTakerBuyCeil
+    #      AND vol_ratio < 1.0 (sellers absorbing buyers)
+    iter71WeakPumpFilterEnabled: bool = True
+    weakPumpWindowMin: int = 15            # measurement window
+    weakPumpMinChgPct: float = 0.5         # only check if price ↑ this much
+    weakPumpVolDeclineRatio: float = 0.7   # recent/prior vol below this = weak
+    weakPumpUpperWickShare: float = 0.4    # avg upper-wick share on greens
+    weakPumpTakerBuyCeil: float = 0.45     # below this = sellers absorbing
+    iter71WeakPumpAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:
