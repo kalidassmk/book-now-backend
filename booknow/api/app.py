@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from booknow.api.routes_binance import router as binance_router
 from booknow.api.routes_config import router as config_router
+from booknow.api.routes_diag import router as diag_router
 from booknow.api.routes_trading import router as trading_router
 from booknow.api.routes_wallet import router as wallet_router
 from booknow.api.state import AppState
@@ -59,6 +60,7 @@ def build_app(state: AppState) -> FastAPI:
     app.include_router(binance_router)
     app.include_router(wallet_router)
     app.include_router(config_router)
+    app.include_router(diag_router)  # iter 79 — /api/v1/diag/logs/*
 
     @app.get("/", tags=["meta"])
     async def root():
