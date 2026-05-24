@@ -137,4 +137,14 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("volume_spike_pattern.py",),
         kind="persistent",
     ),
+    # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC).
+    # Small caps (7d avg vol < $10M) suddenly getting 3x+ volume =
+    # explosive-move chance.  Scores 0-100 from 6 factors, classifies
+    # direction (PUMP/DUMP/NEUTRAL) via hourly candles + VWAP.
+    # Paper mode default; live mode delegates EXPLOSIVE_PUMP buys.
+    SubprocessTask(
+        name="Low MCap Explosive",
+        cmd_argv=("low_mcap_explosive.py",),
+        kind="persistent",
+    ),
 ]

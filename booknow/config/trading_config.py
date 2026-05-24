@@ -839,6 +839,57 @@ class TradingConfig:
     vspSellPctLabel: float = 5.0
     iter69VspAppliedAt: str = "2026-05-24"
 
+    # ──────────────────────────────────────────────────────────────────
+    # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
+    # ──────────────────────────────────────────────────────────────────
+    # Subprocess `low_mcap_explosive.py` detects small-cap coins (7d
+    # avg quote vol within [lmcMinVol24h, lmcMaxAvgVol7d]) that suddenly
+    # get 3×+ volume.  Scores 0-100 across 6 factors:
+    #   • LOW MCAP proxy (7d avg vol bucket) — up to 25 pts
+    #   • Volume surge today vs 7d avg — up to 25
+    #   • Trade-count surge — up to 15
+    #   • Today's |chg_24h| — up to 20
+    #   • Pre-pump quiet (7d range tight) — up to 10
+    #   • Liquidity sanity (today vol >= $100K) — up to 5
+    # Then classifies direction (PUMP/DUMP/NEUTRAL) via last-24h hourly
+    # candles + VWAP + taker-buy ratio.
+    #
+    # Paper mode for first 7 days (auto-flips after lmcPaperModeEndDate).
+    # Live mode delegates EXPLOSIVE_PUMP buys at score >= lmcLiveScore.
+    #
+    # Redis keys:
+    #   LMC:DETECTIONS:<date>, LMC:LATEST, LMC:PAPER_TRADES:<date>,
+    #   LMC:OUTCOMES:<date>, LMC:COOLDOWN:<sym>, LMC:OUTCOME_PENDING
+    lmcEnabled: bool = True
+    lmcPaperMode: bool = True
+    lmcPaperModeEndDate: str = "2026-05-31"
+    lmcPollIntervalSec: int = 30
+    lmcCooldownSec: int = 1800       # 30min per symbol
+
+    # Universe brackets
+    lmcMinVol24h: float = 50_000
+    lmcMaxAvgVol7d: float = 10_000_000
+
+    # Entry triggers
+    lmcMinVolSurge: float = 3.0
+    lmcMinTradeSurge: float = 3.0
+    lmcMinAbsChg24h: float = 2.0
+
+    # Scoring weights
+    lmcWeightMcap: int = 25
+    lmcWeightVolSurge: int = 25
+    lmcWeightTradeSurge: int = 15
+    lmcWeightTodayMove: int = 20
+    lmcWeightPrePumpQuiet: int = 10
+    lmcWeightLiquiditySanity: int = 5
+
+    # Classification thresholds
+    lmcExplosiveScore: int = 75
+    lmcWatchScore: int = 50
+    lmcLiveScore: int = 75
+    lmcSellPctLabel: float = 5.0
+    iter70LmcAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:
