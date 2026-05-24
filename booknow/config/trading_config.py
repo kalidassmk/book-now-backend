@@ -778,6 +778,67 @@ class TradingConfig:
     dustTransferLogFailuresAsWarning: bool = False  # first one INFO, rest DEBUG
     iter68DustFailureCooldownAppliedAt: str = "2026-05-24"
 
+    # ──────────────────────────────────────────────────────────────────
+    # iter 69 (2026-05-24) — Volume-Spike Pattern (VSP) classifier
+    # ──────────────────────────────────────────────────────────────────
+    # New subprocess `volume_spike_pattern.py` detects sudden volume
+    # spikes and uses *taker buy ratio* (Binance gives takerBuyQuote
+    # per 1m kline) + candle structure + VWAP + HH/LL to disambiguate
+    # PUMP vs DUMP, plus volume z-score + sustainment + range
+    # expansion to predict BIG-move magnitude.
+    #
+    # Output published to:
+    #   VSP:DETECTIONS:<date>   — every fire
+    #   VSP:LATEST              — hash: symbol → latest event
+    #   VSP:PAPER_TRADES:<date> — would-be buys in paper mode
+    #   VSP:OUTCOMES:<date>     — actual price chg at +5/+15/+30/+60m
+    #
+    # Paper mode for first 7 days (auto-flips to live after
+    # vspPaperModeEndDate).  Live mode delegates BIG_PUMP buys at
+    # confidence ≥ vspLiveConfidence via pattern-buy — inherits
+    # iter65 resistance gate + iter66 depth check + HARD-SL.
+    vspEnabled: bool = True
+    vspPaperMode: bool = True
+    vspPaperModeEndDate: str = "2026-05-31"  # auto-live from June 1st
+    vspTopSymbols: int = 100
+    vspPollIntervalSec: int = 15
+    vspCooldownSec: int = 600                # per-symbol cooldown
+    vspMin24hVolUsd: float = 1_000_000
+
+    # Entry triggers (any wakes up the scorer)
+    vspEntryVol1mMult: float = 5.0
+    vspEntryVol5mMult: float = 3.0
+    vspEntryTradeMult: float = 4.0
+
+    # Direction scoring weights (sum to 100 for pure pump/dump signal)
+    vspWeightCandleColor: int = 20
+    vspWeightTakerRatio: int = 20
+    vspWeightBodyWick: int = 15
+    vspWeightVwap: int = 10
+    vspWeightChg5m: int = 15
+    vspWeightHhLl: int = 10
+    vspWeightTradeSize: int = 10
+
+    # Magnitude scoring weights (sum to 100)
+    vspMagWeightZScore: int = 25
+    vspMagWeightSustained: int = 20
+    vspMagWeightRangeExp: int = 15
+    vspMagWeightAccel: int = 10
+    vspMagWeightTradeSurge: int = 10
+    vspMagWeightWasQuiet: int = 10
+    vspMagWeightRoomToRun: int = 10
+
+    # Classification thresholds
+    vspBigDirThreshold: int = 40       # |D| >= this for BIG
+    vspBigMagThreshold: int = 60       # M >= this for BIG
+    vspModerateDirThreshold: int = 60
+    vspModerateMagThreshold: int = 40
+
+    # Live-mode buy threshold (only acts on BIG_PUMP)
+    vspLiveConfidence: int = 75
+    vspSellPctLabel: float = 5.0
+    iter69VspAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:

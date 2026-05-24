@@ -126,4 +126,15 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("pump_rider.py",),
         kind="persistent",
     ),
+    # iter 69 (2026-05-24) — Volume-Spike Pattern (VSP) classifier.
+    # Detects volume spikes and uses taker-buy-ratio + candle structure
+    # to classify direction (BIG_PUMP / BIG_DUMP / MODERATE / UNCERTAIN)
+    # and magnitude (0-100).  Paper mode for first 7 days, then live.
+    # Live buys delegate via the same pattern-buy endpoint so they
+    # inherit iter65/66 + all safety gates.
+    SubprocessTask(
+        name="Volume Spike Pattern",
+        cmd_argv=("volume_spike_pattern.py",),
+        kind="persistent",
+    ),
 ]
