@@ -682,7 +682,7 @@ class TradingConfig:
     pumpRiderVolMultipleThreshold: float = 2.5       # last 1m candle vol vs 20-candle baseline
     pumpRiderMinPriceChangePct: float = 0.8          # last candle close-vs-open %
     pumpRiderMinPriorVolMultiple: float = 1.5        # warm-up confirmation
-    pumpRiderMinVol24hUsd: float = 1_000_000.0       # liquidity floor
+    pumpRiderMinVol24hUsd: float = 2_000_000.0       # iter 75 — bumped 1M→2M to cut false-breakout noise
     pumpRiderMaxCumulativeGainPct: float = 8.0       # skip mature pumps
     pumpRiderMaxLookbackCandles: int = 10            # look-back window for cum-gain
     pumpRiderTopSymbols: int = 200                   # iter 61: 50→200 — scan all USDT pairs
@@ -803,7 +803,7 @@ class TradingConfig:
     vspTopSymbols: int = 100
     vspPollIntervalSec: int = 15
     vspCooldownSec: int = 600                # per-symbol cooldown
-    vspMin24hVolUsd: float = 1_000_000
+    vspMin24hVolUsd: float = 2_000_000          # iter 75 — bumped 1M→2M to cut false-breakout noise
 
     # Entry triggers (any wakes up the scorer)
     vspEntryVol1mMult: float = 5.0
@@ -938,7 +938,12 @@ class TradingConfig:
     ccpPaperModeEndDate: str = "2026-05-31"
     ccpPollIntervalSec: int = 60
     ccpCooldownSec: int = 1800
-    ccpMin24hVolUsd: float = 500_000
+    ccpMin24hVolUsd: float = 2_000_000          # iter 75 — bumped 500K→2M to cut false-breakout noise
+    # NOTE: LMC script reads `lmcMinVol24h` (no "Usd" suffix) — keep both
+    # keys in sync.  iter 75 bumped 50K → 2M to cut false signals.
+    lmcMinVol24h: float = 2_000_000             # iter 75 — actual key LMC reads
+    lmcMin24hVolUsd: float = 2_000_000          # iter 75 — alias for parity with other detectors
+    iter75VolFloors2mAppliedAt: str = "2026-05-24"
     ccpTopSymbols: int = 200
 
     # Gate thresholds

@@ -66,7 +66,7 @@ DEFAULTS: Dict[str, Any] = {
     "lmcCooldownSec": 1800,                # 30min per-symbol
 
     # Universe brackets (in USD)
-    "lmcMinVol24h": 50_000,                # below = dead/illiquid, skip
+    "lmcMinVol24h": 2_000_000,             # iter 75 — bumped 50K→2M (false-signal noise)
     "lmcMaxAvgVol7d": 10_000_000,          # above = not small cap
 
     # Entry triggers
@@ -410,7 +410,7 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
 
     # LMC bracket
     max_avg = float(cfg.get("lmcMaxAvgVol7d", 10_000_000))
-    min_avg = float(cfg.get("lmcMinVol24h", 50_000))
+    min_avg = float(cfg.get("lmcMinVol24h", 2_000_000))  # iter 75
     if avg_vol_7d > max_avg or avg_vol_7d < min_avg:
         return None
 
@@ -674,7 +674,7 @@ def main() -> None:
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
-            min_v = float(cfg.get("lmcMinVol24h", 50_000))
+            min_v = float(cfg.get("lmcMinVol24h", 2_000_000))  # iter 75
             max_v = float(cfg.get("lmcMaxAvgVol7d", 10_000_000))
             candidates = universe_from_tickers(tickers, min_v, max_v)
             log.info(f"[LMC] universe = {len(candidates)} candidates "

@@ -64,7 +64,7 @@ DEFAULTS: Dict[str, Any] = {
     "ccpPaperModeEndDate": "2026-05-31",
     "ccpPollIntervalSec": 60,
     "ccpCooldownSec": 1800,
-    "ccpMin24hVolUsd": 500_000,
+    "ccpMin24hVolUsd": 2_000_000,  # iter 75 — bumped 500K→2M (false-signal noise)
     "ccpTopSymbols": 200,
 
     # Gate thresholds
@@ -459,7 +459,7 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
         chg_24h = float(ticker.get("priceChangePercent") or 0)
     except (TypeError, ValueError):
         return None
-    if qv_24h < float(cfg.get("ccpMin24hVolUsd", 500_000)):
+    if qv_24h < float(cfg.get("ccpMin24hVolUsd", 2_000_000)):  # iter 75
         return None
     if last_price <= 0:
         return None
@@ -701,7 +701,7 @@ def main() -> None:
                 continue
 
             # Pre-filter universe by 24h vol + chg
-            min_vol = float(cfg.get("ccpMin24hVolUsd", 500_000))
+            min_vol = float(cfg.get("ccpMin24hVolUsd", 2_000_000))  # iter 75
             top_n = int(cfg.get("ccpTopSymbols", 200))
             candidates = []
             for t in tickers:

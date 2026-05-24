@@ -66,7 +66,7 @@ DEFAULTS: Dict[str, Any] = {
     "vspTopSymbols": 100,
     "vspPollIntervalSec": 15,
     "vspCooldownSec": 600,                   # per-symbol cooldown
-    "vspMin24hVolUsd": 1_000_000,            # liquidity floor
+    "vspMin24hVolUsd": 2_000_000,            # iter 75 — bumped 1M→2M (false-signal noise)
 
     # Entry triggers (any of these wakes up the scorer)
     "vspEntryVol1mMult": 5.0,
@@ -580,7 +580,7 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any],
     else:
         qv_24h = qv_24h_est * 24
 
-    min_24h = float(cfg.get("vspMin24hVolUsd", 1_000_000))
+    min_24h = float(cfg.get("vspMin24hVolUsd", 2_000_000))  # iter 75
     if qv_24h < min_24h:
         return None
 

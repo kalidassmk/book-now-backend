@@ -70,7 +70,7 @@ DEFAULTS: Dict[str, Any] = {
     "pumpRiderVolMultipleThreshold": 2.5,    # vol > 2.5x baseline
     "pumpRiderMinPriceChangePct": 0.8,       # candle must close +0.8%
     "pumpRiderMinPriorVolMultiple": 1.5,     # prior candle warm-up
-    "pumpRiderMinVol24hUsd": 1_000_000,      # liquidity floor
+    "pumpRiderMinVol24hUsd": 2_000_000,      # iter 75 — bumped 1M→2M (false-signal noise)
     "pumpRiderMaxCumulativeGainPct": 8.0,    # skip if already pumped > +8%
     "pumpRiderMaxLookbackCandles": 10,       # look-back window for cumulative %
     "pumpRiderTopSymbols": 50,               # scan top-N by FAST_MOVE score
