@@ -145,12 +145,18 @@ def load_config(r: redis.Redis) -> Dict[str, Any]:
 
 
 def pick_symbols(r: redis.Redis, top_n: int) -> List[str]:
-    """Pick the N most-active USDT symbols.
+    """Pick up to N USDT symbols to scan.
 
-    Uses the FAST_MOVE hash (written by Fast Move Analyzer) — already
-    ranked by momentum.  Falls back to FAST_MOVE_TOP5 + CURRENT_PRICE
-    keys if FAST_MOVE is empty.
+    iter 61 (2026-05-23) — COS pumped from $0.001150 at 08:25 UTC.
+    Old logic returned only the top 50 FAST_MOVE symbols.  COS was
+    quiet before 08:25 so it wasn't in FAST_MOVE → never scanned →
+    we missed the pump start by 3.5h.  New logic:
+      1. take FAST_MOVE ranking first (highest priority)
+      2. UNION with every USDT key in CURRENT_PRICE (~400 symbols)
+      3. de-dupe, cap at top_n (default 200)
     """
+    out: List[str] = []
+    seen: set = set()
     try:
         raw = r.hgetall("FAST_MOVE") or {}
         scored: List[tuple] = []
@@ -162,19 +168,25 @@ def pick_symbols(r: redis.Redis, top_n: int) -> List[str]:
             except Exception:
                 continue
         scored.sort(reverse=True)
-        if scored:
-            return [s for _, s in scored[:top_n]]
+        for _, sym in scored:
+            if sym not in seen and sym.endswith("USDT"):
+                seen.add(sym); out.append(sym)
+            if len(out) >= top_n: return out
     except Exception as e:
         log.warning(f"FAST_MOVE read failed: {e}")
-    # Fallback — use any CURRENT_PRICE keys (less targeted, but works).
+    # Top-up with CURRENT_PRICE keys (all WS-tracked USDT pairs)
     try:
         keys = list(r.hkeys("CURRENT_PRICE") or [])
-        return [k for k in keys if k.endswith("USDT")][:top_n]
+        for k in keys:
+            if k.endswith("USDT") and k not in seen:
+                seen.add(k); out.append(k)
+                if len(out) >= top_n: return out
     except Exception:
-        return []
+        pass
+    return out
 
 
-def fetch_klines(symbol: str, limit: int = 25) -> Optional[List[List]]:
+def fetch_klines(symbol: str, limit: int = 32) -> Optional[List[List]]:
     """Last `limit` 1m klines for symbol.  Returns the raw Binance shape."""
     try:
         r = requests.get(
@@ -205,77 +217,104 @@ def fetch_24h_ticker(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return a detection event dict if the entry rules fire, else None."""
-    ks = fetch_klines(symbol, limit=25)
-    if not ks or len(ks) < 22:
+    """iter 61 — multi-window tiered pump detection.
+
+    Tiers:
+      EARLY   — alert only.  Caught early; manual confirmation desired.
+      NORMAL  — buy.  Standard pump start (vol surge + meaningful move).
+      STRONG  — buy.  High-confidence (big vol surge + big 5m move).
+      MEGA    — alert only.  Already pumped too much — chasing the top.
+
+    Replay COS 08:25 UTC:
+      chg_1m=+0.61%  chg_5m=+1.14%  vol_surge_5m=4.95x
+      → NORMAL (5m vol ≥ 3x AND 5m chg ≥ 1.0%)
+      → BUY at $0.001154 ✓
+    """
+    ks = fetch_klines(symbol, limit=32)
+    if not ks or len(ks) < 32:
         return None
 
-    # klines[-1] is the in-progress candle.  Use [-2] (most-recently-closed)
-    # as the trigger candle, and [-3] as the prior warm-up candle.
-    trigger = ks[-2]
-    prior = ks[-3]
-
+    # ks[-1] is the in-progress candle; use ks[:-1] for closed-only.
+    closed = ks[:-1]
     try:
-        o = float(trigger[1]); h = float(trigger[2]); l = float(trigger[3])
-        c = float(trigger[4]); qv = float(trigger[7])
-        po = float(prior[1]); pc = float(prior[4]); pqv = float(prior[7])
+        opens  = [float(k[1]) for k in closed]
+        closes = [float(k[4]) for k in closed]
+        qvols  = [float(k[7]) for k in closed]
     except (ValueError, IndexError, TypeError):
         return None
-
-    if o <= 0 or c <= 0 or qv <= 0:
+    if len(closes) < 30 or opens[-1] <= 0 or closes[-1] <= 0:
         return None
 
-    # Baseline = 20 candles before the prior one (don't include the warm-up
-    # in the baseline or it falsely raises the bar).
-    baseline_window = ks[-23:-3]
-    if len(baseline_window) < 15:
+    c = closes[-1]; o = opens[-1]
+
+    # ── Multi-window % changes ─────────────────────────────────────
+    chg_1m  = (c - o) / o * 100 if o > 0 else 0
+    chg_5m  = (c - closes[-6])  / closes[-6]  * 100 if closes[-6]  > 0 else 0
+    chg_30m = (c - closes[-30]) / closes[-30] * 100 if closes[-30] > 0 else 0
+
+    # ── Volume surges (two windows) ────────────────────────────────
+    qv_5m_avg  = sum(qvols[-5:]) / 5
+    qv_25m_prior = sum(qvols[-30:-5]) / 25 if len(qvols) >= 30 else 0
+    vol_surge_5m = qv_5m_avg / qv_25m_prior if qv_25m_prior > 0 else 0
+    qv_1m = qvols[-1]
+    qv_25m_base = sum(qvols[-26:-1]) / 25 if len(qvols) >= 26 else 0
+    vol_surge_1m = qv_1m / qv_25m_base if qv_25m_base > 0 else 0
+
+    # Cumulative 10m gain (top-chase guard)
+    cum_chg_10m = (c - opens[-10]) / opens[-10] * 100 if opens[-10] > 0 else 0
+
+    # ── Tier classification (thresholds from config) ───────────────
+    mega_5m   = float(cfg.get("pumpRiderMega5mPct", 5.0))
+    mega_1m   = float(cfg.get("pumpRiderMega1mPct", 3.0))
+    strong_v  = float(cfg.get("pumpRiderStrongVolMult", 5.0))
+    strong_c5 = float(cfg.get("pumpRiderStrongChg5mPct", 1.5))
+    normal_v5 = float(cfg.get("pumpRiderNormal5mVolMult", 3.0))
+    normal_c5 = float(cfg.get("pumpRiderNormal5mChgPct", 1.0))
+    normal_v1 = float(cfg["pumpRiderVolMultipleThreshold"])
+    normal_c1 = float(cfg["pumpRiderMinPriceChangePct"])
+    early_v5  = float(cfg.get("pumpRiderEarly5mVolMult", 2.0))
+    early_c5  = float(cfg.get("pumpRiderEarly5mChgPct", 0.5))
+    max_cum   = float(cfg["pumpRiderMaxCumulativeGainPct"])
+
+    tier = None
+    if chg_5m >= mega_5m or chg_1m >= mega_1m:
+        tier = "MEGA"
+    elif (vol_surge_5m >= strong_v and chg_5m >= strong_c5) or \
+         (vol_surge_1m >= strong_v and chg_1m >= strong_c5):
+        tier = "STRONG"
+    elif (vol_surge_5m >= normal_v5 and chg_5m >= normal_c5):
+        tier = "NORMAL"
+    elif (vol_surge_1m >= normal_v1 and chg_1m >= normal_c1 and c > o):
+        tier = "NORMAL"
+    elif (vol_surge_5m >= early_v5 and chg_5m >= early_c5):
+        tier = "EARLY"
+    elif chg_30m >= 3.0 and vol_surge_5m >= 1.5:
+        tier = "EARLY"
+
+    if tier is None:
         return None
-    try:
-        baseline_qv = mean(float(k[7]) for k in baseline_window)
-    except Exception:
-        return None
-    if baseline_qv <= 0:
-        return None
 
-    vol_mult = qv / baseline_qv
-    prior_vol_mult = pqv / baseline_qv if baseline_qv > 0 else 0
-    price_change_pct = (c - o) / o * 100
-
-    # ── Entry rules ────────────────────────────────────────────────
-    reasons = []
-    if vol_mult < cfg["pumpRiderVolMultipleThreshold"]:
-        reasons.append(f"vol_mult={vol_mult:.2f}<{cfg['pumpRiderVolMultipleThreshold']}")
-    if price_change_pct < cfg["pumpRiderMinPriceChangePct"]:
-        reasons.append(f"chg_pct={price_change_pct:.2f}<{cfg['pumpRiderMinPriceChangePct']}")
-    if prior_vol_mult < cfg["pumpRiderMinPriorVolMultiple"]:
-        reasons.append(f"prior_vol={prior_vol_mult:.2f}<{cfg['pumpRiderMinPriorVolMultiple']}")
-    if c <= o:
-        reasons.append("not_green_candle")
-
-    # Cumulative gain check — if we're already +N% from `lookback` candles
-    # ago, the move is mature and likely about to exhaust.
-    look = int(cfg["pumpRiderMaxLookbackCandles"])
-    if len(ks) >= look + 2:
-        lookback_open = float(ks[-(look + 2)][1])
-        if lookback_open > 0:
-            cum_gain = (c - lookback_open) / lookback_open * 100
-            if cum_gain > cfg["pumpRiderMaxCumulativeGainPct"]:
-                reasons.append(f"already_pumped_{cum_gain:.1f}%")
-
-    if reasons:
-        return None  # didn't fire
+    # Top-chase guard — already pumped too hard → downgrade buys to MEGA.
+    if tier in ("STRONG", "NORMAL") and cum_chg_10m > max_cum:
+        tier = "MEGA"
 
     return {
         "symbol": symbol,
         "ts": int(time.time() * 1000),
-        "trigger_open": o,
+        "tier": tier,
         "trigger_close": c,
-        "trigger_high": h,
-        "price_change_pct": round(price_change_pct, 3),
-        "vol_mult": round(vol_mult, 2),
-        "prior_vol_mult": round(prior_vol_mult, 2),
-        "baseline_qv_usdt": round(baseline_qv, 0),
-        "trigger_qv_usdt": round(qv, 0),
+        "trigger_open": o,
+        "chg_1m":  round(chg_1m, 3),
+        "chg_5m":  round(chg_5m, 3),
+        "chg_30m": round(chg_30m, 3),
+        "vol_surge_1m": round(vol_surge_1m, 2),
+        "vol_surge_5m": round(vol_surge_5m, 2),
+        "cum_chg_10m":  round(cum_chg_10m, 2),
+        # Legacy fields for compatibility with existing publish/log code.
+        "price_change_pct": round(chg_1m, 3),
+        "vol_mult": round(vol_surge_1m, 2),
+        "baseline_qv_usdt": round(qv_25m_base, 0),
+        "trigger_qv_usdt":  round(qv_1m, 0),
     }
 
 
@@ -438,11 +477,38 @@ def cycle(r: redis.Redis, r_an: redis.Redis) -> None:
         ev["vol_24h_usd"] = round(qv_24h, 0)
         ev["watchlist_mode"] = mode
 
+        tier = str(ev.get("tier") or "").upper()
+        # iter 61 — publish EVERY tier (EARLY/NORMAL/STRONG/MEGA) so the
+        # dashboard alert banner sees it.  Only delegate to try_buy for
+        # the actionable tiers.
         publish_detection(r, ev)
-        ok = delegate_buy(sym, ev, cfg)
-        if ok:
-            set_cooldown(r, sym, int(cfg["pumpRiderCooldownSec"]))
-            fired += 1
+
+        if tier in ("NORMAL", "STRONG"):
+            ok = delegate_buy(sym, ev, cfg)
+            if ok:
+                set_cooldown(r, sym, int(cfg["pumpRiderCooldownSec"]))
+                fired += 1
+            log.info(
+                f"[PUMP_RIDER] {tier} BUY {sym} chg_5m={ev.get('chg_5m')}% "
+                f"vol_5m={ev.get('vol_surge_5m')}x ok={ok}"
+            )
+        elif tier == "EARLY":
+            # alert only — no buy.  Short cooldown so we don't spam the
+            # banner with the same coin every cycle.
+            set_cooldown(r, sym, 60)
+            log.info(
+                f"[PUMP_RIDER] EARLY {sym} chg_5m={ev.get('chg_5m')}% "
+                f"vol_5m={ev.get('vol_surge_5m')}x (alert only)"
+            )
+        elif tier == "MEGA":
+            # already pumped — alert + 5min cooldown so we don't re-alert
+            # constantly while the coin sits at the top.
+            set_cooldown(r, sym, 300)
+            log.info(
+                f"[PUMP_RIDER] MEGA {sym} chg_5m={ev.get('chg_5m')}% "
+                f"cum_chg_10m={ev.get('cum_chg_10m')}% (too late, alert only)"
+            )
+
         # Be polite to Binance.
         time.sleep(0.2)
 

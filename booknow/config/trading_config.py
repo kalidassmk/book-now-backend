@@ -685,10 +685,29 @@ class TradingConfig:
     pumpRiderMinVol24hUsd: float = 1_000_000.0       # liquidity floor
     pumpRiderMaxCumulativeGainPct: float = 8.0       # skip mature pumps
     pumpRiderMaxLookbackCandles: int = 10            # look-back window for cum-gain
-    pumpRiderTopSymbols: int = 50                    # scan top-N by FAST_MOVE
+    pumpRiderTopSymbols: int = 200                   # iter 61: 50→200 — scan all USDT pairs
     pumpRiderCooldownSec: int = 600                  # 10 min per-symbol
     pumpRiderSellPctLabel: float = 5.0               # forwarded to try_buy (profitAmountUsdt wins)
     iter55PumpRiderAppliedAt: str = "2026-05-23"
+
+    # iter 61 (2026-05-24) — multi-window tiered PumpRider.
+    # COS pumped at 08:25 UTC (chg_5m=+1.14%, vol_surge_5m=4.95x).  The
+    # old 1m-only rules required chg_1m>=+0.8% which COS missed (only
+    # +0.61% on that minute).  New 5m-window rule catches it.
+    # Tiers:
+    #   EARLY   alert only      vol_surge_5m >= 2x AND chg_5m >= 0.5%
+    #   NORMAL  buy             vol_surge_5m >= 3x AND chg_5m >= 1.0%  (catches COS)
+    #   STRONG  buy             vol_surge >= 5x AND chg_5m or chg_1m >= 1.5%
+    #   MEGA    alert only      chg_5m >= 5% OR chg_1m >= 3% (chasing top)
+    pumpRiderStrongVolMult: float = 5.0
+    pumpRiderStrongChg5mPct: float = 1.5
+    pumpRiderNormal5mVolMult: float = 3.0
+    pumpRiderNormal5mChgPct: float = 1.0
+    pumpRiderEarly5mVolMult: float = 2.0
+    pumpRiderEarly5mChgPct: float = 0.5
+    pumpRiderMega5mPct: float = 5.0
+    pumpRiderMega1mPct: float = 3.0
+    iter61TieredPumpRiderAppliedAt: str = "2026-05-24"
 
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
