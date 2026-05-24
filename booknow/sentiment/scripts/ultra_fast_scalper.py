@@ -10,55 +10,11 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 # from dotenv import load_dotenv  <-- Removed to solve ModuleNotFoundError
 
-# iter 73 — pre-buy filter call to /api/check-coin (httpx async).
-import httpx
-
 from booknow.util.trade_archive import archive_closed_trade
 
-# iter 73 — dashboard URL for /api/check-coin pre-buy filter (NEIRO
-# incident: Fast Scalper was bypassing every safety gate we built).
-_CHECK_COIN_URL_BASE = os.getenv(
-    "BOOKNOW_DASHBOARD_URL",
-    "http://frontend:3000",  # Docker Compose default
-).rstrip("/")
-_CHECK_COIN_TIMEOUT_S = float(os.getenv("CHECK_COIN_TIMEOUT_S", "2.0"))
-_check_coin_client: "httpx.AsyncClient | None" = None
-
-
-async def _ladder_check_coin_blocked(symbol: str, cfg: dict) -> str | None:
-    """iter 73 — Call /api/check-coin and return blocker reason string
-    if the buy should be SKIPPED, else None.
-
-    Runs the same filter pipeline that R1/R2/R3/Pattern Bot/PumpRider
-    already use (iter48 falling-knife + iter71 weak-pump + macro-top +
-    vol-regime + near-top + post-pump + ...).  Fail-OPEN on network
-    errors so Binance hiccups don't block trading (cfg controllable).
-
-    Disabled when `useCheckCoinFilterEnabled=False` so user can revert
-    via Redis without redeploy.
-    """
-    global _check_coin_client
-    if not cfg.get("useCheckCoinFilterEnabled", True):
-        return None
-    if _check_coin_client is None:
-        _check_coin_client = httpx.AsyncClient(timeout=_CHECK_COIN_TIMEOUT_S)
-    fail_closed = bool(cfg.get("checkCoinFailClosed", False))
-    url = f"{_CHECK_COIN_URL_BASE}/api/check-coin"
-    try:
-        resp = await _check_coin_client.get(url, params={"symbol": symbol})
-        if resp.status_code != 200:
-            return f"check-coin HTTP {resp.status_code}" if fail_closed else None
-        data = resp.json()
-        verdict = data.get("verdict") or {}
-        if verdict.get("blocked"):
-            blocker = verdict.get("blocker") or "unknown"
-            reason = verdict.get("blocker_reason") or ""
-            return f"{blocker}: {reason}" if reason else blocker
-        return None
-    except httpx.TimeoutException:
-        return "check-coin timeout" if fail_closed else None
-    except Exception as e:
-        return f"check-coin error: {e}" if fail_closed else None
+# iter 73/74 — shared pre-buy gates (check-coin + USDT cooldown +
+# orderbook depth).  Same pipeline R1/R2/R3/Pattern Bot/PumpRider use.
+from pre_buy_gates import run_all_gates as _run_pre_buy_gates
 
 # WebSocket-backed kline cache replaces fetch_ohlcv polling.
 # When unavailable (older deployments), fall back to CCXT REST.
@@ -1871,28 +1827,28 @@ class MultiSymbolScalper:
                      f"range_1h={adapt['range_1h_pct']:.2f}% → "
                      f"buy1_off={dyn_buy1_off}% buy2_off={dyn_buy2_off}% tp_target=${dyn_tp_tgt}")
 
-            # ── iter 73 — Pre-buy filter gate ────────────────────────
-            # Fast Scalper was bypassing every safety filter (NEIRO
-            # incident 2026-05-24: bought a flat coin, lost $0.34 in
-            # 22s).  Now call /api/check-coin BEFORE placing the
-            # order so iter71 weak-pump + iter48 filters apply here
-            # too.  Entry-detection logic (above) stays untouched —
-            # this is a final sanity check, not a re-think.
+            # ── iter 73 + iter 74 — All pre-buy gates ────────────────
+            # Fast Scalper bypassed every safety filter until iter73
+            # (NEIRO incident 2026-05-24).  iter74 routes all 3 gates
+            # (USDT cooldown + check-coin + orderbook depth) through
+            # the shared `pre_buy_gates` module so future filters land
+            # in one place for ALL buy paths.
             try:
                 cfg_dict = await self.config.get_dict() if hasattr(self, "config") else {}
             except Exception:
                 cfg_dict = {}
             if not cfg_dict:
-                # Fallback: read directly from Redis (config service not
-                # always available depending on init path).
                 try:
                     raw_cfg = await asyncio.to_thread(self.redis.get, "TRADING_CONFIG")
                     cfg_dict = json.loads(raw_cfg) if raw_cfg else {}
                 except Exception:
                     cfg_dict = {}
-            block_reason = await _ladder_check_coin_blocked(symbol, cfg_dict)
+            block_reason = await asyncio.to_thread(
+                _run_pre_buy_gates,
+                symbol, float(self.ladder_buy1_size), cfg_dict, self.redis,
+            )
             if block_reason:
-                log.info(f"⛔ [ladder] {symbol} pre-buy filter BLOCKED: {block_reason}")
+                log.info(f"⛔ [ladder] {symbol} pre-buy gate BLOCKED: {block_reason}")
                 try:
                     await asyncio.to_thread(
                         self.redis.lpush,
@@ -1900,7 +1856,7 @@ class MultiSymbolScalper:
                         json.dumps({
                             "ts": int(time.time() * 1000),
                             "symbol": symbol,
-                            "rule": "fast_scalper_pre_buy_filter",
+                            "rule": "fast_scalper_pre_buy_gate",
                             "reason": block_reason,
                             "rule_label": f"FAST_SCALPER:{adapt['strategy']}",
                         }),

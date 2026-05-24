@@ -6,6 +6,11 @@ import uuid
 from datetime import datetime
 from decimal import Decimal, ROUND_DOWN
 
+# iter 74 — shared pre-buy gates (USDT cooldown + check-coin + orderbook
+# depth).  Same pipeline R1/R2/R3/Pattern Bot/PumpRider/Fast Scalper use.
+# Brings Virtual Scalper into full filter parity for the first time.
+from pre_buy_gates import run_all_gates as _vs_pre_buy_gates
+
 # Optional: ccxt only needed for live mode. Import is lazy so paper-only
 # deployments without ccxt installed still run.
 try:
@@ -842,6 +847,34 @@ class VirtualScalpExecutor:
             print(f"🎚️ [v-ladder] {symbol} adaptive={adapt['strategy']} "
                   f"range_1h={adapt['range_1h_pct']:.2f}% → "
                   f"buy1={buy1_offset}% buy2={adapt['buy2_offset_pct']}% tp=${adapt['tp_target_usdt']}")
+
+        # ── iter 74 — Pre-buy gates (USDT cooldown + check-coin + depth) ──
+        # Virtual Scalper was the LAST live buy path bypassing the
+        # safety pipeline.  iter74 brings it to parity with everything
+        # else (R1/R2/R3/Pattern Bot/PumpRider/EP/VSP/LMC/CCP/Fast
+        # Scalper) using the shared `pre_buy_gates` module.  Entry
+        # detection logic (above) stays untouched — this is a final
+        # sanity check.  Reverts via Redis flags without redeploy.
+        try:
+            v_block = _vs_pre_buy_gates(symbol, float(self.ladder_buy1_size), cfg, self.r)
+        except Exception:
+            v_block = None
+        if v_block:
+            print(f"⛔ [v-ladder] {symbol} pre-buy gate BLOCKED: {v_block}")
+            try:
+                self.r.lpush(
+                    f"METRICS:SKIP:{time.strftime('%Y-%m-%d')}",
+                    json.dumps({
+                        "ts": int(time.time() * 1000),
+                        "symbol": symbol,
+                        "rule": "virtual_scalper_pre_buy_gate",
+                        "reason": v_block,
+                        "rule_label": f"VIRTUAL_SCALPER:{adapt['strategy']}",
+                    }),
+                )
+            except Exception:
+                pass
+            return
 
         # If offset > 0: place LIMIT BUY at signal × (1 - offset/100)
         if buy1_offset > 0:
