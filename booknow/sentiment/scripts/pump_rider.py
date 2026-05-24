@@ -239,6 +239,7 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     closed = ks[:-1]
     try:
         opens  = [float(k[1]) for k in closed]
+        highs  = [float(k[2]) for k in closed]  # iter 65 — for resistance break
         closes = [float(k[4]) for k in closed]
         qvols  = [float(k[7]) for k in closed]
     except (ValueError, IndexError, TypeError):
@@ -304,6 +305,33 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     if tier is None:
         return None
 
+    # ── iter 65 — Resistance-break gate for NORMAL/STRONG ──────────────
+    # Require the trigger close to break (or be within tolerance of) the
+    # prior-N-bar high. Without this, NORMAL fires on any +1% / 3× vol
+    # pop inside a tight range that promptly fades. With it, we only buy
+    # when the move is actually clearing recent structure.
+    #
+    # Tolerance: 0.2% — allows for buying just below the high (when the
+    # break is imminent but the printed close hasn't quite cleared yet).
+    # Lookback: 60 bars = prior 1h.
+    # Applies to NORMAL/STRONG only (EARLY/MEGA are alert-only).
+    resistance_ok = True
+    prior_high = 0.0
+    if (tier in ("STRONG", "NORMAL")
+            and bool(cfg.get("pumpRiderResistanceBreakEnabled", True))):
+        lookback = int(cfg.get("pumpRiderResistanceLookbackBars", 60))
+        tol_pct  = float(cfg.get("pumpRiderResistanceTolerancePct", 0.2))
+        # Exclude the current (trigger) bar from the high search.
+        window = highs[:-1][-lookback:] if len(highs) > 1 else []
+        if window:
+            prior_high = max(window)
+            threshold = prior_high * (1.0 - tol_pct / 100.0)
+            resistance_ok = c >= threshold
+    if not resistance_ok:
+        # Don't fire NORMAL/STRONG; downgrade to EARLY so the signal still
+        # publishes for monitoring but no auto-buy is triggered.
+        tier = "EARLY"
+
     # Top-chase guard — already pumped too hard → downgrade buys to MEGA.
     if tier in ("STRONG", "NORMAL") and cum_chg_10m > max_cum:
         tier = "MEGA"
@@ -321,6 +349,9 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
         "vol_surge_1m": round(vol_surge_1m, 2),
         "vol_surge_5m": round(vol_surge_5m, 2),
         "cum_chg_10m":  round(cum_chg_10m, 2),
+        # iter 65 — resistance-break diagnostics
+        "prior_1h_high": round(prior_high, 8) if prior_high else 0,
+        "resistance_ok": bool(resistance_ok),
         # Legacy fields for compatibility with existing publish/log code.
         "price_change_pct": round(chg_1m, 3),
         "vol_mult": round(vol_surge_1m, 2),

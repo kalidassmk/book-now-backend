@@ -728,6 +728,38 @@ class TradingConfig:
     iter62EpAutoBuyAndChg1hAppliedAt: str = "2026-05-24"
     iter64Slow1hVolConfirmAppliedAt: str = "2026-05-24"
 
+    # iter 65 (2026-05-24) — Resistance-break gate for PumpRider.
+    # Pre-existing NORMAL/STRONG tiers fire on momentum (price+vol) alone,
+    # which lets them buy +1% pops INSIDE a tight range that promptly
+    # fade. Add a structural check: require trigger_close to break (or be
+    # within tolerance of) the prior-N-bar high. If not, downgrade the
+    # signal to EARLY (alert only, no auto-buy).
+    #   • Lookback 60 bars = prior 1h on 1m candles.
+    #   • Tolerance 0.2% — allows buying just as the break prints rather
+    #     than waiting for the close to clear cleanly.
+    #   • Applies only to NORMAL/STRONG (EARLY/MEGA are alert-only).
+    pumpRiderResistanceBreakEnabled: bool = True
+    pumpRiderResistanceLookbackBars: int = 60
+    pumpRiderResistanceTolerancePct: float = 0.2
+    iter65ResistanceBreakAppliedAt: str = "2026-05-24"
+
+    # iter 66 (2026-05-24) — Orderbook depth pre-check in try_buy.
+    # Volume-floor ($2M/24h) alone doesn't guarantee depth AT THE TOP OF
+    # BOOK — a coin can trade $5M/day with a 0.5% spread and slip badly
+    # on a $96 market buy. Before placing a market buy, fetch top-20
+    # asks and verify the cumulative ask depth within `pctOfPrice` of
+    # last is at least `multiplier × leg size`. Reject with reason
+    # `thin_orderbook` if not.
+    #   • multiplier=3.0 → need 3× our leg size in available asks
+    #   • pctOfPrice=0.5 → only count asks within 0.5% of last
+    #   • timeoutMs=2000 — fail-open on timeout (don't block buys if
+    #     Binance is slow), but log a warning
+    orderbookDepthCheckEnabled: bool = True
+    orderbookDepthMultiplier: float = 3.0
+    orderbookDepthPctOfPrice: float = 0.5
+    orderbookDepthTimeoutMs: int = 2000
+    iter66OrderbookDepthAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:

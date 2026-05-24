@@ -222,6 +222,100 @@ class TradeExecutor:
             logger.debug("[PUMP-MODE] detection failed for %s: %s", symbol, e)
             return False
 
+    async def _check_orderbook_depth(
+        self,
+        symbol: str,
+        leg_size_usdt: float,
+        cfg,
+    ) -> Optional[str]:
+        """iter 66 — Verify the top of book has enough depth on BOTH sides
+        to absorb our leg size + future market-exit without ugly slippage.
+
+        Fetches top-20 bids+asks, sums quote-value of orders within
+        ``orderbookDepthPctOfPrice`` of last price, and compares to
+        ``orderbookDepthMultiplier × leg_size_usdt``.
+
+        Returns:
+          - None  → depth OK, proceed.
+          - str   → blocker reason (skip the buy).
+
+        Fail-OPEN on Binance errors/timeouts (network hiccup shouldn't
+        block trading) but logs a warning.
+        """
+        if not bool(getattr(cfg, "orderbookDepthCheckEnabled", True)):
+            return None
+        if leg_size_usdt <= 0:
+            return None
+
+        mult     = float(getattr(cfg, "orderbookDepthMultiplier", 3.0))
+        pct      = float(getattr(cfg, "orderbookDepthPctOfPrice", 0.5))
+        timeout  = float(getattr(cfg, "orderbookDepthTimeoutMs", 2000)) / 1000.0
+        required = mult * leg_size_usdt
+
+        try:
+            if self._http is None:
+                self._http = httpx.AsyncClient(timeout=timeout)
+            url = "https://api.binance.com/api/v3/depth"
+            resp = await self._http.get(
+                url, params={"symbol": symbol, "limit": 20}, timeout=timeout,
+            )
+            if resp.status_code != 200:
+                logger.debug(
+                    "[OB-DEPTH] %s HTTP %s — fail-open",
+                    symbol, resp.status_code,
+                )
+                return None
+            data = resp.json()
+            bids = data.get("bids") or []
+            asks = data.get("asks") or []
+            if not bids or not asks:
+                logger.debug("[OB-DEPTH] %s empty book — fail-open", symbol)
+                return None
+
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid = (best_bid + best_ask) / 2.0
+            if mid <= 0:
+                return None
+
+            bid_floor = mid * (1.0 - pct / 100.0)
+            ask_ceil  = mid * (1.0 + pct / 100.0)
+
+            bid_depth = sum(
+                float(p) * float(q) for p, q in bids if float(p) >= bid_floor
+            )
+            ask_depth = sum(
+                float(p) * float(q) for p, q in asks if float(p) <= ask_ceil
+            )
+
+            # Spread sanity — wide spread means we'll slip on the exit even
+            # if depth looks fine. 0.5% spread on a $96 leg = $0.48 instant
+            # loss.  Reject if spread alone exceeds pct.
+            spread_pct = (best_ask - best_bid) / mid * 100.0 if mid > 0 else 0
+            if spread_pct > pct:
+                return (
+                    f"thin_orderbook: spread {spread_pct:.2f}% > {pct}% "
+                    f"(bid={best_bid:.8f} ask={best_ask:.8f})"
+                )
+
+            if bid_depth < required:
+                return (
+                    f"thin_orderbook: bid_depth ${bid_depth:.0f} < "
+                    f"required ${required:.0f} ({mult}× leg) within {pct}% of mid"
+                )
+            if ask_depth < required:
+                return (
+                    f"thin_orderbook: ask_depth ${ask_depth:.0f} < "
+                    f"required ${required:.0f} ({mult}× leg) within {pct}% of mid"
+                )
+            return None
+        except httpx.TimeoutException:
+            logger.debug("[OB-DEPTH] %s timeout — fail-open", symbol)
+            return None
+        except Exception as e:
+            logger.debug("[OB-DEPTH] %s error: %s — fail-open", symbol, e)
+            return None
+
     async def _check_coin_blocked(
         self, symbol: str, timeout_s: float, fail_closed: bool,
     ) -> Optional[str]:
@@ -600,6 +694,33 @@ class TradeExecutor:
                 except Exception:
                     pass
                 return
+
+        # ── iter 66: orderbook depth pre-check ──────────────────────
+        # Reject pairs with thin top-of-book / wide spread where our $96
+        # leg will slip badly on the eventual market exit.
+        ob_reason = await self._check_orderbook_depth(
+            symbol=symbol,
+            leg_size_usdt=float(cfg.buyAmountUsdt),
+            cfg=cfg,
+        )
+        if ob_reason:
+            logger.info(
+                "[%s] Skip %s — %s", rule_label, symbol, ob_reason,
+            )
+            try:
+                await self._redis.lpush(
+                    f"METRICS:SKIP:{time.strftime('%Y-%m-%d')}",
+                    json.dumps({
+                        "ts": int(time.time() * 1000),
+                        "symbol": symbol,
+                        "rule": "orderbook_depth",
+                        "reason": ob_reason,
+                        "rule_label": rule_label,
+                    }),
+                )
+            except Exception:
+                pass
+            return
 
         # ── Place the buy order ──────────────────────────────────────
         if self._guard.is_banned():
