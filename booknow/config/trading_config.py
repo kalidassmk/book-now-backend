@@ -709,6 +709,18 @@ class TradingConfig:
     pumpRiderMega1mPct: float = 3.0
     iter61TieredPumpRiderAppliedAt: str = "2026-05-24"
 
+    # iter 62 (2026-05-24) — EARLY_PUMP auto-buy + chg_1h slow detection.
+    # Closes two gaps from the spot-movers analysis:
+    #   - NIL/PLUME pumped while EP detected them (score 84/75) but EP
+    #     doesn't trigger buys — only alerts.  Adding auto-buy at score≥85.
+    #   - SUPER/EIGEN/ONDO/WLD pumped at 05:00 UTC with slow steady gain
+    #     (1.5%/h) — too slow for chg_5m/chg_30m rules.  chg_1h ≥ 2%
+    #     catches them.
+    pumpRiderSlow1hChgPct: float = 2.0    # NORMAL tier if 1h change >= 2%
+    earlyPumpAutoBuyScore: int = 85       # 0 = disabled; otherwise min EP score
+    earlyPumpAutoBuyMaxAgeSec: int = 300  # only act on detections <5min old
+    iter62EpAutoBuyAndChg1hAppliedAt: str = "2026-05-24"
+
     # iter 56 (2026-05-23) — Early-Pump watchlist intersection.
     # The 51-event Early Pump backtest (today, 2026-05-23) showed the
     # signal alone is unprofitable across every TP/SL combo (best:

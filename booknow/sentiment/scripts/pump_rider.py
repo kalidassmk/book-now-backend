@@ -230,7 +230,8 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
       → NORMAL (5m vol ≥ 3x AND 5m chg ≥ 1.0%)
       → BUY at $0.001154 ✓
     """
-    ks = fetch_klines(symbol, limit=32)
+    # iter 62 — fetch 60 1m candles (= 1h) so we can compute chg_1h
+    ks = fetch_klines(symbol, limit=62)
     if not ks or len(ks) < 32:
         return None
 
@@ -251,6 +252,8 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     chg_1m  = (c - o) / o * 100 if o > 0 else 0
     chg_5m  = (c - closes[-6])  / closes[-6]  * 100 if closes[-6]  > 0 else 0
     chg_30m = (c - closes[-30]) / closes[-30] * 100 if closes[-30] > 0 else 0
+    # iter 62 — chg_1h for slow steady pumps (SUPER/EIGEN/ONDO/WLD style)
+    chg_1h  = (c - closes[-60]) / closes[-60] * 100 if len(closes) >= 60 and closes[-60] > 0 else 0
 
     # ── Volume surges (two windows) ────────────────────────────────
     qv_5m_avg  = sum(qvols[-5:]) / 5
@@ -286,6 +289,9 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
         tier = "NORMAL"
     elif (vol_surge_1m >= normal_v1 and chg_1m >= normal_c1 and c > o):
         tier = "NORMAL"
+    # iter 62 — slow steady pump (catches SUPER/EIGEN/ONDO/WLD style)
+    elif chg_1h >= float(cfg.get("pumpRiderSlow1hChgPct", 2.0)):
+        tier = "NORMAL"
     elif (vol_surge_5m >= early_v5 and chg_5m >= early_c5):
         tier = "EARLY"
     elif chg_30m >= 3.0 and vol_surge_5m >= 1.5:
@@ -307,6 +313,7 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
         "chg_1m":  round(chg_1m, 3),
         "chg_5m":  round(chg_5m, 3),
         "chg_30m": round(chg_30m, 3),
+        "chg_1h":  round(chg_1h, 3),
         "vol_surge_1m": round(vol_surge_1m, 2),
         "vol_surge_5m": round(vol_surge_5m, 2),
         "cum_chg_10m":  round(cum_chg_10m, 2),
@@ -439,6 +446,56 @@ def cycle(r: redis.Redis, r_an: redis.Redis) -> None:
         rest = [s for s in symbols if s not in watchlist]
         symbols = watch_first + rest
 
+    # iter 62 — EARLY_PUMP auto-buy: scan EARLY_PUMP:LATEST for any
+    # symbol with a HIGH score detected RECENTLY, and delegate to
+    # try_buy.  Acts as a parallel pump-mode trigger for "predictive"
+    # signals that PumpRider's chg_5m/chg_30m won't catch.
+    ep_autobuy_min_score = int(cfg.get("earlyPumpAutoBuyScore", 85))
+    ep_autobuy_max_age_s = int(cfg.get("earlyPumpAutoBuyMaxAgeSec", 300))  # 5min
+    ep_autobuys = 0
+    if ep_autobuy_min_score > 0:
+        try:
+            raw = r_an.hgetall("EARLY_PUMP:LATEST") or {}
+            now_ms_ = int(time.time() * 1000)
+            cutoff_ms = now_ms_ - ep_autobuy_max_age_s * 1000
+            ep_candidates = []
+            for sym, raw_val in raw.items():
+                try:
+                    ev = json.loads(raw_val)
+                    score = int(ev.get("score") or 0)
+                    ts = int(ev.get("ts") or 0)
+                    if score < ep_autobuy_min_score or ts < cutoff_ms:
+                        continue
+                    if under_cooldown(r, sym):
+                        continue
+                    if already_in_position(r, sym):
+                        continue
+                    ep_candidates.append((score, sym, ev))
+                except Exception:
+                    continue
+            ep_candidates.sort(reverse=True)
+            for score, sym, ev in ep_candidates[:3]:  # cap at 3 per cycle
+                ep_event = {
+                    "symbol": sym,
+                    "ts": int(time.time() * 1000),
+                    "tier": "EP_HIGH",  # special tier label for EP auto-buy
+                    "trigger_close": ev.get("last_price"),
+                    "early_pump_score": score,
+                    "ep_change_24h_pct": ev.get("change_24h_pct"),
+                    "source": "early_pump_autobuy",
+                }
+                publish_detection(r, ep_event)
+                ok = delegate_buy(sym, ep_event, cfg)
+                if ok:
+                    set_cooldown(r, sym, int(cfg["pumpRiderCooldownSec"]))
+                    ep_autobuys += 1
+                log.info(
+                    f"[PUMP_RIDER] EP_HIGH {sym} score={score} "
+                    f"24h={ev.get('change_24h_pct')}% ok={ok}"
+                )
+        except Exception as exc:
+            log.warning(f"EARLY_PUMP autobuy failed: {exc}")
+
     fired = 0
     skipped_cooldown = 0
     skipped_inpos = 0
@@ -519,6 +576,7 @@ def cycle(r: redis.Redis, r_an: redis.Redis) -> None:
         "watchlist_size": len(watchlist),
         "watchlist_hits": watchlist_hits,
         "fired": fired,
+        "ep_autobuys": ep_autobuys,
         "skipped_cooldown": skipped_cooldown,
         "skipped_inposition": skipped_inpos,
         "failed_24h_lookup": failed_24h,
