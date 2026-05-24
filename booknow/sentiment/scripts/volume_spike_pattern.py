@@ -139,30 +139,47 @@ def load_config(r: redis.Redis) -> Dict[str, Any]:
 # ── Universe ─────────────────────────────────────────────────────────────
 
 def pick_universe(r: redis.Redis, top_n: int) -> List[str]:
-    """Pick top-N USDT pairs by current 24h quote volume.
+    """Pick scan universe — FAST_MOVE top-ranked first, then CURRENT_PRICE
+    keys to top up.  Matches the pump_rider.py strategy so VSP scans the
+    same coins that other detectors cover.
 
-    Reuses the CURRENT_PRICE Redis hash that Market Scanner maintains
-    (symbol → JSON with last_price + quoteVolume).
+    CURRENT_PRICE entries don't carry quoteVolume (only price/percentage),
+    so we don't sort by 24h vol here — instead we use FAST_MOVE rank
+    (already volume-aware) for the first slice, and let the per-symbol
+    24h-vol floor (vspMin24hVolUsd) gate the rest at evaluate time.
     """
+    out: List[str] = []
+    seen: set = set()
+    # 1. FAST_MOVE top-ranked
     try:
-        raw = r.hgetall("CURRENT_PRICE") or {}
+        raw = r.hgetall("FAST_MOVE") or {}
+        scored: List[Tuple[float, str]] = []
+        for sym, val in raw.items():
+            try:
+                d = json.loads(val) if isinstance(val, str) else val
+                score = float(d.get("overAllCount") or d.get("score") or 0)
+                scored.append((score, sym))
+            except Exception:
+                continue
+        scored.sort(reverse=True)
+        for _, sym in scored:
+            if sym not in seen and sym.endswith("USDT"):
+                seen.add(sym); out.append(sym)
+            if len(out) >= top_n:
+                return out
+    except Exception as exc:
+        log.warning(f"FAST_MOVE read failed: {exc}")
+    # 2. Top up from CURRENT_PRICE
+    try:
+        keys = list(r.hkeys("CURRENT_PRICE") or [])
+        for k in keys:
+            if k.endswith("USDT") and k not in seen:
+                seen.add(k); out.append(k)
+                if len(out) >= top_n:
+                    return out
     except Exception as exc:
         log.warning(f"CURRENT_PRICE read failed: {exc}")
-        return []
-
-    rows: List[Tuple[str, float]] = []
-    for sym, val in raw.items():
-        if not sym.endswith("USDT"):
-            continue
-        try:
-            obj = json.loads(val) if isinstance(val, str) else val
-            qv = float(obj.get("quoteVolume") or obj.get("qv") or 0)
-            if qv > 0:
-                rows.append((sym, qv))
-        except Exception:
-            continue
-    rows.sort(key=lambda x: x[1], reverse=True)
-    return [s for s, _ in rows[:top_n]]
+    return out
 
 
 # ── Binance klines ───────────────────────────────────────────────────────
@@ -701,12 +718,16 @@ def is_paper_mode(cfg: Dict[str, Any]) -> bool:
 # ── Outcome tracking ─────────────────────────────────────────────────────
 
 def fetch_last_price(r: redis.Redis, symbol: str) -> Optional[float]:
+    """Read latest price from CURRENT_PRICE hash (maintained by Market
+    Scanner WS).  Schema: {symbol, percentage, price, timestamp, ...}.
+    """
     try:
         raw = r.hget("CURRENT_PRICE", symbol)
         if not raw:
             return None
         obj = json.loads(raw)
-        return float(obj.get("price") or obj.get("p") or 0) or None
+        p = float(obj.get("price") or 0)
+        return p if p > 0 else None
     except Exception:
         return None
 
