@@ -944,6 +944,28 @@ class TradingConfig:
     lmcMinVol24h: float = 2_000_000             # iter 75 — actual key LMC reads
     lmcMin24hVolUsd: float = 2_000_000          # iter 75 — alias for parity with other detectors
     iter75VolFloors2mAppliedAt: str = "2026-05-24"
+
+    # ──────────────────────────────────────────────────────────────────
+    # iter 80 (2026-05-24) — Orphan Position Reconciler
+    # ──────────────────────────────────────────────────────────────────
+    # When a coin is bought via a path our bot can't track (Binance UI,
+    # mobile app, manual API call), no auto-TP gets armed and the
+    # position sits unprotected.  CHIPUSDT 2026-05-24: 10 minutes
+    # exposed before a sell appeared.
+    #
+    # OrphanReconciler runs every `orphanReconPollSec` seconds.  For
+    # every BINANCE:BALANCE asset >= $orphanReconMinUsd that ISN'T
+    # tracked in TradeState, it auto-arms a LIMIT SELL at last_price *
+    # (1 + targetPct/100).  Worst-case exposure is now poll-interval
+    # (default 30s) instead of unbounded.
+    #
+    # Also: state.mark_sold() now HDELs Redis BUY:<sym> so the Coin
+    # Detail page (and other consumers) don't show stale "HOLDING".
+    orphanReconEnabled: bool = True
+    orphanReconPollSec: int = 30
+    orphanReconMinUsd: float = 5.0       # skip true dust
+    orphanReconTargetPct: float = 0.5    # +0.5% target sell
+    iter80OrphanReconAppliedAt: str = "2026-05-24"
     ccpTopSymbols: int = 200
 
     # Gate thresholds

@@ -174,6 +174,8 @@ async def _bootstrap() -> None:
 
     # ── Phase 9 + 10: state, TSL, monitor, and the real TradeExecutor ─
     trade_state = TradeState()
+    # iter 80 — wire redis client so mark_sold clears BUY hash.
+    trade_state.attach_redis_client(redis)
     tsl = TrailingStopLoss(
         trailing_percentage=initial_config.tslPct,
         min_drop_pct_per_minute=getattr(initial_config, "tslMinDropPctPerMin", 0.15),
@@ -447,6 +449,22 @@ async def _bootstrap() -> None:
             await balance_service.seed_from_rest()
             await user_data.start()
             log.info("  user-data-stream + dust-service started")
+
+            # iter 80 — Orphan Position Reconciler.  Auto-arms a safety
+            # +0.5% LIMIT SELL on any Binance balance not tracked by our
+            # TradeState (e.g. user bought via Binance UI). Runs every
+            # 30s so worst-case exposure is 30s instead of unbounded.
+            from booknow.trading.orphan_reconciler import OrphanReconciler
+            orphan_recon = OrphanReconciler(
+                redis_client=redis,
+                ws_api=ws_api,
+                filter_service=filter_service,
+                trade_state=trade_state,
+                settings=settings,
+                live_mode=True,
+            )
+            await orphan_recon.start()
+            log.info("  orphan-reconciler started (iter 80)")
     else:
         log.info("  user-data-stream + dust-service skipped (live_mode=False)")
 

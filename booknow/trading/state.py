@@ -109,6 +109,11 @@ class TradeState:
 
         Listeners must be non-blocking + side-effect-free w.r.t. each
         other; one raising won't stop the others from running.
+
+        iter 80 — Also schedule a Redis HDEL of BUY:<symbol> so the
+        stale entry doesn't confuse dashboards (Coin Detail page) +
+        any consumer that reads the BUY hash.  Without this, the
+        dashboard shows "HOLDING" forever after a successful close.
         """
         with self._lock:
             removed = self._positions.pop(symbol, None)
@@ -116,11 +121,37 @@ class TradeState:
         if removed is None:
             return
         logger.info("[TradeState] mark_sold %s", symbol)
+
+        # Schedule Redis cleanup (best-effort, async, non-blocking)
+        try:
+            import asyncio
+            from booknow.repository import redis_keys
+            redis_client = getattr(self, "_redis_client_ref", None)
+            if redis_client is not None:
+                async def _hdel_buy():
+                    try:
+                        await redis_client.hdel(redis_keys.BUY_KEY, symbol)
+                        logger.info("[TradeState] cleared Redis BUY:%s", symbol)
+                    except Exception as e:
+                        logger.warning("[TradeState] BUY:%s hdel failed: %s", symbol, e)
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(_hdel_buy())
+                except RuntimeError:
+                    pass
+        except Exception as e:
+            logger.debug("[TradeState] cleanup scheduling failed: %s", e)
+
         for l in listeners:
             try:
                 l(symbol)
             except Exception as e:
                 logger.warning("[TradeState] sell listener raised: %s", e)
+
+    # iter 80 — wire a Redis client reference from main.py so mark_sold
+    # can clear the BUY hash.  Optional — without it cleanup is a no-op.
+    def attach_redis_client(self, redis_client) -> None:
+        self._redis_client_ref = redis_client
 
     # ── Listener registration ────────────────────────────────────────────
 
