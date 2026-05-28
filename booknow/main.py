@@ -334,8 +334,42 @@ async def _bootstrap() -> None:
                     return
                 side = event.get("S")
                 pos = trade_state.get_position(symbol)
+
+                # ── iter 82 (2026-05-25) CRITICAL FIX: auto-recover ──
+                # orphan BUY fills.
+                #
+                # ROOT CAUSE OF SUSDT 2026-05-11 (-$1.96, held 16h):
+                #   • A LIMIT BUY was placed via a path that didn't call
+                #     `trade_state.mark_bought()`.
+                #   • BUY filled on Binance → executionReport event arrived.
+                #   • `pos = trade_state.get_position(symbol)` returned None.
+                #   • Old code: `if pos is None: return` → BAIL OUT SILENTLY.
+                #   • Result: no auto-TP, no auto-hard-stop, no TSL.
+                #     Position sat unprotected forever.
+                #
+                # FIX: if BUY fills on an untracked position, auto-register
+                # it via mark_bought, then let the rest of the handler arm
+                # the TP. This guarantees EVERY BUY fill gets a sell order.
                 if pos is None:
-                    return
+                    if side == "BUY":
+                        from decimal import Decimal as _D
+                        fp_raw = event.get("L") or event.get("p") or "0"
+                        try:
+                            recovered_price = _D(str(fp_raw))
+                        except Exception:
+                            recovered_price = _D(0)
+                        log.warning(
+                            "[ORPHAN BUY FILL] %s order #%s @ %s — "
+                            "auto-recovering (iter82). This buy bypassed "
+                            "mark_bought; would have orphaned without iter82.",
+                            symbol, order_id, recovered_price,
+                        )
+                        pos = trade_state.mark_bought(
+                            symbol, "AUTO_RECOVERED", recovered_price,
+                        )
+                    else:
+                        # SELL fill on untracked position — nothing to clean up.
+                        return
 
                 # ── BUY fill (iter 47): arm the limit-sell + dynamic TP ──
                 if side == "BUY":

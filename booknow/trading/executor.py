@@ -430,8 +430,15 @@ class TradeExecutor:
 
         pos = self._state.get_position(symbol)
         if pos is None:
-            logger.info("[on_buy_filled] %s not in TradeState — ignoring fill", symbol)
-            return None
+            # iter 82 — auto-recover (defense in depth — main.py
+            # _on_execution_report should have already done this).
+            # NEVER silently drop a BUY fill — that's the SUSDT bug.
+            logger.warning(
+                "[on_buy_filled] %s NOT in TradeState — auto-registering as "
+                "ORPHAN_FILL (iter82 defense-in-depth) qty=%s price=%s",
+                symbol, filled_qty, fill_price,
+            )
+            pos = self._state.mark_bought(symbol, "ORPHAN_FILL", fill_price)
         if pos.open_sell_order_id is not None:
             logger.debug(
                 "[on_buy_filled] %s already has sell-order #%s — skipping duplicate",
