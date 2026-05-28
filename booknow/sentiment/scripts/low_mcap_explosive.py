@@ -108,6 +108,58 @@ DEFAULTS: Dict[str, Any] = {
 POLL_INTERVAL_S = float(os.getenv("LMC_POLL_S", "5"))    # iter 98 — was 10, now 5s
 SLOW_EVERY_N_TICKS = int(os.getenv("LMC_SLOW_EVERY_N", "6"))  # iter 98 — slow path runs every Nth tick (5s × 6 = 30s)
 
+# iter 100 — WebSocket ticker cache. Replaces the per-tick REST
+# /api/v3/ticker/24hr call (weight=40) with O(1) reads from an in-
+# memory cache fed by the public !ticker@arr stream. Saves ~560
+# weight/min (~9% of the 6000/min IP budget) and drops the
+# detection latency floor from 5s to ~1s.
+try:
+    from booknow.binance.tickers_cache import get_default_cache as _get_tickers_cache
+    _TICKERS_CACHE_IMPORT_ERR: Optional[str] = None
+except Exception as _exc:  # pragma: no cover — fallback if path differs
+    _get_tickers_cache = None
+    _TICKERS_CACHE_IMPORT_ERR = str(_exc)
+
+
+def tickers_from_cache_or_rest() -> List[Dict[str, Any]]:
+    """iter 100 — primary path: read all symbols from the WS-fed cache
+    and return them in a REST-compatible format (lastPrice, quoteVolume,
+    priceChangePercent, count) so the rest of the LMC pipeline is
+    untouched.  Falls back to REST if the cache is empty (e.g. before
+    the first WS frame lands, or if the import failed).
+    """
+    if _get_tickers_cache is not None:
+        try:
+            cache = _get_tickers_cache()
+            snap = cache.get_all() if cache else {}
+            if snap:
+                out: List[Dict[str, Any]] = []
+                for sym, row in snap.items():
+                    # Map WS cache schema (last/open/quoteVolume/…) →
+                    # REST schema (lastPrice/openPrice/quoteVolume/…)
+                    # so universe_from_tickers + evaluate_symbol +
+                    # detect_flash_dump work unchanged.
+                    out.append({
+                        "symbol": sym,
+                        "lastPrice": str(row.get("last", 0)),
+                        "openPrice": str(row.get("open", 0)),
+                        "highPrice": str(row.get("high", 0)),
+                        "lowPrice":  str(row.get("low", 0)),
+                        "volume":      str(row.get("volume", 0)),
+                        "quoteVolume": str(row.get("quoteVolume", 0)),
+                        "priceChangePercent": str(row.get("priceChangePercent", 0)),
+                        "priceChange":        str(row.get("priceChange", 0)),
+                        "weightedAvgPrice":   str(row.get("weightedAvgPrice", 0)),
+                        "count":              int(row.get("count", 0) or 0),
+                        "bidPrice": str(row.get("bidPrice", 0)),
+                        "askPrice": str(row.get("askPrice", 0)),
+                    })
+                return out
+        except Exception as exc:
+            log.debug(f"[LMC] tickers cache read failed, falling back to REST: {exc}")
+    # Fallback — first run before WS frames arrive, or import failed.
+    return fetch_all_24h_tickers()
+
 # iter 93 — per-symbol ticker snapshot tracker for flash-dump detection.
 # Maps symbol -> (epoch_seconds, last_price, quote_volume) from the prior
 # tick. On every new tick we compare current ticker against this snapshot
@@ -914,6 +966,20 @@ def main() -> None:
     daily_cache: Dict[str, Tuple[float, List[List[Any]]]] = {}
     tick_count = 0   # iter 98 — used to gate the slow path to every Nth tick
 
+    # iter 100 — start the shared !ticker@arr WebSocket cache so subsequent
+    # ticks read from memory instead of hitting the REST endpoint.
+    if _get_tickers_cache is not None:
+        try:
+            cache = _get_tickers_cache()
+            cache.start(wait_for_first_frame_seconds=10.0)
+            log.info("[LMC] 📡 TickersCache (!ticker@arr WS) started — "
+                     "REST /api/v3/ticker/24hr poll disabled, "
+                     f"saved ~560 weight/min. First frame: {len(cache.get_all())} symbols seen.")
+        except Exception as exc:
+            log.warning(f"[LMC] TickersCache start failed: {exc} — will use REST fallback")
+    elif _TICKERS_CACHE_IMPORT_ERR:
+        log.warning(f"[LMC] tickers WS cache unavailable at import: {_TICKERS_CACHE_IMPORT_ERR} — REST fallback active")
+
     while True:
         try:
             tick_count += 1
@@ -927,7 +993,10 @@ def main() -> None:
             # tick (default 5s) so sudden dumps surface within ~5s.
             do_slow = (tick_count % SLOW_EVERY_N_TICKS == 0)
 
-            tickers = fetch_all_24h_tickers()
+            # iter 100 — read tickers from WS cache (zero REST weight); only
+            # falls back to /api/v3/ticker/24hr on cold start before the
+            # first WS frame arrives.
+            tickers = tickers_from_cache_or_rest()
             if not tickers:
                 log.warning("[LMC] no tickers — skipping tick")
                 time.sleep(POLL_INTERVAL_S)
