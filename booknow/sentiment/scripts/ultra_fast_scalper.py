@@ -1809,12 +1809,42 @@ class MultiSymbolScalper:
     # To re-enable, change this constant and redeploy.
     HARD_DISABLE_AUTOBUY: bool = True
 
+    async def _publish_scalper_signal(self, symbol, signal_price, features, source="ladder"):
+        """iter 88 — When the scalper WOULD have bought but is blocked by
+        HARD_DISABLE_AUTOBUY, publish a signal event so the operator can
+        see it in the dashboard and decide manually.
+        Redis key: FAST_SCALPER:DETECTIONS:<date> (RPUSH of JSON events)
+        """
+        import json as _json
+        from datetime import datetime, timezone
+        try:
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "fast_scalper",
+                "source": source,
+                "signal_price": float(signal_price),
+                "features": features or {},
+                "would_buy": True,
+                "blocked_by": "HARD_DISABLE_AUTOBUY",
+            }
+            payload = _json.dumps(event)
+            await asyncio.to_thread(self.redis.rpush, f"FAST_SCALPER:DETECTIONS:{date}", payload)
+            await asyncio.to_thread(self.redis.expire, f"FAST_SCALPER:DETECTIONS:{date}", 14 * 24 * 3600)
+            await asyncio.to_thread(self.redis.hset, "FAST_SCALPER:LATEST", symbol, payload)
+            log.info(f"📡 [scalper-signal] {symbol} would_buy @ {signal_price} (source={source})")
+        except Exception as e:
+            log.debug(f"[scalper-signal] publish failed: {e}")
+
     async def _ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
         whole ladder (legs 2/3 + TP) is on the book within microseconds
         of buy 1's fill — no waiting state."""
         # iter 87 — hard kill switch (manual-only mode)
         if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            await self._publish_scalper_signal(symbol, signal_price, features, source="ladder")
             log.debug(f"[ladder] {symbol} ignored — HARD_DISABLE_AUTOBUY=True (manual-only mode)")
             return
         try:
@@ -3410,6 +3440,8 @@ class MultiSymbolScalper:
     async def execute_buy(self, symbol, price, features=None):
         # iter 87 — hard kill switch (manual-only mode)
         if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            await self._publish_scalper_signal(symbol, price, features, source="execute_buy")
             log.debug(f"[fast-scalper] execute_buy {symbol} ignored — HARD_DISABLE_AUTOBUY=True")
             return
         if not self.auto_enabled:

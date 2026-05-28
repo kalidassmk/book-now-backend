@@ -816,12 +816,41 @@ class VirtualScalpExecutor:
     # Mirrors iter86 / iter87 in other paths.  Manual-only mode.
     HARD_DISABLE_AUTOBUY: bool = True
 
+    def _publish_scalper_signal(self, symbol, signal_price, features, source="ladder"):
+        """iter 88 — When Virtual Scalper would have bought but is blocked
+        by HARD_DISABLE_AUTOBUY, publish a signal so operator sees it.
+        Redis key: VIRTUAL_SCALPER:DETECTIONS:<date>
+        """
+        import json as _json
+        from datetime import datetime, timezone
+        try:
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "virtual_scalper",
+                "source": source,
+                "signal_price": float(signal_price),
+                "features": features or {},
+                "would_buy": True,
+                "blocked_by": "HARD_DISABLE_AUTOBUY",
+            }
+            payload = _json.dumps(event)
+            self.r.rpush(f"VIRTUAL_SCALPER:DETECTIONS:{date}", payload)
+            self.r.expire(f"VIRTUAL_SCALPER:DETECTIONS:{date}", 14 * 24 * 3600)
+            self.r.hset("VIRTUAL_SCALPER:LATEST", symbol, payload)
+            print(f"📡 [v-scalper-signal] {symbol} would_buy @ {signal_price} (source={source})")
+        except Exception as e:
+            print(f"[v-scalper-signal] publish failed: {e}")
+
     def _ladder_start_live(self, symbol, signal_price, features=None):
         """Live start: place Buy 1 as MARKET (default) so Buy 2/3 limits
         can be placed in the same call. Falls back to aggressive-limit-
         at-ask when ladderBuy1UseMarketOrder is False."""
         # iter 87 — hard kill switch (manual-only mode)
         if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            self._publish_scalper_signal(symbol, signal_price, features, source="ladder")
             print(f"[v-ladder-live] {symbol} ignored — HARD_DISABLE_AUTOBUY=True (manual-only mode)")
             return
         f = self._get_filters(symbol)
@@ -2379,6 +2408,8 @@ class VirtualScalpExecutor:
         """
         # iter 87 — hard kill switch (manual-only mode)
         if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            self._publish_scalper_signal(symbol, signal_price, features, source="place_limit_order")
             print(f"[v-scalper] place_limit_order {symbol} ignored — HARD_DISABLE_AUTOBUY=True")
             return
         investment, profit_target_usdt, profit_pct, limit_offset_pct = self._load_trading_config()
