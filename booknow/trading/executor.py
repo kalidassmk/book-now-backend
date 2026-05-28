@@ -616,6 +616,15 @@ class TradeExecutor:
 
     # ── Auto-trader entry ───────────────────────────────────────────────
 
+    # iter 86 — HARD KILL SWITCH (manual-only mode).
+    # Operator chose to disable auto-buy permanently and trade manually
+    # from Binance UI.  No path through this method can place an order
+    # while this constant is True.  To re-enable auto-buy in future,
+    # CHANGE THE CODE (not just a Redis flag) — set HARD_DISABLE_AUTOBUY
+    # = False and redeploy.  Manual buys via Binance UI still work and
+    # iter80 OrphanReconciler still auto-arms safety sells.
+    HARD_DISABLE_AUTOBUY: bool = True
+
     async def try_buy(
         self,
         symbol: str,
@@ -624,6 +633,14 @@ class TradeExecutor:
         rule_label: str,
     ) -> None:
         """Rule-driven buy. Mirrors Java TradeExecutor.tryBuy line-for-line."""
+        # iter 86 — hard kill switch (cannot be flipped via Redis).
+        if self.HARD_DISABLE_AUTOBUY:
+            logger.debug(
+                "[%s] try_buy %s ignored — HARD_DISABLE_AUTOBUY=True "
+                "(manual-only mode; iter86)",
+                rule_label, symbol,
+            )
+            return
         cfg = await self._config.get()
 
         if not cfg.autoBuyEnabled:
