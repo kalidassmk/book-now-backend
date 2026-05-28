@@ -81,6 +81,12 @@ DEFAULTS: Dict[str, Any] = {
     "lmcFastPrefilterChg24h": 1.0,         # skip 1m-kline fetch if |chg_24h|<1%
     "lmcWeight5mSurge": 20.0,              # bonus points when 5m surge fires
 
+    # iter 93 — Flash-dump path: compares ticker between 10s polls and
+    # fires on sub-30s price drops. Latency 10-30s from dump start.
+    "lmcFlashMinDropPct": 0.5,             # |price chg in window| >= 0.5%
+    "lmcFlashMinVolDeltaUsd": 50_000.0,    # vol traded in window (sanity)
+    "lmcFlashCooldownSec": 300,            # 5 min re-fire lockout
+
     # Scoring weights
     "lmcWeightMcap": 25,
     "lmcWeightVolSurge": 25,
@@ -99,7 +105,15 @@ DEFAULTS: Dict[str, Any] = {
     "lmcOutcomeCheckMinutes": [15, 60, 240, 1440],
 }
 
-POLL_INTERVAL_S = float(os.getenv("LMC_POLL_S", "30"))
+POLL_INTERVAL_S = float(os.getenv("LMC_POLL_S", "10"))   # iter 93 — was 30, now 10s
+
+# iter 93 — per-symbol ticker snapshot tracker for flash-dump detection.
+# Maps symbol -> (epoch_seconds, last_price, quote_volume) from the prior
+# tick. On every new tick we compare current ticker against this snapshot
+# and fire FLASH_DUMP if price dropped >= flash threshold within the
+# tick interval, with at least some real volume.  This catches sudden
+# drops that the 5m-window gate would miss for another 30-60 seconds.
+_PREV_TICKERS: Dict[str, Tuple[float, float, float]] = {}
 BACKEND_BASE = os.getenv("BOOKNOW_BACKEND_BASE", "http://backend:8083")
 BINANCE_BASE = "https://api.binance.com"
 
@@ -635,6 +649,23 @@ def set_cooldown(r: redis.Redis, symbol: str, ttl_s: int) -> None:
         pass
 
 
+# iter 93 — separate cooldown channel for the flash-dump fast path.
+# Shorter than the regular 30-min cooldown (default 5 min) so a
+# continuing flash dump can re-fire while still avoiding 10s-tick spam.
+def flash_cooldown_active(r: redis.Redis, symbol: str) -> bool:
+    try:
+        return bool(r.get(f"LMC:FLASH_COOLDOWN:{symbol}"))
+    except Exception:
+        return False
+
+
+def set_flash_cooldown(r: redis.Redis, symbol: str, ttl_s: int) -> None:
+    try:
+        r.setex(f"LMC:FLASH_COOLDOWN:{symbol}", ttl_s, "1")
+    except Exception:
+        pass
+
+
 def publish_detection(r: redis.Redis, event: Dict[str, Any]) -> None:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
@@ -706,6 +737,96 @@ def is_paper_mode(cfg: Dict[str, Any]) -> bool:
         return datetime.now(timezone.utc) < end
     except Exception:
         return True
+
+
+# ── iter 93 ─────────────────────────────────────────────────────────────
+# Flash-dump fast path. Runs BEFORE evaluate_symbol() on every tick.
+# Compares the current 24h ticker against the snapshot taken at the
+# previous tick (10s ago by default). If price dropped >= flash_min_drop
+# in that window AND at least flash_min_vol_usd of fresh volume traded,
+# we publish a FLASH_DUMP event immediately. This gives 10-30s detection
+# latency from the start of a real dump — vs 60-90s for the 5m gate.
+
+def detect_flash_dump(ticker: Dict[str, Any],
+                       avg_vol_7d: float,
+                       cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Returns an event dict if this symbol just flash-dumped, else None.
+    Mutates _PREV_TICKERS with the current snapshot.
+
+    `ticker` is one element of the /api/v3/ticker/24hr response.
+    `avg_vol_7d` is the 7-day daily avg quote volume (for scoring).
+    """
+    sym = ticker.get("symbol")
+    if not sym:
+        return None
+    try:
+        last_price = float(ticker.get("lastPrice") or 0)
+        cur_vol    = float(ticker.get("quoteVolume") or 0)
+        chg_24h    = float(ticker.get("priceChangePercent") or 0)
+    except (TypeError, ValueError):
+        return None
+    if last_price <= 0:
+        return None
+
+    now_s = time.time()
+    prev = _PREV_TICKERS.get(sym)
+    _PREV_TICKERS[sym] = (now_s, last_price, cur_vol)
+
+    if prev is None:
+        return None
+    prev_ts, prev_price, prev_vol = prev
+    dt = now_s - prev_ts
+    # Skip if snapshot too old (process restart, long stall) or zero.
+    if dt <= 0 or dt > 60:
+        return None
+    if prev_price <= 0:
+        return None
+
+    price_chg_pct = (last_price - prev_price) / prev_price * 100.0
+    vol_delta = cur_vol - prev_vol  # USDT volume added in the window
+
+    flash_min_drop = float(cfg.get("lmcFlashMinDropPct", 0.5))
+    flash_min_vol  = float(cfg.get("lmcFlashMinVolDeltaUsd", 50_000.0))
+
+    # iter 93 — only dump direction for now (matches operator request).
+    if price_chg_pct > -flash_min_drop:
+        return None
+    if vol_delta < flash_min_vol:
+        return None
+
+    # Simple flash score: 60 + (price-drop-magnitude × 10), capped 80.
+    score = round(min(80.0, 60.0 + abs(price_chg_pct) * 10.0), 1)
+
+    return {
+        "symbol": sym,
+        "ts": int(now_s * 1000),
+        "label": "FLASH_DUMP",
+        "score": score,
+        "direction": "DUMP",
+        "trigger_price": last_price,
+        "trigger_source": "flash",
+        # Window-level details so the dashboard can show "X% in Ys"
+        "flash_window_s":      round(dt, 1),
+        "flash_price_chg_pct": round(price_chg_pct, 3),
+        "flash_vol_delta_usd": round(vol_delta, 0),
+        # Echo 24h context for parity with the slow path's event shape
+        "chg_24h_pct":   round(chg_24h, 2),
+        "today_vol_usd": round(cur_vol, 0),
+        "avg_7d_vol_usd": round(avg_vol_7d, 0),
+        "vol_surge_x":    round(_safe_div(cur_vol, avg_vol_7d), 2),
+        "trade_surge_x":  None,  # not computed in flash path
+        "surge_5m":       None,
+        "chg_5m_pct":     None,
+        "short_vol_5m_usd": None,
+        "breakdown": {
+            "flash": {
+                "window_s": round(dt, 1),
+                "price_chg_pct": round(price_chg_pct, 3),
+                "vol_delta_usd": round(vol_delta, 0),
+                "pts": score,
+            }
+        },
+    }
 
 
 # ── Outcome tracker ─────────────────────────────────────────────────────
@@ -819,8 +940,52 @@ def main() -> None:
                     daily_cache.pop(sym, None)
 
             fires = 0
+            flash_fires = 0
+            flash_cd_s = int(cfg.get("lmcFlashCooldownSec", 300))   # iter93 — 5 min
             for t in candidates:
                 sym = t.get("symbol", "")
+
+                # ── iter 93 — FLASH dump fast-fast-path ────────────
+                # Runs on every 10s tick, BEFORE the heavier slow/5m
+                # evaluation. Detects sudden drops by comparing the
+                # current 24h ticker to the snapshot from the prior
+                # tick. Has its own (shorter) cooldown so it doesn't
+                # spam during an extended dump.
+                if not flash_cooldown_active(r, sym):
+                    try:
+                        # Cheap avg_7d_vol estimate from cache if we
+                        # have it; else use today's 24h vol as an
+                        # approximation (the field only feeds the
+                        # event payload, not the gate).
+                        avg7d = 0.0
+                        cached = daily_cache.get(sym)
+                        if cached:
+                            # daily_cache value shape from evaluate_symbol
+                            # is (ts, klines) — recompute the simple avg.
+                            try:
+                                _ts, _klines = cached
+                                if _klines:
+                                    avg7d = sum(float(k[7] or 0) for k in _klines[:-1]) / max(1, len(_klines) - 1)
+                            except Exception:
+                                avg7d = 0.0
+                        if avg7d <= 0:
+                            avg7d = float(t.get("quoteVolume") or 0)
+                        flash_evt = detect_flash_dump(t, avg7d, cfg)
+                    except Exception as exc:
+                        log.debug(f"[LMC] flash check {sym} error: {exc}")
+                        flash_evt = None
+                    if flash_evt is not None:
+                        publish_detection(r, flash_evt)
+                        flash_fires += 1
+                        set_flash_cooldown(r, sym, flash_cd_s)
+                        log.info(
+                            f"[LMC] ⚡ FLASH_DUMP {sym} "
+                            f"drop={flash_evt['flash_price_chg_pct']}% in "
+                            f"{flash_evt['flash_window_s']}s "
+                            f"vol_delta=${flash_evt['flash_vol_delta_usd']:,.0f} "
+                            f"score={flash_evt['score']}"
+                        )
+
                 if cooldown_active(r, sym):
                     continue
                 try:
@@ -852,7 +1017,7 @@ def main() -> None:
                         delegate_buy(sym, event, cfg)
                 set_cooldown(r, sym, int(cfg.get("lmcCooldownSec", 1800)))
 
-            log.info(f"[LMC] tick complete — {fires} signals "
+            log.info(f"[LMC] tick complete — {fires} slow + {flash_fires} flash "
                      f"(cache={len(daily_cache)} symbols)")
 
             try:

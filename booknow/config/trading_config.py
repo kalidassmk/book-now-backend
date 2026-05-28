@@ -886,6 +886,14 @@ class TradingConfig:
     lmcFastPrefilterChg24h: float = 1.0      # skip 1m klines fetch if |chg_24h|<1%
     lmcWeight5mSurge: float = 20.0           # score bonus when 5m surge fires
 
+    # iter 93 — Flash dump path. Compares 24h ticker between LMC polls
+    # (now every 10s, was 30s). Fires within 10-30s of dump start when
+    # price drops >= lmcFlashMinDropPct AND >= lmcFlashMinVolDeltaUsd of
+    # fresh volume printed in the same window. Independent 5-min cooldown.
+    lmcFlashMinDropPct: float = 0.5          # |% change in 10s window|
+    lmcFlashMinVolDeltaUsd: float = 50_000.0 # USDT vol traded in window
+    lmcFlashCooldownSec: int = 300           # 5 min re-fire lockout
+
     # Scoring weights
     lmcWeightMcap: int = 25
     lmcWeightVolSurge: int = 25
