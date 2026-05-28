@@ -38,6 +38,10 @@ class TradingConfig:
 
     # ── Core safety ──────────────────────────────────────────────────────
     autoBuyEnabled: bool = False     # OFF by default — operator opts in
+    # iter 94 — auto-sell kill via config (the hard-coded HARD_DISABLE_AUTOSELL
+    # constants in each executor are the real lock; this flag is for the
+    # admin UI / Redis to show the manual-only-sell state to the operator).
+    autoSellEnabled: bool = False
     buyAmountUsdt: float = 50.0      # 2026-05-12 iter 12: $50/leg (was 55)
 
     # ── Profit target ────────────────────────────────────────────────────

@@ -199,6 +199,12 @@ class OrphanReconciler:
             except Exception as e:
                 logger.warning("[OrphanRecon] key %s error: %s", key, e)
 
+    # iter 94 — HARD KILL SWITCH for orphan-reconciler safety SELLs.
+    # Operator requested EVERY bot-side sell (including iter80's safety
+    # protection layer) be disabled. To re-enable, change this constant
+    # and redeploy.
+    HARD_DISABLE_AUTOSELL: bool = True
+
     async def _arm_orphan(
         self,
         symbol: str,
@@ -211,6 +217,38 @@ class OrphanReconciler:
         """Place a LIMIT SELL at +target_pct above current and register
         the position in TradeState so we don't re-arm next tick.
         """
+        # iter 94 — hard kill switch.
+        if self.HARD_DISABLE_AUTOSELL:
+            # Publish a "would-have-armed" alert so the operator knows
+            # an orphan position exists and needs manual attention.
+            try:
+                import json as _json
+                from datetime import datetime as _dt, timezone as _tz
+                date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+                ev = {
+                    "ts": int(_dt.now(_tz.utc).timestamp() * 1000),
+                    "symbol": symbol,
+                    "kind": "orphan_reconciler_sell",
+                    "source": "_arm_orphan",
+                    "reason": "orphan_safety_sell",
+                    "asset": asset,
+                    "free_qty": float(free_qty),
+                    "would_sell_price": float(last_price * (1.0 + target_pct / 100.0)),
+                    "blocked_by": "HARD_DISABLE_AUTOSELL",
+                }
+                payload = _json.dumps(ev)
+                await self._redis.rpush(f"BOT_SELL_SIGNALS:{date}", payload)
+                await self._redis.expire(f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+                await self._redis.hset("BOT_SELL_SIGNALS:LATEST", symbol, payload)
+            except Exception:
+                pass
+            logger.warning(
+                "[OrphanRecon] %s orphan qty=%.6f @ %s would-have-armed "
+                "safety sell at +%.2f%% BLOCKED — HARD_DISABLE_AUTOSELL=True "
+                "(iter94). Sell manually on Binance.",
+                symbol, free_qty, last_price, target_pct,
+            )
+            return
         sell_price_raw = last_price * (1.0 + target_pct / 100.0)
         qty_raw = free_qty * fee_buffer
 

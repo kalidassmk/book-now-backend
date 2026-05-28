@@ -565,6 +565,18 @@ class TradeExecutor:
         already filled — in that case we DON'T place a new sell (we'd
         oversell) and return None.
         """
+        # iter 94 — hard kill switch. The trailing-TP ratchet is also
+        # an automated sell action, so we block the *new* leg from being
+        # placed. (Any pre-existing limit-sell still rests on Binance
+        # until the operator cancels it manually.)
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, new_price, "trailing_tp_move", source="move_limit_sell")
+            logger.warning(
+                "[MoveTP] %s ratchet to %s IGNORED — HARD_DISABLE_AUTOSELL=True "
+                "(manual-only mode; iter94).",
+                symbol, new_price,
+            )
+            return None
         if not self.live_mode:
             return None
         pos = self._state.get_position(symbol)
@@ -621,9 +633,48 @@ class TradeExecutor:
     # from Binance UI.  No path through this method can place an order
     # while this constant is True.  To re-enable auto-buy in future,
     # CHANGE THE CODE (not just a Redis flag) — set HARD_DISABLE_AUTOBUY
-    # = False and redeploy.  Manual buys via Binance UI still work and
-    # iter80 OrphanReconciler still auto-arms safety sells.
+    # = False and redeploy.
     HARD_DISABLE_AUTOBUY: bool = True
+
+    # iter 94 — HARD KILL SWITCH for AUTO-SELL (manual-only mode).
+    # Operator wants to manually sell every position on Binance, so
+    # NO sell path (TP, SL, TSL, breakeven, orphan-safety, scalper
+    # exits, OCO legs, etc.) can place an order while this constant
+    # is True.  Same rule as auto-buy kill: only flip by changing this
+    # code line + redeploy, NOT via Redis config.
+    # WARNING: open positions will NOT auto-stop-loss or auto-take-
+    # profit.  Operator must monitor /coin.html and act manually.
+    HARD_DISABLE_AUTOSELL: bool = True
+
+    async def _publish_blocked_sell(
+        self,
+        symbol: str,
+        price,
+        reason: str,
+        source: str = "executor",
+    ) -> None:
+        """iter 94 — publish a "would-have-sold" event to Redis so the
+        operator sees on the dashboard which positions the bot wanted
+        to exit but couldn't because of HARD_DISABLE_AUTOSELL.
+        """
+        try:
+            import json as _json
+            from datetime import datetime as _dt, timezone as _tz
+            date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+            ev = {
+                "ts": int(_dt.now(_tz.utc).timestamp() * 1000),
+                "symbol": symbol,
+                "source": source,
+                "reason": reason,
+                "would_sell_price": float(price) if price is not None else None,
+                "blocked_by": "HARD_DISABLE_AUTOSELL",
+            }
+            payload = _json.dumps(ev)
+            await self._redis.rpush(f"BOT_SELL_SIGNALS:{date}", payload)
+            await self._redis.expire(f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+            await self._redis.hset("BOT_SELL_SIGNALS:LATEST", symbol, payload)
+        except Exception as exc:
+            logger.debug("[sell-signal] publish failed for %s: %s", symbol, exc)
 
     async def try_buy(
         self,
@@ -928,6 +979,15 @@ class TradeExecutor:
         limit-sell already filled, in which case the market sell will
         fail cleanly.
         """
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, current_price, reason, source="force_market_exit")
+            logger.warning(
+                "[ForceExit:%s] SELL %s @ %s IGNORED — HARD_DISABLE_AUTOSELL=True "
+                "(manual-only mode; iter94). Operator must sell manually on Binance.",
+                reason, symbol, current_price,
+            )
+            return
         if not self._state.is_already_bought(symbol):
             logger.debug("[ForceExit:%s] skip %s — not in position", reason, symbol)
             return
@@ -1199,6 +1259,20 @@ class TradeExecutor:
         qty: Optional[float] = None,
         rule_label: str = "MANUAL",
     ) -> None:
+        # iter 94 — hard kill switch (manual-only sell mode).
+        # The operator wants ALL bot-side sells disabled — including the
+        # "Manual Sell" button on our internal dashboard, since they
+        # prefer to act directly on Binance UI. If you need to re-enable
+        # this, set HARD_DISABLE_AUTOSELL=False and redeploy.
+        if self.HARD_DISABLE_AUTOSELL:
+            sell_price = _price_of(current_price_data)
+            await self._publish_blocked_sell(symbol, sell_price, rule_label, source="try_manual_sell")
+            logger.warning(
+                "[%s SELL] %s @ ~%s IGNORED — HARD_DISABLE_AUTOSELL=True "
+                "(manual-only mode; iter94). Sell on Binance UI directly.",
+                rule_label, symbol, sell_price,
+            )
+            return
         try:
             sell_price = _price_of(current_price_data)
             if qty is not None and qty > 0:
@@ -1320,6 +1394,17 @@ class TradeExecutor:
         was treating it as gross — a $0.20 target actually netted ~$0.06
         after 2× 0.075% fees on a $96 leg.
         """
+        # iter 94 — hard kill switch.  Even the auto-placed take-profit
+        # LIMIT SELL right after a buy is blocked, since the operator
+        # has chosen to manage every exit on Binance directly.
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, buy_price, "auto_tp_after_buy", source="_place_limit_sell")
+            logger.warning(
+                "[AutoTP] SELL %s qty=%s buy_price=%s IGNORED — "
+                "HARD_DISABLE_AUTOSELL=True (manual-only mode; iter94).",
+                symbol, qty, buy_price,
+            )
+            return None
         try:
             qty = await self._filters.round_quantity(symbol, qty)
             # iter 54: pull fee rate from config (default 0.00075 = 0.075% per side)

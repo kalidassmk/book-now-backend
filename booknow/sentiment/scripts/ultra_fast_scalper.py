@@ -1809,6 +1809,39 @@ class MultiSymbolScalper:
     # To re-enable, change this constant and redeploy.
     HARD_DISABLE_AUTOBUY: bool = True
 
+    # iter 94 — HARD KILL SWITCH for Fast Scalper SELLs.
+    # Blocks every exit path (ladder TP, OCO, force-exit, trailing-TP,
+    # aggressive-limit, hard-stop) so the operator manages every sell
+    # on Binance directly. Only the operator can flip this by editing
+    # the constant and redeploying — Redis config cannot override.
+    HARD_DISABLE_AUTOSELL: bool = True
+
+    async def _publish_blocked_sell(self, symbol, price, reason, source="scalper"):
+        """iter 94 — When the scalper WOULD have sold but is blocked by
+        HARD_DISABLE_AUTOSELL, publish to BOT_SELL_SIGNALS:<date> so the
+        operator sees on the dashboard which positions need a manual exit.
+        """
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "fast_scalper_sell",
+                "source": source,
+                "reason": reason,
+                "would_sell_price": float(price) if price is not None else None,
+                "blocked_by": "HARD_DISABLE_AUTOSELL",
+            }
+            payload = _json.dumps(event)
+            await asyncio.to_thread(self.redis.rpush, f"BOT_SELL_SIGNALS:{date}", payload)
+            await asyncio.to_thread(self.redis.expire, f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+            await asyncio.to_thread(self.redis.hset, "BOT_SELL_SIGNALS:LATEST", symbol, payload)
+            log.warning(f"⛔ [fast-scalper-sell-block] {symbol} {reason} @ {price} blocked by HARD_DISABLE_AUTOSELL")
+        except Exception as e:
+            log.debug(f"[blocked-sell] publish failed: {e}")
+
     async def _publish_scalper_signal(self, symbol, signal_price, features, source="ladder"):
         """iter 88 — When the scalper WOULD have bought but is blocked by
         HARD_DISABLE_AUTOBUY, publish a signal event so the operator can
@@ -2623,6 +2656,15 @@ class MultiSymbolScalper:
         return False, ""
 
     async def _maybe_force_exit_ladder(self, state, f):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                price = getattr(state, "last_price", None) or getattr(state, "signal_price", None)
+                await self._publish_blocked_sell(state.symbol, price, "force_exit_ladder", source="_maybe_force_exit_ladder")
+            except Exception:
+                pass
+            log.warning(f"[ForceExit] {state.symbol} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return
         """Iter 14 time-based + break-even exit logic.
 
         Two conditions trigger a force exit at market on whatever has
@@ -2830,6 +2872,15 @@ class MultiSymbolScalper:
         return True
 
     async def _maybe_trailing_tp_exit(self, state, f):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                price = getattr(state, "last_price", None) or getattr(state, "signal_price", None)
+                await self._publish_blocked_sell(state.symbol, price, "trailing_tp_exit", source="_maybe_trailing_tp_exit")
+            except Exception:
+                pass
+            log.warning(f"[TrailingTP] {state.symbol} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return
         """Iter 15 trailing-TP gate.
 
         Activation: when current price first reaches state.tp_target_price
@@ -3093,6 +3144,14 @@ class MultiSymbolScalper:
 
     async def _ladder_place_tp(self, state, qty_total, tp_price, filters):
         """Place a LIMIT SELL for entire filled qty at tp_price."""
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(state.symbol, tp_price, "ladder_place_tp", source="_ladder_place_tp")
+            log.warning(
+                f"[LadderTP] {state.symbol} qty={qty_total} tp={tp_price} blocked "
+                f"— HARD_DISABLE_AUTOSELL=True (iter94)"
+            )
+            return None
         try:
             placed = await self.client.create_limit_sell_order(state.symbol, qty_total, tp_price)
             tp_oid = placed.get("id")
@@ -3680,14 +3739,21 @@ class MultiSymbolScalper:
 
         Returns the orderListId on success, None on failure (caller
         falls back to the polling-based exit pattern).
-
-        Prices derived from current config:
-            TP = entry × (1 + profit_target_usdt / buy_amount_usdt)
-            SL trigger = entry × (1 - stop_loss_usdt / buy_amount_usdt)
-            SL limit   = trigger × 0.998   (small buffer below trigger so
-                                            the stop-limit can fill in
-                                            fast-moving markets)
         """
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, entry_price, "oco_sell", source="_place_oco_sell")
+            log.warning(
+                f"[OCO-SELL] {symbol} qty={qty} entry={entry_price} blocked "
+                f"— HARD_DISABLE_AUTOSELL=True (iter94)"
+            )
+            return None
+        # Prices derived from current config (when not hard-disabled):
+        #     TP = entry × (1 + profit_target_usdt / buy_amount_usdt)
+        #     SL trigger = entry × (1 - stop_loss_usdt / buy_amount_usdt)
+        #     SL limit   = trigger × 0.998   (small buffer below trigger so
+        #                                     the stop-limit can fill in
+        #                                     fast-moving markets)
         if self.buy_amount_usdt <= 0:
             return None
         try:
@@ -3864,6 +3930,11 @@ class MultiSymbolScalper:
         return symbol if '/' in symbol else f"{symbol[:-4]}/USDT"
 
     async def execute_sell(self, symbol, price):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, price, "execute_sell", source="execute_sell")
+            log.warning(f"[execute_sell] {symbol} @ {price} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return
         if symbol not in self.active_positions: return
         try:
             pos = self.active_positions[symbol]
@@ -3929,6 +4000,11 @@ class MultiSymbolScalper:
             log.error(f"❌ Sell {symbol} failed: {e}")
 
     async def _place_aggressive_limit_sell(self, symbol: str, qty: float, max_wait_sec: int = 5, retries: int = 3):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            await self._publish_blocked_sell(symbol, None, "aggressive_limit_sell", source="_place_aggressive_limit_sell")
+            log.warning(f"[AggressiveSell] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
         """Place a LIMIT SELL at the current best bid and wait up to
         max_wait_sec for it to fill. If it doesn't, cancel and try
         again with a freshly-fetched bid. Total attempts = retries.

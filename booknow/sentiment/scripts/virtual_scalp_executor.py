@@ -816,6 +816,36 @@ class VirtualScalpExecutor:
     # Mirrors iter86 / iter87 in other paths.  Manual-only mode.
     HARD_DISABLE_AUTOBUY: bool = True
 
+    # iter 94 — HARD KILL SWITCH for Virtual Scalper SELLs.
+    # Blocks every exit path so the operator manages every sell on
+    # Binance directly. Flip by editing this constant + redeploy.
+    HARD_DISABLE_AUTOSELL: bool = True
+
+    def _publish_blocked_sell(self, symbol, price, reason, source="virtual_scalper"):
+        """iter 94 — publish a 'would-have-sold' event so the dashboard
+        shows which positions the bot wanted to exit.
+        """
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "virtual_scalper_sell",
+                "source": source,
+                "reason": reason,
+                "would_sell_price": float(price) if price is not None else None,
+                "blocked_by": "HARD_DISABLE_AUTOSELL",
+            }
+            payload = _json.dumps(event)
+            self.r.rpush(f"BOT_SELL_SIGNALS:{date}", payload)
+            self.r.expire(f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+            self.r.hset("BOT_SELL_SIGNALS:LATEST", symbol, payload)
+            print(f"⛔ [v-scalper-sell-block] {symbol} {reason} @ {price} blocked")
+        except Exception as e:
+            print(f"[v-scalper-sell-block] publish failed: {e}")
+
     def _publish_scalper_signal(self, symbol, signal_price, features, source="ladder"):
         """iter 88 — When Virtual Scalper would have bought but is blocked
         by HARD_DISABLE_AUTOBUY, publish a signal so operator sees it.
@@ -1373,6 +1403,14 @@ class VirtualScalpExecutor:
         return False, ""
 
     def _maybe_force_exit_ladder_live(self, state, f, last):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(state.symbol, last, "v_force_exit_ladder_live", source="_maybe_force_exit_ladder_live")
+            except Exception:
+                pass
+            print(f"[v-ForceExit] {state.symbol} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return False
         """iter 14 + 37 + 39 (Virtual): unified force-exit pipeline.
         Returns True iff the ladder was closed via a force exit (caller
         should ``return`` immediately, skipping further state-machine
@@ -2769,6 +2807,14 @@ class VirtualScalpExecutor:
     # ── OCO helpers (mirror the Fast Scalper pattern) ────────────────────
 
     def _place_oco_sell(self, symbol, qty, entry_price, profit_pct):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, entry_price, "v_oco_sell", source="_place_oco_sell")
+            except Exception:
+                pass
+            print(f"[v-OCO] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
         """Place a Binance OCO sell — LIMIT TP + STOP_LOSS_LIMIT SL.
 
         Returns the orderListId on success, None on any failure (caller
@@ -3022,10 +3068,26 @@ class VirtualScalpExecutor:
         """Wrapper kept for API compatibility — internally now uses an
         aggressive-limit-at-bid sell instead of a market sell. Returns
         {price, qty} on success, None on failure."""
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, None, "v_market_sell", source="_place_real_market_sell")
+            except Exception:
+                pass
+            print(f"[v-MarketSell] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
         return self._place_real_aggressive_limit_sell(symbol, qty, max_wait_sec=5, retries=3)
 
     def _place_real_aggressive_limit_sell(self, symbol: str, qty: float,
                                           max_wait_sec: int = 5, retries: int = 3):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, None, "v_aggressive_limit_sell", source="_place_real_aggressive_limit_sell")
+            except Exception:
+                pass
+            print(f"[v-AggressiveSell] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
         """Synchronous version of the aggressive-limit-sell pattern
         (matches Fast Scalper's async helper, including the
         partial-fill safety from the AAVE/PENGU bug).
