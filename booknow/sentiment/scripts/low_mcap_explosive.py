@@ -74,6 +74,13 @@ DEFAULTS: Dict[str, Any] = {
     "lmcMinTradeSurge": 3.0,
     "lmcMinAbsChg24h": 2.0,                # |chg_24h| >= 2%
 
+    # iter 92 — Fast-path 5m vol-surge gate (catches sharp dumps the
+    # rolling 24h gate takes 2-3 min to see).
+    "lmcMin5mVolSurge": 3.0,               # last 5m avg vol/min vs prior 60m
+    "lmcMin5mAbsChg": 0.8,                 # |last 5m price chg| >= 0.8%
+    "lmcFastPrefilterChg24h": 1.0,         # skip 1m-kline fetch if |chg_24h|<1%
+    "lmcWeight5mSurge": 20.0,              # bonus points when 5m surge fires
+
     # Scoring weights
     "lmcWeightMcap": 25,
     "lmcWeightVolSurge": 25,
@@ -163,6 +170,71 @@ def fetch_hourly_klines(symbol: str, limit: int = 24) -> Optional[List[List[Any]
         return r.json()
     except Exception:
         return None
+
+
+# iter 92 — fast-path support: 1m klines for short-window vol-surge
+# detection. The 24h-rolling vol-surge gate (>=3.0x) takes 2-3 min to
+# react to a sharp dump like BCH 2026-05-28 16:45 IST because the
+# rolling 24h denominator absorbs the spike slowly. By also fetching
+# the last ~65 minutes of 1m klines we can detect a 5m-window surge
+# the moment it starts, which catches dumps minutes earlier.
+def fetch_minute_klines(symbol: str, limit: int = 65) -> Optional[List[List[Any]]]:
+    """Last N 1m klines for short-window vol-surge / price-move scoring.
+
+    Binance weight = 1 per call (limit <= 100). At ~115 LMC candidates
+    per 30s tick that's ~230 calls/min — well under the 6000/min budget.
+    """
+    try:
+        r = requests.get(
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={"symbol": symbol, "interval": "1m", "limit": limit},
+            timeout=4,
+        )
+        if r.status_code != 200:
+            return None
+        return r.json()
+    except Exception:
+        return None
+
+
+def compute_short_vol_surge(klines_1m: Optional[List[List[Any]]],
+                             short_win: int = 5,
+                             base_win: int = 60) -> Tuple[float, float, float, float]:
+    """Compare avg per-minute quote volume in the most recent `short_win`
+    minutes to the avg in the preceding `base_win` minutes.
+
+    Returns (short_vol_usd, base_avg_per_min, surge_ratio, chg_pct).
+      short_vol_usd : sum quoteVolume over last short_win 1m bars
+      base_avg_per_min : avg quoteVolume per minute over preceding base_win bars
+      surge_ratio : short_avg_per_min / base_avg_per_min (0 if no baseline)
+      chg_pct : % price change from short_win minutes ago to last close
+    """
+    if not klines_1m or len(klines_1m) < short_win + 1:
+        return 0.0, 0.0, 0.0, 0.0
+    # Binance kline shape: [openTime, open, high, low, close, volume,
+    # closeTime, quoteAssetVolume, ...]. Use quoteAssetVolume (index 7)
+    # so we stay in USDT terms.
+    try:
+        vols = [float(k[7] or 0) for k in klines_1m]
+        closes = [float(k[4] or 0) for k in klines_1m]
+    except (TypeError, ValueError, IndexError):
+        return 0.0, 0.0, 0.0, 0.0
+
+    short_vols = vols[-short_win:]
+    base_vols  = vols[:-short_win][-base_win:]   # exclude the short window
+    if not short_vols or not base_vols:
+        return 0.0, 0.0, 0.0, 0.0
+
+    short_total = sum(short_vols)
+    short_avg   = short_total / len(short_vols)
+    base_avg    = sum(base_vols) / len(base_vols)
+    surge       = (short_avg / base_avg) if base_avg > 0 else 0.0
+
+    p_now  = closes[-1] if closes else 0.0
+    p_then = closes[-short_win - 1] if len(closes) > short_win else 0.0
+    chg = ((p_now - p_then) / p_then * 100.0) if p_then > 0 else 0.0
+
+    return short_total, base_avg, surge, chg
 
 
 # ── Universe filter ─────────────────────────────────────────────────────
@@ -434,12 +506,40 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
     min_trade_surge = float(cfg.get("lmcMinTradeSurge", 3.0))
     min_abs_chg     = float(cfg.get("lmcMinAbsChg24h", 2.0))
 
-    if vol_surge < min_vol_surge:
+    # ── iter 92 — Slow path: rolling 24h gates (existing behavior) ─
+    slow_pass = (
+        vol_surge   >= min_vol_surge
+        and trade_surge >= min_trade_surge
+        and abs(chg_24h_pct) >= min_abs_chg
+    )
+
+    # ── iter 92 — Fast path: 5-minute vol-surge gate ───────────────
+    # Catches BCH-style sharp dumps 2-3 minutes earlier than the
+    # rolling 24h ratio can. Cheap pre-filter (chg_24h>=1%) avoids
+    # fetching 1m klines for boring/flat coins.
+    fast_min_surge = float(cfg.get("lmcMin5mVolSurge", 3.0))
+    fast_min_chg   = float(cfg.get("lmcMin5mAbsChg",   0.8))
+    fast_prefilter_chg = float(cfg.get("lmcFastPrefilterChg24h", 1.0))
+
+    short_vol_5m  = 0.0
+    short_base_pm = 0.0
+    surge_5m      = 0.0
+    chg_5m_pct    = 0.0
+    fast_pass     = False
+    if abs(chg_24h_pct) >= fast_prefilter_chg:
+        klines_1m = fetch_minute_klines(symbol, limit=65)
+        short_vol_5m, short_base_pm, surge_5m, chg_5m_pct = compute_short_vol_surge(
+            klines_1m, short_win=5, base_win=60
+        )
+        fast_pass = (surge_5m >= fast_min_surge and abs(chg_5m_pct) >= fast_min_chg)
+
+    if not (slow_pass or fast_pass):
         return None
-    if trade_surge < min_trade_surge:
-        return None
-    if abs(chg_24h_pct) < min_abs_chg:
-        return None
+
+    trigger_source = (
+        "24h+5m" if (slow_pass and fast_pass) else
+        ("5m"   if fast_pass else "24h")
+    )
 
     # Score
     s_mcap, b_mcap   = compute_mcap_score(avg_vol_7d, cfg)
@@ -449,7 +549,32 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
     s_qt, b_qt       = compute_pre_pump_quiet_score(daily, cfg)
     s_lq, b_lq       = compute_liquidity_sanity_score(today_vol, cfg)
 
-    score = round(s_mcap + s_vol + s_trd + s_mv + s_qt + s_lq, 1)
+    # iter 92 — bonus from short-window surge so a fast-path-only
+    # candidate (where 24h ratios haven't caught up) can still clear
+    # the watch threshold and surface in the dashboard.
+    fast_bonus_w = float(cfg.get("lmcWeight5mSurge", 20.0))
+    if surge_5m <= 0:
+        s_fast = 0.0
+    elif surge_5m >= 8.0:
+        s_fast = fast_bonus_w
+    elif surge_5m >= 5.0:
+        s_fast = fast_bonus_w * 0.8
+    elif surge_5m >= 3.0:
+        s_fast = fast_bonus_w * 0.6
+    elif surge_5m >= 2.0:
+        s_fast = fast_bonus_w * 0.3
+    else:
+        s_fast = 0.0
+    b_fast = {
+        "trigger_source": trigger_source,
+        "surge_5m": round(surge_5m, 2),
+        "chg_5m_pct": round(chg_5m_pct, 2),
+        "short_vol_5m_usd": round(short_vol_5m, 0),
+        "base_per_min_usd": round(short_base_pm, 0),
+        "pts": round(s_fast, 1),
+    }
+
+    score = round(s_mcap + s_vol + s_trd + s_mv + s_qt + s_lq + s_fast, 1)
 
     # Direction (requires extra API call — only do for candidates above watch)
     watch_min = float(cfg.get("lmcWatchScore", 50))
@@ -478,10 +603,17 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
         "avg_7d_vol_usd": round(avg_vol_7d, 0),
         "vol_surge_x": round(vol_surge, 2),
         "trade_surge_x": round(trade_surge, 2),
+        # iter 92 — fast-path metrics so the dashboard + post-mortem can
+        # tell whether the slow 24h gate or the 5m gate fired this event.
+        "trigger_source": trigger_source,
+        "surge_5m": round(surge_5m, 2),
+        "chg_5m_pct": round(chg_5m_pct, 2),
+        "short_vol_5m_usd": round(short_vol_5m, 0),
         "breakdown": {
             "mcap": b_mcap, "vol_surge": b_vol, "trade_surge": b_trd,
             "today_move": b_mv, "pre_pump_quiet": b_qt,
             "liquidity_sanity": b_lq,
+            "fast_5m": b_fast,
         },
         "direction_breakdown": dir_breakdown,
     }

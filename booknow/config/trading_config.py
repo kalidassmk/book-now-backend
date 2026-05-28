@@ -875,6 +875,17 @@ class TradingConfig:
     lmcMinTradeSurge: float = 3.0
     lmcMinAbsChg24h: float = 2.0
 
+    # iter 92 — Fast-path 5m vol-surge gate. The slow 24h gate above
+    # takes 2-3 minutes to react to a sharp dump (eg BCHUSDT 16:45 →
+    # caught at 16:47:53 IST on 2026-05-28). These thresholds add an
+    # alternate trigger that watches the last 5 minutes of 1m klines,
+    # firing the moment volume jumps regardless of where the rolling
+    # 24h ratio is.
+    lmcMin5mVolSurge: float = 3.0            # last-5m avg-vol/min vs prior-60m
+    lmcMin5mAbsChg: float = 0.8              # |last-5m price chg| >= 0.8%
+    lmcFastPrefilterChg24h: float = 1.0      # skip 1m klines fetch if |chg_24h|<1%
+    lmcWeight5mSurge: float = 20.0           # score bonus when 5m surge fires
+
     # Scoring weights
     lmcWeightMcap: int = 25
     lmcWeightVolSurge: int = 25
