@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, Optional
 
 import redis.asyncio as aioredis
@@ -966,6 +966,35 @@ class TradingConfig:
     orphanReconMinUsd: float = 5.0       # skip true dust
     orphanReconTargetPct: float = 0.5    # +0.5% target sell
     iter80OrphanReconAppliedAt: str = "2026-05-24"
+
+    # ──────────────────────────────────────────────────────────────────
+    # iter 81 (2026-05-25) — Enhanced weak-pump + symbol blacklist
+    # ──────────────────────────────────────────────────────────────────
+    # JTOUSDT forensic (2026-05-12) showed iter71 missed the buy because
+    # the chg threshold (0.5%) was too high.  Real signal at buy time:
+    # taker_buy_ratio was only 14% (sellers crushing) but chg was tiny
+    # so iter71 didn't even check.
+    #
+    # iter81 adds 3 NEW weak-pump sub-rules + a blacklist:
+    #   • Seller dominance     — TBR < 30% AND vol_ratio > 0.8 (no chg
+    #                            threshold).  Catches JTO 08:36's TBR=14%.
+    #   • Latest reversal      — 2+ greens then RED with fading vol.
+    #   • Buy near top         — close in top 30% of 15m range w/ flat tail.
+    #   • Symbol blacklist     — FIDA/AMP/JTO/S/COS/CFG (lost $12.14 with
+    #                            1 winning trade in 20 attempts).
+    iter81SymbolBlacklistEnabled: bool = True
+    symbolBlacklist: list = field(default_factory=lambda: [
+        "FIDAUSDT", "AMPUSDT", "JTOUSDT", "SUSDT", "COSUSDT", "CFGUSDT",
+    ])
+
+    # iter71 tweak: lower TBR sub-rule chg threshold to 0% so the rule
+    # fires regardless of price-move size.
+    weakPumpSellerDomTbrCeil: float = 0.30      # TBR < 30% = sellers crushing
+    weakPumpSellerDomMinVolRatio: float = 0.8   # but there IS recent vol
+    weakPumpNearTopThreshold: float = 0.7       # 70%+ into 15m range
+    iter81LatestReversalEnabled: bool = True
+    iter81NearTopEnabled: bool = True
+    iter81AppliedAt: str = "2026-05-25"
     ccpTopSymbols: int = 200
 
     # Gate thresholds

@@ -623,6 +623,31 @@ class TradeExecutor:
             logger.info("[%s] Auto-buy DISABLED via config — skipping %s", rule_label, symbol)
             return
 
+        # iter 81 — symbol blacklist fast-fail.  No API call, just
+        # checks TRADING_CONFIG.symbolBlacklist (default: FIDA/AMP/
+        # JTO/S/COS/CFG — the 6 worst losers per audit 2026-05-25).
+        if bool(getattr(cfg, "iter81SymbolBlacklistEnabled", True)):
+            blacklist = list(getattr(cfg, "symbolBlacklist", []) or [])
+            if symbol in [str(s).upper() for s in blacklist]:
+                logger.info(
+                    "[%s] Skip %s — symbol_blacklisted (toxic coin, manually reviewed)",
+                    rule_label, symbol,
+                )
+                try:
+                    await self._redis.lpush(
+                        f"METRICS:SKIP:{time.strftime('%Y-%m-%d')}",
+                        json.dumps({
+                            "ts": int(time.time() * 1000),
+                            "symbol": symbol,
+                            "rule": "iter81_symbol_blacklist",
+                            "reason": f"{symbol} on toxic-coin blacklist",
+                            "rule_label": rule_label,
+                        }),
+                    )
+                except Exception:
+                    pass
+                return
+
         if self._state.is_already_bought(symbol):
             logger.debug("[%s] Skip %s — already in position", rule_label, symbol)
             return

@@ -50,6 +50,29 @@ _BINANCE_BASE = "https://api.binance.com"
 
 
 # ──────────────────────────────────────────────────────────────────────
+# 0. Symbol blacklist (iter 81)  — fast-fail, no API calls
+# ──────────────────────────────────────────────────────────────────────
+
+def symbol_blacklisted(symbol: str, cfg: Dict[str, Any]) -> Optional[str]:
+    """Return blocker reason if symbol is on the configured blacklist.
+
+    iter 81 — JTO/FIDA/AMP/S/COS/CFG have lost $12+ with 1 win in 20
+    attempts.  Hard-block them.  User can edit
+    TRADING_CONFIG.symbolBlacklist in Redis to add/remove without
+    redeploy.
+    """
+    if not cfg.get("iter81SymbolBlacklistEnabled", True):
+        return None
+    blacklist = cfg.get("symbolBlacklist") or []
+    if not isinstance(blacklist, list):
+        return None
+    sym_upper = str(symbol).upper()
+    if sym_upper in [str(s).upper() for s in blacklist]:
+        return f"symbol_blacklisted: {sym_upper} is on the toxic-coin blacklist"
+    return None
+
+
+# ──────────────────────────────────────────────────────────────────────
 # 1. USDT cooldown (iter 67)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -189,11 +212,17 @@ def run_all_gates(
     dashboard_url: Optional[str] = None,
     timeout_s: float = 2.0,
 ) -> Optional[str]:
-    """Convenience wrapper: runs all 3 gates and returns first blocker.
+    """Convenience wrapper: runs all gates and returns first blocker.
 
-    Order: USDT cooldown → check-coin → orderbook depth.
-    USDT first because it's a cheap Redis check.
+    Order:
+      1. Symbol blacklist (iter 81)  — local, fastest
+      2. USDT cooldown      (iter 67) — Redis check
+      3. check-coin pipeline (iter 71/81) — HTTP to /api/check-coin
+      4. orderbook depth    (iter 66) — HTTP to Binance
     """
+    block = symbol_blacklisted(symbol, cfg)
+    if block:
+        return block
     block = usdt_cooldown_active(redis_client)
     if block:
         return block
