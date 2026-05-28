@@ -528,13 +528,21 @@ class TradeExecutor:
             symbol, filled_qty, fill_price, sell_order_id,
         )
         # iter 60 — dashboard banner alert on BUY fill (always on).
+        # iter 95 — label as MANUAL when this is an iter82-AUTO_RECOVERED
+        # orphan fill (operator bought on Binance UI directly).
         try:
             from booknow.util.alerts import publish_trade_alert, alert_buy_filled
+            try:
+                pos = self._state.get_position(symbol)
+                buy_label = "MANUAL" if (pos and getattr(pos, "rule_label", "") == "AUTO_RECOVERED") else "BOT"
+            except Exception:
+                buy_label = "BOT"
             await publish_trade_alert(
                 redis_client=self._redis,
                 symbol=symbol,
                 action="FILLED",
                 price=fill_price,
+                rule_label=buy_label,
                 extra={"qty": float(filled_qty)},
             )
             if getattr(cfg, "alertsEnabled", False):

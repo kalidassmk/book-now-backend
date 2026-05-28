@@ -413,14 +413,37 @@ async def _bootstrap() -> None:
                         log.error("[BUY FILLED] on_buy_filled failed for %s: %s", symbol, e, exc_info=True)
                     return
 
-                # ── SELL fill: existing close-position cleanup ──
-                if pos.open_sell_order_id is None or pos.open_sell_order_id != order_id:
-                    return
-                price = event.get("p") or event.get("L") or "0"
-                log.info(
-                    "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
-                    order_id, symbol, price,
+                # ── SELL fill: close-position cleanup ──
+                # iter 95 — also handle MANUAL SELL on Binance UI.
+                #
+                # Before iter95 the handler bailed if
+                # pos.open_sell_order_id != event.order_id, which meant a
+                # manual sell on Binance was completely silent on our
+                # side — TradeState still thought we owned it, the BUY
+                # hash stayed populated, the dashboard kept showing the
+                # position as "HOLDING", and no P&L was recorded.
+                #
+                # In manual-only mode (iter94 HARD_DISABLE_AUTOSELL=True)
+                # the bot never places a sell, so pos.open_sell_order_id
+                # is always None for newly-bought positions. Every SELL
+                # fill that arrives is by definition a manual operator
+                # action on Binance and we must clean up + record it.
+                is_manual_sell = (
+                    pos.open_sell_order_id is None
+                    or pos.open_sell_order_id != order_id
                 )
+                price = event.get("L") or event.get("p") or "0"
+                if is_manual_sell:
+                    log.info(
+                        "[MANUAL SELL FILL] %s order #%s @ %s — "
+                        "operator sold on Binance UI (iter95).",
+                        symbol, order_id, price,
+                    )
+                else:
+                    log.info(
+                        "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
+                        order_id, symbol, price,
+                    )
                 # iter 60 — dashboard banner alert + optional Telegram.
                 try:
                     from booknow.util.alerts import publish_trade_alert, alert_sold
@@ -434,13 +457,17 @@ async def _bootstrap() -> None:
                         realised_net = gross - fees
                     except Exception:
                         realised_net = None
+                    # iter 95 — label correctly: MANUAL for operator-driven
+                    # Binance UI sells (now the default in manual mode), TP
+                    # for the legacy bot-TP-filled path.
+                    sell_label = "MANUAL" if is_manual_sell else "TP"
                     await publish_trade_alert(
                         redis_client=redis,
                         symbol=symbol,
                         action="SELL",
                         price=price,
                         realised_net=realised_net,
-                        rule_label="TP",
+                        rule_label=sell_label,
                     )
                     if getattr(cfg_alerts, "alertsEnabled", False):
                         await alert_sold(
@@ -448,7 +475,7 @@ async def _bootstrap() -> None:
                             buy_price=pos.buy_price,
                             sell_price=price,
                             qty=pos.qty,
-                            reason="TP",
+                            reason=sell_label,
                             hold_seconds=hold_s,
                         )
                 except Exception as e:
