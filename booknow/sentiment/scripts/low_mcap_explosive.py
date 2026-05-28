@@ -105,7 +105,8 @@ DEFAULTS: Dict[str, Any] = {
     "lmcOutcomeCheckMinutes": [15, 60, 240, 1440],
 }
 
-POLL_INTERVAL_S = float(os.getenv("LMC_POLL_S", "10"))   # iter 93 — was 30, now 10s
+POLL_INTERVAL_S = float(os.getenv("LMC_POLL_S", "5"))    # iter 98 — was 10, now 5s
+SLOW_EVERY_N_TICKS = int(os.getenv("LMC_SLOW_EVERY_N", "6"))  # iter 98 — slow path runs every Nth tick (5s × 6 = 30s)
 
 # iter 93 — per-symbol ticker snapshot tracker for flash-dump detection.
 # Maps symbol -> (epoch_seconds, last_price, quote_volume) from the prior
@@ -911,15 +912,20 @@ def main() -> None:
     log.info("[LMC] started — backend=%s, redis=%s:%s",
              BACKEND_BASE, REDIS_HOST, REDIS_PORT)
     daily_cache: Dict[str, Tuple[float, List[List[Any]]]] = {}
+    tick_count = 0   # iter 98 — used to gate the slow path to every Nth tick
 
     while True:
         try:
+            tick_count += 1
             cfg = load_config(r)
             if not bool(cfg.get("lmcEnabled", True)):
                 time.sleep(POLL_INTERVAL_S)
                 continue
             paper = is_paper_mode(cfg)
-            log.info(f"[LMC] tick — mode={'PAPER' if paper else 'LIVE'}")
+            # iter 98 — slow path (24h + 5m gates + scoring + cooldowns) runs
+            # only every Nth tick (default every 30s). FLASH gate runs every
+            # tick (default 5s) so sudden dumps surface within ~5s.
+            do_slow = (tick_count % SLOW_EVERY_N_TICKS == 0)
 
             tickers = fetch_all_24h_tickers()
             if not tickers:
@@ -930,95 +936,100 @@ def main() -> None:
             min_v = float(cfg.get("lmcMinVol24h", 2_000_000))  # iter 75
             max_v = float(cfg.get("lmcMaxAvgVol7d", 10_000_000))
             candidates = universe_from_tickers(tickers, min_v, max_v)
-            log.info(f"[LMC] universe = {len(candidates)} candidates "
-                     f"(from {len(tickers)} all USDT pairs)")
 
-            # Prune old cache
-            now = time.time()
-            for sym in list(daily_cache.keys()):
-                if now - daily_cache[sym][0] > 3600:
-                    daily_cache.pop(sym, None)
+            # Prune old cache (only worth doing during the slow phase).
+            if do_slow:
+                now = time.time()
+                for sym in list(daily_cache.keys()):
+                    if now - daily_cache[sym][0] > 3600:
+                        daily_cache.pop(sym, None)
 
             fires = 0
             flash_fires = 0
             flash_cd_s = int(cfg.get("lmcFlashCooldownSec", 300))   # iter93 — 5 min
+
+            # ── Phase 1: FLASH dump check on every candidate (every tick) ─
+            # Ticker-only — no per-candidate Binance calls — completes in
+            # well under a second for a 100-candidate universe.
             for t in candidates:
                 sym = t.get("symbol", "")
-
-                # ── iter 93 — FLASH dump fast-fast-path ────────────
-                # Runs on every 10s tick, BEFORE the heavier slow/5m
-                # evaluation. Detects sudden drops by comparing the
-                # current 24h ticker to the snapshot from the prior
-                # tick. Has its own (shorter) cooldown so it doesn't
-                # spam during an extended dump.
-                if not flash_cooldown_active(r, sym):
-                    try:
-                        # Cheap avg_7d_vol estimate from cache if we
-                        # have it; else use today's 24h vol as an
-                        # approximation (the field only feeds the
-                        # event payload, not the gate).
-                        avg7d = 0.0
-                        cached = daily_cache.get(sym)
-                        if cached:
-                            # daily_cache value shape from evaluate_symbol
-                            # is (ts, klines) — recompute the simple avg.
-                            try:
-                                _ts, _klines = cached
-                                if _klines:
-                                    avg7d = sum(float(k[7] or 0) for k in _klines[:-1]) / max(1, len(_klines) - 1)
-                            except Exception:
-                                avg7d = 0.0
-                        if avg7d <= 0:
-                            avg7d = float(t.get("quoteVolume") or 0)
-                        flash_evt = detect_flash_dump(t, avg7d, cfg)
-                    except Exception as exc:
-                        log.debug(f"[LMC] flash check {sym} error: {exc}")
-                        flash_evt = None
-                    if flash_evt is not None:
-                        publish_detection(r, flash_evt)
-                        flash_fires += 1
-                        set_flash_cooldown(r, sym, flash_cd_s)
-                        log.info(
-                            f"[LMC] ⚡ FLASH_DUMP {sym} "
-                            f"drop={flash_evt['flash_price_chg_pct']}% in "
-                            f"{flash_evt['flash_window_s']}s "
-                            f"vol_delta=${flash_evt['flash_vol_delta_usd']:,.0f} "
-                            f"score={flash_evt['score']}"
-                        )
-
-                if cooldown_active(r, sym):
+                if flash_cooldown_active(r, sym):
                     continue
                 try:
-                    event = evaluate_symbol(sym, t, daily_cache, cfg)
+                    # Cheap avg_7d_vol estimate from cache; else today's vol.
+                    avg7d = 0.0
+                    cached = daily_cache.get(sym)
+                    if cached:
+                        try:
+                            _ts, _klines = cached
+                            if _klines:
+                                avg7d = sum(float(k[7] or 0) for k in _klines[:-1]) / max(1, len(_klines) - 1)
+                        except Exception:
+                            avg7d = 0.0
+                    if avg7d <= 0:
+                        avg7d = float(t.get("quoteVolume") or 0)
+                    flash_evt = detect_flash_dump(t, avg7d, cfg)
                 except Exception as exc:
-                    log.warning(f"[LMC] evaluate {sym} error: {exc}")
-                    continue
-                if event is None:
-                    continue
+                    log.debug(f"[LMC] flash check {sym} error: {exc}")
+                    flash_evt = None
+                if flash_evt is not None:
+                    publish_detection(r, flash_evt)
+                    flash_fires += 1
+                    set_flash_cooldown(r, sym, flash_cd_s)
+                    log.info(
+                        f"[LMC] ⚡ FLASH_DUMP {sym} "
+                        f"drop={flash_evt['flash_price_chg_pct']}% in "
+                        f"{flash_evt['flash_window_s']}s "
+                        f"vol_delta=${flash_evt['flash_vol_delta_usd']:,.0f} "
+                        f"score={flash_evt['score']}"
+                    )
 
-                publish_detection(r, event)
-                fires += 1
+            # ── Phase 2: SLOW + 5m path (heavy per-candidate work) ───────
+            # Skipped on flash-only ticks. When it runs it can fetch 1m
+            # klines for each candidate, so this phase takes 4-12s.
+            if do_slow:
+                log.info(f"[LMC] slow tick — universe = {len(candidates)} "
+                         f"(from {len(tickers)} all USDT pairs)")
+                for t in candidates:
+                    sym = t.get("symbol", "")
+                    if cooldown_active(r, sym):
+                        continue
+                    try:
+                        event = evaluate_symbol(sym, t, daily_cache, cfg)
+                    except Exception as exc:
+                        log.warning(f"[LMC] evaluate {sym} error: {exc}")
+                        continue
+                    if event is None:
+                        continue
 
-                log.info(
-                    f"[LMC] {event['label']} {sym} score={event['score']} "
-                    f"vol_x={event['vol_surge_x']} chg_24h={event['chg_24h_pct']}% "
-                    f"7d_avg=${event['avg_7d_vol_usd']:,.0f}"
-                )
+                    publish_detection(r, event)
+                    fires += 1
 
-                live_min = float(cfg.get("lmcLiveScore", 75))
-                if event["label"] == "EXPLOSIVE_PUMP" and event["score"] >= live_min:
-                    if paper:
-                        record_paper_trade(r, event, cfg)
-                        log.info(
-                            f"[LMC] 📝 PAPER BUY {sym} score={event['score']} "
-                            f"entry={event['trigger_price']}"
-                        )
-                    else:
-                        delegate_buy(sym, event, cfg)
-                set_cooldown(r, sym, int(cfg.get("lmcCooldownSec", 1800)))
+                    log.info(
+                        f"[LMC] {event['label']} {sym} score={event['score']} "
+                        f"vol_x={event['vol_surge_x']} chg_24h={event['chg_24h_pct']}% "
+                        f"7d_avg=${event['avg_7d_vol_usd']:,.0f}"
+                    )
 
-            log.info(f"[LMC] tick complete — {fires} slow + {flash_fires} flash "
-                     f"(cache={len(daily_cache)} symbols)")
+                    live_min = float(cfg.get("lmcLiveScore", 75))
+                    if event["label"] == "EXPLOSIVE_PUMP" and event["score"] >= live_min:
+                        if paper:
+                            record_paper_trade(r, event, cfg)
+                            log.info(
+                                f"[LMC] 📝 PAPER BUY {sym} score={event['score']} "
+                                f"entry={event['trigger_price']}"
+                            )
+                        else:
+                            delegate_buy(sym, event, cfg)
+                    set_cooldown(r, sym, int(cfg.get("lmcCooldownSec", 1800)))
+
+                log.info(f"[LMC] tick complete — {fires} slow + {flash_fires} flash "
+                         f"(cache={len(daily_cache)} symbols)")
+            else:
+                # iter 98 — quiet flash-only tick; one-line log so we don't
+                # spam at 5s cadence.  Only emits when something fires.
+                if flash_fires:
+                    log.info(f"[LMC] flash-only tick — {flash_fires} flash (#{tick_count})")
 
             try:
                 run_outcome_tracker(r, cfg)
