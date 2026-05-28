@@ -1030,6 +1030,21 @@ def main() -> None:
                 # spam at 5s cadence.  Only emits when something fires.
                 if flash_fires:
                     log.info(f"[LMC] flash-only tick — {flash_fires} flash (#{tick_count})")
+                # iter 99 — heartbeat every 12 ticks (~60s) so the operator
+                # can confirm the loop is alive even when nothing fires.
+                elif tick_count % 12 == 0:
+                    log.info(f"[LMC] heartbeat — tick #{tick_count} alive (universe={len(candidates)}, flash quiet)")
+            # iter 99 — write a Redis heartbeat key on every tick so the
+            # dashboard / monitor can show staleness if the loop dies.
+            try:
+                r.set("LMC:HEARTBEAT", json.dumps({
+                    "ts": int(time.time() * 1000),
+                    "tick": tick_count,
+                    "phase": "slow" if do_slow else "flash",
+                    "universe": len(candidates),
+                }), ex=120)
+            except Exception:
+                pass
 
             try:
                 run_outcome_tracker(r, cfg)
