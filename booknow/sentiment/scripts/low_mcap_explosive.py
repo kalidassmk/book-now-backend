@@ -59,7 +59,7 @@ log = logging.getLogger("LMC")
 
 CONFIG_KEY = "TRADING_CONFIG"
 DEFAULTS: Dict[str, Any] = {
-    "lmcEnabled": True,
+    "lmcEnabled": False,
     "lmcPaperMode": True,
     "lmcPaperModeEndDate": "2026-05-31",
     "lmcPollIntervalSec": 30,

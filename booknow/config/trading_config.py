@@ -74,7 +74,7 @@ class TradingConfig:
     tslPct: float = 2.0              # trailing stop-loss (legacy)
 
     # ── Fast-scalp behaviour ─────────────────────────────────────────────
-    fastScalpMode: bool = True
+    fastScalpMode: bool = False     # iter 84 — KILL SWITCH OFF (operator-opt-in)
     maxHoldSeconds: int = 3600
     marketExitOnTimeout: bool = True
 
@@ -91,7 +91,7 @@ class TradingConfig:
     # mode is live virtual trading. Combined with the new merge-on-POST in
     # routes_config, this ensures the value survives dashboard saves AND
     # a fresh Redis (e.g. volume wipe) without needing manual re-flips.
-    virtualScalperLiveMode: bool = True
+    virtualScalperLiveMode: bool = False  # iter 84 — KILL SWITCH OFF (operator-opt-in)
 
     # ── 24h market-context filter (post-mortem-derived) ─────────────────
     # Reject buy entries when the symbol's 24h ticker fails any of these.
@@ -678,7 +678,7 @@ class TradingConfig:
     # closes instead of waiting for R1/R2/R3's ST timing data to update.
     # See booknow/sentiment/scripts/pump_rider.py for the design notes
     # (MEUSDT 07:47-07:50 pump post-mortem).
-    pumpRiderEnabled: bool = True
+    pumpRiderEnabled: bool = False   # iter 84 — KILL SWITCH OFF (operator-opt-in)
     pumpRiderVolMultipleThreshold: float = 2.5       # last 1m candle vol vs 20-candle baseline
     pumpRiderMinPriceChangePct: float = 0.8          # last candle close-vs-open %
     pumpRiderMinPriorVolMultiple: float = 1.5        # warm-up confirmation
@@ -723,7 +723,7 @@ class TradingConfig:
     # 25m baseline — gentle enough to not block real slow pumps, strict enough
     # to filter out organic drift on illiquid pairs.
     pumpRiderSlow1hVolMult: float = 1.5
-    earlyPumpAutoBuyScore: int = 85       # 0 = disabled; otherwise min EP score
+    earlyPumpAutoBuyScore: int = 0       # iter 84 — 0 = DISABLED (operator-opt-in)
     earlyPumpAutoBuyMaxAgeSec: int = 300  # only act on detections <5min old
     iter62EpAutoBuyAndChg1hAppliedAt: str = "2026-05-24"
     iter64Slow1hVolConfirmAppliedAt: str = "2026-05-24"
@@ -797,7 +797,7 @@ class TradingConfig:
     # vspPaperModeEndDate).  Live mode delegates BIG_PUMP buys at
     # confidence ≥ vspLiveConfidence via pattern-buy — inherits
     # iter65 resistance gate + iter66 depth check + HARD-SL.
-    vspEnabled: bool = True
+    vspEnabled: bool = False         # iter 84 — KILL SWITCH OFF (operator-opt-in)
     vspPaperMode: bool = True
     vspPaperModeEndDate: str = "2026-05-31"  # auto-live from June 1st
     vspTopSymbols: int = 100
@@ -860,7 +860,7 @@ class TradingConfig:
     # Redis keys:
     #   LMC:DETECTIONS:<date>, LMC:LATEST, LMC:PAPER_TRADES:<date>,
     #   LMC:OUTCOMES:<date>, LMC:COOLDOWN:<sym>, LMC:OUTCOME_PENDING
-    lmcEnabled: bool = True
+    lmcEnabled: bool = False         # iter 84 — KILL SWITCH OFF (operator-opt-in)
     lmcPaperMode: bool = True
     lmcPaperModeEndDate: str = "2026-05-31"
     lmcPollIntervalSec: int = 30
@@ -933,7 +933,7 @@ class TradingConfig:
     #
     # Score (0-100) across 7 factors then classified.
     # Paper mode default; live mode delegates CALM_REVERSAL_UP buys.
-    ccpEnabled: bool = True
+    ccpEnabled: bool = False         # iter 84 — KILL SWITCH OFF (operator-opt-in)
     ccpPaperMode: bool = True
     ccpPaperModeEndDate: str = "2026-05-31"
     ccpPollIntervalSec: int = 60

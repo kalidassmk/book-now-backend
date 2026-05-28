@@ -66,7 +66,7 @@ log = logging.getLogger("PumpRider")
 # ── Config (Redis-backed; falls back to defaults if missing) ────────────
 CONFIG_KEY = "TRADING_CONFIG"
 DEFAULTS: Dict[str, Any] = {
-    "pumpRiderEnabled": True,
+    "pumpRiderEnabled": False,
     "pumpRiderVolMultipleThreshold": 2.5,    # vol > 2.5x baseline
     "pumpRiderMinPriceChangePct": 0.8,       # candle must close +0.8%
     "pumpRiderMinPriorVolMultiple": 1.5,     # prior candle warm-up

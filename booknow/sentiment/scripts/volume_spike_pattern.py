@@ -60,7 +60,7 @@ log = logging.getLogger("VSP")
 
 CONFIG_KEY = "TRADING_CONFIG"
 DEFAULTS: Dict[str, Any] = {
-    "vspEnabled": True,
+    "vspEnabled": False,
     "vspPaperMode": True,                    # first 7 days paper-only
     "vspPaperModeEndDate": "2026-05-31",     # auto-flip to live after this date
     "vspTopSymbols": 100,

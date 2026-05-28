@@ -59,7 +59,7 @@ log = logging.getLogger("CCP")
 
 CONFIG_KEY = "TRADING_CONFIG"
 DEFAULTS: Dict[str, Any] = {
-    "ccpEnabled": True,
+    "ccpEnabled": False,
     "ccpPaperMode": True,
     "ccpPaperModeEndDate": "2026-05-31",
     "ccpPollIntervalSec": 60,
