@@ -1803,10 +1803,20 @@ class MultiSymbolScalper:
             'range_1h_pct':    r1h,
         }
 
+    # iter 87 — HARD KILL SWITCH for Fast Scalper.  Mirrors iter86 in
+    # executor.try_buy.  Even if cfg.fastScalpMode is somehow flipped
+    # to True via Redis, this hard-coded constant prevents any buy.
+    # To re-enable, change this constant and redeploy.
+    HARD_DISABLE_AUTOBUY: bool = True
+
     async def _ladder_start(self, symbol, signal_price, features=None):
         """Place buy 1 + buys 2/3 + TP. When buy 1 is a market order the
         whole ladder (legs 2/3 + TP) is on the book within microseconds
         of buy 1's fill — no waiting state."""
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            log.debug(f"[ladder] {symbol} ignored — HARD_DISABLE_AUTOBUY=True (manual-only mode)")
+            return
         try:
             if symbol not in self.filters: await self.fetch_filters(symbol)
             f = self.filters.get(symbol)
@@ -3398,6 +3408,10 @@ class MultiSymbolScalper:
         ladder.set_cooldown(self.redis, state.symbol, self.ladder_cooldown_seconds)
 
     async def execute_buy(self, symbol, price, features=None):
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            log.debug(f"[fast-scalper] execute_buy {symbol} ignored — HARD_DISABLE_AUTOBUY=True")
+            return
         if not self.auto_enabled:
             return
 

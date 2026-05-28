@@ -812,10 +812,18 @@ class VirtualScalpExecutor:
         self._paper_ladder_clear(state.symbol)
         ladder.set_cooldown(self.r, state.symbol, self.ladder_cooldown_seconds)
 
+    # iter 87 — HARD KILL SWITCH for Virtual Scalper (live path).
+    # Mirrors iter86 / iter87 in other paths.  Manual-only mode.
+    HARD_DISABLE_AUTOBUY: bool = True
+
     def _ladder_start_live(self, symbol, signal_price, features=None):
         """Live start: place Buy 1 as MARKET (default) so Buy 2/3 limits
         can be placed in the same call. Falls back to aggressive-limit-
         at-ask when ladderBuy1UseMarketOrder is False."""
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            print(f"[v-ladder-live] {symbol} ignored — HARD_DISABLE_AUTOBUY=True (manual-only mode)")
+            return
         f = self._get_filters(symbol)
         if f is None:
             print(f"⚠️ [v-ladder] {symbol} missing filters; skipping")
@@ -2369,6 +2377,10 @@ class VirtualScalpExecutor:
         defers fill detection to _sweep_pending_orders which polls
         Binance for the order's actual status.
         """
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            print(f"[v-scalper] place_limit_order {symbol} ignored — HARD_DISABLE_AUTOBUY=True")
+            return
         investment, profit_target_usdt, profit_pct, limit_offset_pct = self._load_trading_config()
         base_price = self._fetch_base_price(symbol)
         limit_price = signal_price * (1 - limit_offset_pct / 100.0)
