@@ -121,13 +121,20 @@ except Exception as _exc:  # pragma: no cover — fallback if path differs
     _TICKERS_CACHE_IMPORT_ERR = str(_exc)
 
 
-def tickers_from_cache_or_rest() -> List[Dict[str, Any]]:
-    """iter 100 — primary path: read all symbols from the WS-fed cache
-    and return them in a REST-compatible format (lastPrice, quoteVolume,
-    priceChangePercent, count) so the rest of the LMC pipeline is
-    untouched.  Falls back to REST if the cache is empty (e.g. before
-    the first WS frame lands, or if the import failed).
+def tickers_from_cache_or_rest(prefer_rest_for_trade_count: bool = False) -> List[Dict[str, Any]]:
+    """iter 100 / iter 101 — primary path: read all symbols from the
+    WS-fed cache (!miniTicker@arr) and return them in REST-compatible
+    format (lastPrice / quoteVolume / priceChangePercent) so the rest
+    of the LMC pipeline is untouched.
+
+    The miniTicker stream does NOT include trade count (n).  Slow-tick
+    callers that need it (for the trade_surge gate) should pass
+    `prefer_rest_for_trade_count=True` to fall through to REST.  Flash-
+    tick callers don't use trade_surge so they read the cache and
+    avoid the 40-weight REST call entirely.
     """
+    if prefer_rest_for_trade_count:
+        return fetch_all_24h_tickers()
     if _get_tickers_cache is not None:
         try:
             cache = _get_tickers_cache()
@@ -135,10 +142,6 @@ def tickers_from_cache_or_rest() -> List[Dict[str, Any]]:
             if snap:
                 out: List[Dict[str, Any]] = []
                 for sym, row in snap.items():
-                    # Map WS cache schema (last/open/quoteVolume/…) →
-                    # REST schema (lastPrice/openPrice/quoteVolume/…)
-                    # so universe_from_tickers + evaluate_symbol +
-                    # detect_flash_dump work unchanged.
                     out.append({
                         "symbol": sym,
                         "lastPrice": str(row.get("last", 0)),
@@ -148,11 +151,9 @@ def tickers_from_cache_or_rest() -> List[Dict[str, Any]]:
                         "volume":      str(row.get("volume", 0)),
                         "quoteVolume": str(row.get("quoteVolume", 0)),
                         "priceChangePercent": str(row.get("priceChangePercent", 0)),
-                        "priceChange":        str(row.get("priceChange", 0)),
-                        "weightedAvgPrice":   str(row.get("weightedAvgPrice", 0)),
-                        "count":              int(row.get("count", 0) or 0),
-                        "bidPrice": str(row.get("bidPrice", 0)),
-                        "askPrice": str(row.get("askPrice", 0)),
+                        # `count` not available from miniTicker stream;
+                        # callers that need it should use the slow-tick
+                        # REST path (see tick loop wiring in main()).
                     })
                 return out
         except Exception as exc:
@@ -971,10 +972,10 @@ def main() -> None:
     if _get_tickers_cache is not None:
         try:
             cache = _get_tickers_cache()
-            cache.start(wait_for_first_frame_seconds=10.0)
-            log.info("[LMC] 📡 TickersCache (!ticker@arr WS) started — "
-                     "REST /api/v3/ticker/24hr poll disabled, "
-                     f"saved ~560 weight/min. First frame: {len(cache.get_all())} symbols seen.")
+            cache.start(wait_for_first_frame_seconds=8.0)
+            log.info(f"[LMC] 📡 TickersCache WS started — flash ticks use cache "
+                     f"(saves 480 weight/min), slow ticks still REST for trade_count. "
+                     f"First frame: {len(cache.get_all())} symbols.")
         except Exception as exc:
             log.warning(f"[LMC] TickersCache start failed: {exc} — will use REST fallback")
     elif _TICKERS_CACHE_IMPORT_ERR:
@@ -993,10 +994,11 @@ def main() -> None:
             # tick (default 5s) so sudden dumps surface within ~5s.
             do_slow = (tick_count % SLOW_EVERY_N_TICKS == 0)
 
-            # iter 100 — read tickers from WS cache (zero REST weight); only
-            # falls back to /api/v3/ticker/24hr on cold start before the
-            # first WS frame arrives.
-            tickers = tickers_from_cache_or_rest()
+            # iter 100 / iter 101 — Flash ticks: WS cache (zero REST weight,
+            # no trade_count). Slow ticks: REST so trade_surge gate still
+            # works. Result: flash saves 480 weight/min, slow stays at
+            # 80 weight/min (every 30s).
+            tickers = tickers_from_cache_or_rest(prefer_rest_for_trade_count=do_slow)
             if not tickers:
                 log.warning("[LMC] no tickers — skipping tick")
                 time.sleep(POLL_INTERVAL_S)

@@ -8,7 +8,7 @@ python-engine consolidation. Public API unchanged so callers in the
 sentiment engine keep working via the compatibility shim at the old
 path.
 
-Subscribes once to the public ``!ticker@arr`` stream and keeps a
+Subscribes once to the public ``!miniTicker@arr`` stream and keeps a
 per-symbol dict updated every second. Reads are O(1) and don't hit
 Binance.
 
@@ -17,23 +17,23 @@ Designed for synchronous Python daemons that previously called
 daemon thread with its own asyncio event loop; consumers call
 ``start()`` once and read.
 
-iter 100 — upgraded from !miniTicker@arr to !ticker@arr to expose the
-full 24h ticker payload (priceChangePercent + total trade count), so
-the LMC detector can replace its REST `/api/v3/ticker/24hr` polling.
-Existing consumers (vp_history, profit_020_trend_analyzer) only read
-the price fields and continue working unchanged.
+iter 100 / iter 101 — initially tried !ticker@arr for the richer
+payload (priceChangePercent + trade count), but Binance does not push
+that stream reliably (confirmed via raw WS test: 0 frames in 8s vs
+!miniTicker@arr which pushes ~600 entries every second).  Reverted
+to !miniTicker@arr.  Derived priceChangePercent is computed by the
+consumer as (last - open) / open * 100 — accurate to the spec.  Trade
+count (n) isn't in this payload; callers that need it should still hit
+REST sparingly (e.g. LMC's slow path every 30s).
 
-Cached fields per symbol (mirroring the !ticker@arr payload):
-    last                  — close (last) price (c)
-    open                  — 24h open price (o)
-    high                  — 24h high (h)
-    low                   — 24h low (l)
-    volume                — 24h base-asset volume (v)
-    quoteVolume           — 24h quote-asset (USDT) volume (q)
-    priceChangePercent    — 24h % change (P) — iter 100
-    count                 — total trade count over the 24h window (n) — iter 100
-    weightedAvgPrice      — VWAP over the 24h window (w) — iter 100
-    ts                    — last update wall-clock time (epoch seconds)
+Cached fields per symbol (mirroring the !miniTicker@arr payload):
+    last         — close (last) price (c)
+    open         — 24h open price (o)
+    high         — 24h high (h)
+    low          — 24h low (l)
+    volume       — 24h base-asset volume (v)
+    quoteVolume  — 24h quote-asset (USDT) volume (q)
+    ts           — last update wall-clock time (epoch seconds)
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ import websockets
 
 logger = logging.getLogger("booknow.tickers_cache")
 
-WS_URL = "wss://stream.binance.com:9443/ws/!ticker@arr"   # iter 100
+WS_URL = "wss://stream.binance.com:9443/ws/!miniTicker@arr"   # iter 101 (was !ticker@arr in iter100 — does not push reliably)
 
 
 class TickersCache:
@@ -136,7 +136,7 @@ class TickersCache:
                     ssl=ssl_ctx,
                     max_size=8 * 1024 * 1024,
                 ) as ws:
-                    logger.info("[TickersCache] WS connected to !miniTicker@arr")
+                    logger.info("[TickersCache] WS connected to %s", WS_URL.rsplit("/", 1)[-1])  # iter 100
                     backoff = 2
                     async for raw in ws:
                         if not self._running:
@@ -165,22 +165,21 @@ class TickersCache:
                 if not sym:
                     continue
                 try:
-                    # iter 100 — !ticker@arr payload has 17+ fields.
-                    # We expose the commonly-used ones plus the LMC-required
-                    # priceChangePercent (P) and count (n).
+                    # iter 101 — !miniTicker@arr payload (7 numeric fields).
+                    # priceChangePercent is computed by consumers as
+                    # (last - open) / open * 100.  Trade count is not
+                    # in this stream; LMC's slow tick still hits REST.
+                    last = float(t.get("c", 0))
+                    op   = float(t.get("o", 0))
+                    pct  = ((last - op) / op * 100.0) if op > 0 else 0.0
                     self._cache[sym] = {
-                        "last":               float(t.get("c", 0)),
-                        "open":               float(t.get("o", 0)),
+                        "last":               last,
+                        "open":               op,
                         "high":               float(t.get("h", 0)),
                         "low":                float(t.get("l", 0)),
                         "volume":             float(t.get("v", 0)),    # base-asset 24h volume
                         "quoteVolume":        float(t.get("q", 0)),    # quote-asset 24h volume (USDT for *USDT pairs)
-                        "priceChangePercent": float(t.get("P", 0)),    # 24h % change — iter 100
-                        "priceChange":        float(t.get("p", 0)),    # 24h price change — iter 100
-                        "weightedAvgPrice":   float(t.get("w", 0)),    # 24h VWAP — iter 100
-                        "count":              int(t.get("n", 0)),      # 24h total trade count — iter 100
-                        "bidPrice":           float(t.get("b", 0)),    # best bid — iter 100
-                        "askPrice":           float(t.get("a", 0)),    # best ask — iter 100
+                        "priceChangePercent": pct,                     # iter 101 — derived
                         "ts": now,
                     }
                 except (TypeError, ValueError):
