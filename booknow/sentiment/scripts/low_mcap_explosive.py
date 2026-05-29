@@ -168,6 +168,12 @@ def tickers_from_cache_or_rest(prefer_rest_for_trade_count: bool = False) -> Lis
 # tick interval, with at least some real volume.  This catches sudden
 # drops that the 5m-window gate would miss for another 30-60 seconds.
 _PREV_TICKERS: Dict[str, Tuple[float, float, float]] = {}
+
+# iter 103 — separate snapshot for INSTANT_PUMP detector so it can scan
+# the FULL ticker universe (not just LMC candidates) without interfering
+# with the flash-dump path's per-LMC-candidate snapshot.  Memory cost
+# is trivial (~600 symbols × 24 bytes).
+_PREV_TICKERS_IP: Dict[str, Tuple[float, float, float]] = {}
 BACKEND_BASE = os.getenv("BOOKNOW_BACKEND_BASE", "http://backend:8083")
 BINANCE_BASE = "https://api.binance.com"
 
@@ -720,6 +726,35 @@ def set_flash_cooldown(r: redis.Redis, symbol: str, ttl_s: int) -> None:
         pass
 
 
+# iter 103 — separate cooldown for INSTANT_PUMP detector (5 min default).
+def instant_pump_cooldown_active(r: redis.Redis, symbol: str) -> bool:
+    try:
+        return bool(r.get(f"INSTANT_PUMP:COOLDOWN:{symbol}"))
+    except Exception:
+        return False
+
+
+def set_instant_pump_cooldown(r: redis.Redis, symbol: str, ttl_s: int) -> None:
+    try:
+        r.setex(f"INSTANT_PUMP:COOLDOWN:{symbol}", ttl_s, "1")
+    except Exception:
+        pass
+
+
+def publish_instant_pump(r: redis.Redis, event: Dict[str, Any]) -> None:
+    """iter 103 — publish to dedicated INSTANT_PUMP namespace so the
+    dashboard can render it as a separate signal kind."""
+    try:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        payload = json.dumps(event)
+        r.rpush(f"INSTANT_PUMP:DETECTIONS:{date}", payload)
+        r.ltrim(f"INSTANT_PUMP:DETECTIONS:{date}", -1000, -1)
+        r.expire(f"INSTANT_PUMP:DETECTIONS:{date}", 14 * 24 * 3600)
+        r.hset("INSTANT_PUMP:LATEST", event["symbol"], payload)
+    except Exception as exc:
+        log.debug(f"[INSTANT_PUMP] publish failed for {event.get('symbol')}: {exc}")
+
+
 def publish_detection(r: redis.Redis, event: Dict[str, Any]) -> None:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
@@ -883,6 +918,96 @@ def detect_flash_dump(ticker: Dict[str, Any],
     }
 
 
+# ── iter 103 ──────────────────────────────────────────────────────────────
+# INSTANT_PUMP detector — catches the "1-second buy-wall hit" pattern.
+#
+# Real example that motivated this iter: IOUSDT 2026-05-29 14:30:00.000 IST.
+# Coin was dormant ($4K vol in prior 60s).  At 14:30:00.000 sharp a
+# coordinated pump fired: $383K vol in ONE second, price jumped
+# $0.16330 → $0.20540 (+25.8% in 5s).  Existing detectors all missed
+# the moment — by the time their windows aggregated the move was over.
+#
+# This detector runs every tick (1Hz, from WS TickersCache).  Compares
+# the current ticker against the snapshot from the prior tick.  Fires
+# INSTANT_PUMP if:
+#   1. price moved UP >= ipMinChgPct (default 1.0%) since prior tick
+#   2. quoteVolume delta >= ipMinVolDeltaUsd (default $50,000)
+#   3. window dt <= 5s (recent comparison, not stale)
+#
+# Runs on a wide universe — every USDT pair with any 24h volume — so
+# new listings and obscure coins get covered too.
+# ──────────────────────────────────────────────────────────────────────────
+
+def detect_instant_pump(ticker: Dict[str, Any], cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    sym = ticker.get("symbol")
+    if not sym:
+        return None
+    try:
+        last_price = float(ticker.get("lastPrice") or 0)
+        cur_vol    = float(ticker.get("quoteVolume") or 0)
+        chg_24h    = float(ticker.get("priceChangePercent") or 0)
+    except (TypeError, ValueError):
+        return None
+    if last_price <= 0:
+        return None
+
+    now_s = time.time()
+    # Use OWN snapshot dict (separate from flash-dump's) so we can
+    # scan the full ticker universe regardless of LMC candidacy.
+    prev = _PREV_TICKERS_IP.get(sym)
+    _PREV_TICKERS_IP[sym] = (now_s, last_price, cur_vol)
+    if prev is None:
+        return None
+    prev_ts, prev_price, prev_vol = prev
+    dt = now_s - prev_ts
+    if dt <= 0 or dt > 5:        # stale snapshot — skip
+        return None
+    if prev_price <= 0:
+        return None
+
+    price_chg_pct = (last_price - prev_price) / prev_price * 100.0
+    vol_delta = cur_vol - prev_vol
+
+    ip_min_chg = float(cfg.get("ipMinChgPct", 1.0))
+    ip_min_vol = float(cfg.get("ipMinVolDeltaUsd", 50_000.0))
+
+    # PUMP direction only — instant DUMPs are covered by flash-dump path.
+    if price_chg_pct < ip_min_chg:
+        return None
+    if vol_delta < ip_min_vol:
+        return None
+
+    # Score: 50 base + 5 pts per 1% price chg + 1 pt per $10K vol delta.
+    score = round(min(100.0,
+                      50.0
+                      + price_chg_pct * 5.0
+                      + (vol_delta / 10_000.0)), 1)
+
+    # Per-second equivalents make the magnitude readable.
+    chg_per_s = price_chg_pct / max(dt, 0.001)
+    vol_per_s = vol_delta / max(dt, 0.001)
+
+    return {
+        "symbol": sym,
+        "ts": int(now_s * 1000),
+        "kind": "instant_pump",          # for FE alerts feed
+        "label": "INSTANT_PUMP",
+        "score": score,
+        "direction": "PUMP",
+        "trigger_price": last_price,
+        "prev_price":    prev_price,
+        "price_chg_pct": round(price_chg_pct, 3),
+        "chg_per_sec":   round(chg_per_s, 3),
+        "window_s":      round(dt, 2),
+        "vol_delta_usd": round(vol_delta, 0),
+        "vol_per_sec":   round(vol_per_s, 0),
+        "prev_vol_usd":  round(prev_vol, 0),
+        "cur_vol_usd":   round(cur_vol, 0),
+        "chg_24h_pct":   round(chg_24h, 2),
+        "blocked_by": "manual-only-mode",  # operator decides manually
+    }
+
+
 # ── Outcome tracker ─────────────────────────────────────────────────────
 
 def fetch_last_price(r: redis.Redis, symbol: str) -> Optional[float]:
@@ -1017,7 +1142,51 @@ def main() -> None:
 
             fires = 0
             flash_fires = 0
+            ip_fires = 0
             flash_cd_s = int(cfg.get("lmcFlashCooldownSec", 300))   # iter93 — 5 min
+            ip_cd_s = int(cfg.get("ipCooldownSec", 300))           # iter103 — 5 min
+            ip_min_vol_baseline = float(cfg.get("ipMinVolBaselineUsdt", 10_000))
+
+            # ── Phase 1a: INSTANT_PUMP check (iter 103) ──────────────────
+            # Runs on EVERY USDT ticker (full universe, not just LMC
+            # candidates) so freshly-pumped coins like IOUSDT 14:30:00
+            # get caught within ~1-2s of the pump.  Ticker-only — no
+            # extra Binance calls.
+            for t in tickers:
+                sym = t.get("symbol", "")
+                if not sym.endswith("USDT"):
+                    continue
+                if instant_pump_cooldown_active(r, sym):
+                    # Still update snapshot so the next post-cooldown
+                    # tick has a fresh prev to compare against.
+                    try:
+                        last_price = float(t.get("lastPrice") or 0)
+                        cur_vol_now = float(t.get("quoteVolume") or 0)
+                        if last_price > 0:
+                            _PREV_TICKERS_IP[sym] = (time.time(), last_price, cur_vol_now)
+                    except Exception:
+                        pass
+                    continue
+                # Skip dust coins so spam stays low.
+                try:
+                    if float(t.get("quoteVolume") or 0) < ip_min_vol_baseline:
+                        continue
+                except Exception:
+                    continue
+                try:
+                    ip_evt = detect_instant_pump(t, cfg)
+                except Exception as exc:
+                    log.debug(f"[INSTANT_PUMP] check {sym} error: {exc}")
+                    ip_evt = None
+                if ip_evt is not None:
+                    publish_instant_pump(r, ip_evt)
+                    ip_fires += 1
+                    set_instant_pump_cooldown(r, sym, ip_cd_s)
+                    log.info(
+                        f"[INSTANT_PUMP] 💥 {sym} +{ip_evt['price_chg_pct']}% in "
+                        f"{ip_evt['window_s']}s vol_delta=${ip_evt['vol_delta_usd']:,.0f} "
+                        f"score={ip_evt['score']}"
+                    )
 
             # ── Phase 1: FLASH dump check on every candidate (every tick) ─
             # Ticker-only — no per-candidate Binance calls — completes in
@@ -1095,7 +1264,7 @@ def main() -> None:
                     set_cooldown(r, sym, int(cfg.get("lmcCooldownSec", 1800)))
 
                 log.info(f"[LMC] tick complete — {fires} slow + {flash_fires} flash "
-                         f"(cache={len(daily_cache)} symbols)")
+                         f"+ {ip_fires} instant-pump (cache={len(daily_cache)} symbols)")
             else:
                 # iter 98 — quiet flash-only tick; one-line log so we don't
                 # spam at 5s cadence.  Only emits when something fires.
