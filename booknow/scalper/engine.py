@@ -125,6 +125,8 @@ class ScalperEngine:
             "running": self._running,
             "connected": self.stream.connected,
             "symbols": self.config.symbols,
+            "tiers": self.config.tiers,
+            "tier_order": self.config.tier_order,
             "started_at": self.started_at,
             "uptime_sec": round(time.time() - self.started_at, 1) if self.started_at else 0,
             "last_message_age_sec": round(time.time() - self.stream.last_message_ts, 2)

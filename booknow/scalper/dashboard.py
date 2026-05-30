@@ -30,6 +30,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   .dot.off { background:var(--red); }
   main { padding:24px; max-width:1400px; margin:0 auto; }
   .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(380px,1fr)); gap:18px; }
+  .tier { margin-bottom:26px; }
+  .tier-head { display:flex; align-items:baseline; gap:12px; margin:18px 0 10px; border-bottom:1px solid var(--border); padding-bottom:6px; }
+  .tier-head h2 { font-size:15px; margin:0; font-weight:700; letter-spacing:.3px; }
+  .tier-meta { font-size:12px; color:var(--muted); }
   .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:18px; transition:border-color .2s; }
   .card.BUY { border-color:var(--green); box-shadow:0 0 0 1px var(--green) inset; }
   .card.SELL { border-color:var(--red); box-shadow:0 0 0 1px var(--red) inset; }
@@ -78,7 +82,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </header>
 <main>
-  <div id="grid" class="grid"></div>
+  <div id="groups"></div>
   <div class="sidebar">
     <div class="section-title">Recent Signals</div>
     <table class="log">
@@ -146,6 +150,30 @@ function renderLog(signals){
     <td>${s.metrics?s.metrics.delta:"—"}</td><td>${s.metrics?s.metrics.volume_ratio+"×":"—"}</td></tr>`
   ).join("")||'<tr><td colspan="6" class="muted">No signals yet…</td></tr>';
 }
+function renderGroups(snaps, status){
+  status = status || {};
+  const tierOrder = (status.tier_order && status.tier_order.length) ? status.tier_order.slice() : [];
+  const tierSyms = status.tiers || {};
+  const groups = {};
+  snaps.forEach(s => { const t = s.market_cap_tier || "Other"; (groups[t] = groups[t] || []).push(s); });
+  const order = tierOrder.slice();
+  Object.keys(groups).forEach(t => { if(!order.includes(t)) order.push(t); });
+  return order.filter(t => groups[t] && groups[t].length).map(t => {
+    const ref = tierSyms[t] || [];
+    const items = groups[t].sort((a,b) => {
+      const ia = ref.indexOf(a.symbol), ib = ref.indexOf(b.symbol);
+      return ((ia<0?1e9:ia) - (ib<0?1e9:ib)) || a.symbol.localeCompare(b.symbol);
+    });
+    const buys = items.filter(s=>s.signal==="BUY").length;
+    const sells = items.filter(s=>s.signal==="SELL").length;
+    return `<section class="tier">
+      <div class="tier-head"><h2>${t}</h2>
+        <span class="tier-meta">${items.length} coins · <span class="pos">${buys} BUY</span> · <span class="neg">${sells} SELL</span></span>
+      </div>
+      <div class="grid">${items.map(renderCard).join("")}</div>
+    </section>`;
+  }).join("");
+}
 function update(data){
   const st=data.status||{};
   document.getElementById("dot").className="dot "+(st.connected?"on":"off");
@@ -153,8 +181,8 @@ function update(data){
   document.getElementById("uptime").textContent="uptime "+(st.uptime_sec||0)+"s";
   if(st.config){ document.getElementById("cfg").textContent=
     `win ${st.config.window_sec}s · wall ${st.config.wall_multiple}× · spike ${st.config.volume_spike_multiple}×`; }
-  const snaps=(data.snapshots||[]).sort((a,b)=>a.symbol.localeCompare(b.symbol));
-  document.getElementById("grid").innerHTML=snaps.map(renderCard).join("");
+  const snaps=(data.snapshots||[]);
+  document.getElementById("groups").innerHTML=renderGroups(snaps, st)||'<div class="muted">Waiting for the first snapshot…</div>';
   renderLog(data.signals||[]);
 }
 function connect(){

@@ -215,6 +215,7 @@ class OrderFlowAnalyzer:
             "symbol": self.symbol,
             "timestamp": now,
             "last_price": self.last_price,
+            "market_cap_tier": self.config.tier_of(self.symbol),
             "signal": signal,
             "buy_score": sum(buy_conditions.values()),
             "buy_score_max": len(buy_conditions),
