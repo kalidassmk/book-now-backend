@@ -53,6 +53,7 @@ from booknow.binance.ws_api import WsApiClient
 from booknow.binance.ws_streams import MarketStreamService
 from booknow.config.settings import get_settings
 from booknow.scalper import ScalperEngine
+from booknow.util.momentum import DEFAULT_DELIST_SEED
 from booknow.processors.fast_analyse import FastAnalyse
 from booknow.processors.fast_move_filter import FastMoveFilter
 from booknow.processors.time_analyser import TimeAnalyser
@@ -166,9 +167,15 @@ async def _bootstrap() -> None:
     # Streams market buys/sells + order book for a small symbol set and emits
     # BUY/SELL/HOLD from the scalper order-flow checklist. Snapshots are read
     # by /api/v1/scalper/* and the dashboard's Order Flow tab.
-    scalper_engine = ScalperEngine()
+    # Block genuinely-delisted coins (scraped Binance announcements) — but NOT
+    # the legacy skip seed, which wrongly contains BTC/ETH.
+    scalper_blocked = await delist_service.get_set() - set(DEFAULT_DELIST_SEED)
+    scalper_engine = ScalperEngine(blocked=scalper_blocked)
     await scalper_engine.start()
-    log.info("  scalper-engine task started")
+    log.info(
+        "  scalper-engine task started (%d active, %d blocked as delisted)",
+        len(scalper_engine.config.symbols), len(scalper_engine.blocked_symbols),
+    )
 
     # ── Phase 8: four processor loops ────────────────────────────────
     # All four read what market_stream writes and emit derived signals

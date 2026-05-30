@@ -28,7 +28,9 @@ from fastapi.responses import HTMLResponse
 
 from booknow.api.deps import get_state
 from booknow.api.state import AppState
+from booknow.repository import redis_keys
 from booknow.scalper.dashboard import DASHBOARD_HTML
+from booknow.util.momentum import DEFAULT_DELIST_SEED
 
 
 router = APIRouter(prefix="/api/v1/scalper", tags=["scalper"])
@@ -66,6 +68,42 @@ async def scalper_signals(
     state: AppState = Depends(get_state),
 ):
     return {"success": True, "signals": _engine(state).recent_signals(limit)}
+
+
+@router.get("/delisted")
+async def scalper_delisted(state: AppState = Depends(get_state)):
+    """Binance delist details + which scalper coins are blocked (for verification).
+
+    - ``scraped_delisted``: live ``BINANCE:DELIST:*`` from Redis — real delistings
+      derived from Binance announcements. These are what the scalper blocks.
+    - ``legacy_skip_seed``: the static ``DEFAULT_DELIST_SEED`` skip list (contains
+      BTC/ETH and is NOT applied to the scalper) — shown only for reference.
+    - ``scalper``: configured vs. active vs. blocked symbols.
+    """
+    engine = _engine(state)
+    prefix = redis_keys.DELIST_PREFIX
+    scraped = []
+    try:
+        keys = await state.redis.keys(f"{prefix}*")
+        scraped = sorted(
+            (k.split(prefix, 1)[1] if prefix in k else k) for k in keys
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("delisted: redis scan failed: %s", e)
+
+    return {
+        "success": True,
+        "scraped_delisted": scraped,
+        "scraped_count": len(scraped),
+        "legacy_skip_seed": sorted(DEFAULT_DELIST_SEED),
+        "scalper": {
+            "configured": engine.configured_symbols,
+            "active": engine.config.symbols,
+            "blocked": engine.blocked_symbols,
+            "active_count": len(engine.config.symbols),
+            "blocked_count": len(engine.blocked_symbols),
+        },
+    }
 
 
 @router.websocket("/ws")
