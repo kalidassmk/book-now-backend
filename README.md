@@ -37,6 +37,7 @@ python-engine/
     ├── sentiment/           # market_engine, volume_price, profit_020_trend, etc.
     ├── subsystems/          # risk_management, fakeout_detector, volume_profile,
     │                        # trend_alignment, meta_model
+    ├── scalper/             # order-flow scalper: WS stream + analyzer + engine
     └── api/                 # FastAPI routes for the dashboard
 ```
 
@@ -95,6 +96,47 @@ Wherever a stream exists, the engine uses it. REST is reserved for:
 
 Order placement uses the **WebSocket API** (`wss://ws-api.binance.com/ws-api/v3`),
 not REST. Lower latency on +$0.20 scalps.
+
+## Order-flow scalper
+
+`booknow/scalper/` adds a real-time **order-flow scalping** algorithm. It opens
+one combined Binance websocket (`aggTrade` + `depth`) for a small set of symbols
+and continuously evaluates the scalper order-flow checklist, emitting
+**BUY / SELL / HOLD** per symbol. It starts/stops with the engine (no separate
+process) and its snapshots are served by the API and a built-in dashboard.
+
+**Before BUYING (all must hold):** delta turning positive · market buys
+increasing · buy wall below price · no large sell wall above · volume spike.
+**Before SELLING (all must hold):** delta negative · market sells increasing ·
+large sell wall above · buy wall disappears. Otherwise **HOLD**.
+
+How each condition is derived:
+
+| Condition | Definition |
+|---|---|
+| Delta | `buy_volume − sell_volume` over the rolling window (default 5s); on `aggTrade`, `m=false` → market buy, `m=true` → market sell |
+| Delta turning positive / negative | current delta crosses 0 **and** rises / falls vs. the previous window |
+| Market buys/sells increasing | window buy/sell volume greater than the previous window |
+| Buy / sell wall | a book level ≥ `wall_multiple` × the average level size on that side (default 3×) |
+| Buy wall disappears | a buy wall was present last tick and is now gone |
+| Volume spike | window volume ≥ `volume_spike_multiple` × average per-window volume over the baseline (default 2× over 60s) |
+
+Endpoints (mounted on the same FastAPI port, default `8083`):
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/v1/scalper/status` | Engine + connection status and config |
+| GET | `/api/v1/scalper/snapshots` | Latest order-flow snapshot for every symbol |
+| GET | `/api/v1/scalper/snapshot/{symbol}` | Snapshot for one symbol |
+| GET | `/api/v1/scalper/signals?limit=50` | Recent BUY/SELL signal log |
+| WS | `/api/v1/scalper/ws` | Live push of status + snapshots + signals (1 Hz) |
+| GET | `/api/v1/scalper/dashboard` | Self-contained live dashboard (HTML) |
+
+Tunable via env vars: `SCALPER_SYMBOLS` (default `BTCUSDT,ETHUSDT,SOLUSDT`),
+`SCALPER_WINDOW_SEC`, `SCALPER_BASELINE_SEC`, `SCALPER_WALL_MULTIPLE`,
+`SCALPER_VOLUME_SPIKE_MULTIPLE`, `SCALPER_MIN_TRADES`, `SCALPER_DEPTH_LEVELS`.
+
+Offline tests (no network): `python -m pytest tests/test_scalper_order_flow.py`.
 
 ## Development notes
 
