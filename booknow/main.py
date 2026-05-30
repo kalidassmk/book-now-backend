@@ -52,6 +52,7 @@ from booknow.binance.user_data import UserDataStreamService
 from booknow.binance.ws_api import WsApiClient
 from booknow.binance.ws_streams import MarketStreamService
 from booknow.config.settings import get_settings
+from booknow.scalper import ScalperEngine
 from booknow.processors.fast_analyse import FastAnalyse
 from booknow.processors.fast_move_filter import FastMoveFilter
 from booknow.processors.time_analyser import TimeAnalyser
@@ -160,6 +161,14 @@ async def _bootstrap() -> None:
     )
     await market_stream.start()
     log.info("  market-stream task started")
+
+    # ── Order-flow scalper (always on, public aggTrade + depth streams) ──
+    # Streams market buys/sells + order book for a small symbol set and emits
+    # BUY/SELL/HOLD from the scalper order-flow checklist. Snapshots are read
+    # by /api/v1/scalper/* and the dashboard's Order Flow tab.
+    scalper_engine = ScalperEngine()
+    await scalper_engine.start()
+    log.info("  scalper-engine task started")
 
     # ── Phase 8: four processor loops ────────────────────────────────
     # All four read what market_stream writes and emit derived signals
@@ -546,6 +555,7 @@ async def _bootstrap() -> None:
         balance_service=balance_service,  # None in paper mode, set in live
         dust_service=dust_service,
         coin_analyzer=coin_analyzer,
+        scalper_engine=scalper_engine,
     )
     fastapi_app = build_app(app_state)
     http_server = HttpServer(fastapi_app, host="0.0.0.0", port=settings.http_port)
@@ -613,6 +623,10 @@ async def _bootstrap() -> None:
             await market_stream.stop()
         except Exception as e:
             log.warning("  market-stream stop error: %s", e)
+        try:
+            await scalper_engine.stop()
+        except Exception as e:
+            log.warning("  scalper-engine stop error: %s", e)
         # Subsystem registry: closes its KlinesCache WS + httpx client.
         # Safe to do here — nothing in the trade core depends on it.
         try:
