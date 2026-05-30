@@ -28,10 +28,33 @@ logger = logging.getLogger("booknow.scalper.engine")
 class ScalperEngine:
     """Boot, run, and tear down the order-flow analysis fleet."""
 
-    def __init__(self, config: Optional[ScalperConfig] = None):
+    def __init__(
+        self,
+        config: Optional[ScalperConfig] = None,
+        blocked: Optional[set] = None,
+    ):
         self.config = config or ScalperConfig()
+
+        # Block delisted coins: never stream or analyze them. ``blocked`` holds
+        # genuinely-delisted symbols (scraped Binance announcements) — NOT the
+        # legacy skip seed, which wrongly contains BTC/ETH.
+        self.blocked_set = {b.upper() for b in (blocked or set())}
+        self.configured_symbols: List[str] = list(self.config.symbols)
+        self.blocked_symbols: List[str] = [
+            s for s in self.configured_symbols if s in self.blocked_set
+        ]
+        active = [s for s in self.configured_symbols if s not in self.blocked_set]
+
+        # Filter the live config so the stream + analyzers only cover active
+        # symbols, and drop blocked coins from each tier so the UI hides them.
+        self.config.symbols = active
+        self.config.tiers = {
+            label: [s for s in syms if s not in self.blocked_set]
+            for label, syms in self.config.tiers.items()
+        }
+
         self.analyzers: Dict[str, OrderFlowAnalyzer] = {
-            sym: OrderFlowAnalyzer(sym, self.config) for sym in self.config.symbols
+            sym: OrderFlowAnalyzer(sym, self.config) for sym in active
         }
         self.stream = OrderFlowStreamService(self.config, self._on_event)
         self._eval_task: Optional[asyncio.Task] = None
@@ -125,6 +148,8 @@ class ScalperEngine:
             "running": self._running,
             "connected": self.stream.connected,
             "symbols": self.config.symbols,
+            "configured_symbols": self.configured_symbols,
+            "blocked_symbols": self.blocked_symbols,
             "tiers": self.config.tiers,
             "tier_order": self.config.tier_order,
             "started_at": self.started_at,
