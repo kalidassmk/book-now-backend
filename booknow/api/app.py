@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from booknow.api.routes_binance import router as binance_router
 from booknow.api.routes_config import router as config_router
+from booknow.api.routes_scalper import router as scalper_router
 from booknow.api.routes_trading import router as trading_router
 from booknow.api.routes_wallet import router as wallet_router
 from booknow.api.state import AppState
@@ -59,6 +60,7 @@ def build_app(state: AppState) -> FastAPI:
     app.include_router(binance_router)
     app.include_router(wallet_router)
     app.include_router(config_router)
+    app.include_router(scalper_router)
 
     @app.get("/", tags=["meta"])
     async def root():
@@ -75,6 +77,8 @@ def build_app(state: AppState) -> FastAPI:
                 "/api/v1/binance/btc-price",
                 "/api/wallet/balances",
                 "/api/wallet/dust",
+                "/api/v1/scalper/snapshots",
+                "/api/v1/scalper/dashboard",
             ],
         }
 
