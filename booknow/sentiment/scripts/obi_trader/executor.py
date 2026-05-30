@@ -16,7 +16,7 @@ class ExecutionManager:
     Handles Binance orders and account balance.
     Supports Live and Paper trading modes.
     """
-    def __init__(self, api_key="", api_secret="", live=False, trade_amount_usdt=100.0):
+    def __init__(self, api_key="", api_secret="", live=False, trade_amount_usdt=30.0):
         self.api_key = api_key
         self.api_secret = api_secret
         self.live = live
@@ -37,16 +37,22 @@ class ExecutionManager:
             self.position = {"symbol": symbol, "entry_price": price, "qty": qty, "time": time.time()}
             log.info(f"📝 [PAPER BUY] {symbol} @ {price} | Walls nearby: {walls}")
 
+    # iter 94 — HARD KILL SWITCH for OBI trader SELLs.
+    HARD_DISABLE_AUTOSELL: bool = True
+
     def close_position(self, symbol, price, reason):
         if not self.position:
             return
 
         entry_price = self.position['entry_price']
         pnl_pct = (price - entry_price) / entry_price * 100
-        
-        if self.live:
+
+        if self.live and not self.HARD_DISABLE_AUTOSELL:
             side = "SELL"
             self._place_order(symbol, side, self.position['qty'])
+        elif self.HARD_DISABLE_AUTOSELL:
+            # iter 94 — record block to dashboard feed.
+            log.warning(f"[OBI] close_position {symbol} @ {price} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
         
         emoji = "🟢" if pnl_pct > 0 else "🔴"
         log.info(f"{emoji} [TRADE CLOSED] {symbol} @ {price} | PnL: {pnl_pct:.2f}% | Reason: {reason}")

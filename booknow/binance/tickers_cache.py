@@ -17,13 +17,22 @@ Designed for synchronous Python daemons that previously called
 daemon thread with its own asyncio event loop; consumers call
 ``start()`` once and read.
 
+iter 100 / iter 101 — initially tried !ticker@arr for the richer
+payload (priceChangePercent + trade count), but Binance does not push
+that stream reliably (confirmed via raw WS test: 0 frames in 8s vs
+!miniTicker@arr which pushes ~600 entries every second).  Reverted
+to !miniTicker@arr.  Derived priceChangePercent is computed by the
+consumer as (last - open) / open * 100 — accurate to the spec.  Trade
+count (n) isn't in this payload; callers that need it should still hit
+REST sparingly (e.g. LMC's slow path every 30s).
+
 Cached fields per symbol (mirroring the !miniTicker@arr payload):
-    last         — close (last) price
-    open         — 24h open price
-    high         — 24h high
-    low          — 24h low
-    volume       — 24h base-asset volume
-    quoteVolume  — 24h quote-asset (USDT) volume
+    last         — close (last) price (c)
+    open         — 24h open price (o)
+    high         — 24h high (h)
+    low          — 24h low (l)
+    volume       — 24h base-asset volume (v)
+    quoteVolume  — 24h quote-asset (USDT) volume (q)
     ts           — last update wall-clock time (epoch seconds)
 """
 
@@ -41,7 +50,7 @@ import websockets
 
 logger = logging.getLogger("booknow.tickers_cache")
 
-WS_URL = "wss://stream.binance.com:9443/ws/!miniTicker@arr"
+WS_URL = "wss://stream.binance.com:9443/ws/!miniTicker@arr"   # iter 101 (was !ticker@arr in iter100 — does not push reliably)
 
 
 class TickersCache:
@@ -127,7 +136,7 @@ class TickersCache:
                     ssl=ssl_ctx,
                     max_size=8 * 1024 * 1024,
                 ) as ws:
-                    logger.info("[TickersCache] WS connected to !miniTicker@arr")
+                    logger.info("[TickersCache] WS connected to %s", WS_URL.rsplit("/", 1)[-1])  # iter 100
                     backoff = 2
                     async for raw in ws:
                         if not self._running:
@@ -156,13 +165,21 @@ class TickersCache:
                 if not sym:
                     continue
                 try:
+                    # iter 101 — !miniTicker@arr payload (7 numeric fields).
+                    # priceChangePercent is computed by consumers as
+                    # (last - open) / open * 100.  Trade count is not
+                    # in this stream; LMC's slow tick still hits REST.
+                    last = float(t.get("c", 0))
+                    op   = float(t.get("o", 0))
+                    pct  = ((last - op) / op * 100.0) if op > 0 else 0.0
                     self._cache[sym] = {
-                        "last":         float(t.get("c", 0)),
-                        "open":         float(t.get("o", 0)),
-                        "high":         float(t.get("h", 0)),
-                        "low":          float(t.get("l", 0)),
-                        "volume":       float(t.get("v", 0)),  # base-asset volume
-                        "quoteVolume":  float(t.get("q", 0)),  # quote-asset volume (USDT for *USDT pairs)
+                        "last":               last,
+                        "open":               op,
+                        "high":               float(t.get("h", 0)),
+                        "low":                float(t.get("l", 0)),
+                        "volume":             float(t.get("v", 0)),    # base-asset 24h volume
+                        "quoteVolume":        float(t.get("q", 0)),    # quote-asset 24h volume (USDT for *USDT pairs)
+                        "priceChangePercent": pct,                     # iter 101 — derived
                         "ts": now,
                     }
                 except (TypeError, ValueError):

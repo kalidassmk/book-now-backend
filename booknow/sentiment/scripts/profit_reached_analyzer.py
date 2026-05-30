@@ -18,9 +18,12 @@ EVENTS_KEY         = "PROFIT_REACHED_020_EVENTS"      # NEW: append-only edge-tr
 STATE_KEY          = "PROFIT_020_STATE"               # NEW: durable per-symbol "above" marker for edge detection
 
 # ── Tunables ────────────────────────────────────────────────────────────
+# Aligned with operator's $30 small-scalp config (was $100 / $0.20).
+# PROFIT_THRESHOLD scaled proportionally: $0.06 on $30 = same 0.2 % move
+# the analyzer used to flag, just sized for the smaller trade.
 EVENTS_CAP        = 20_000
-BUY_AMOUNT_USDT   = 100.0
-PROFIT_THRESHOLD  = 0.20
+BUY_AMOUNT_USDT   = 30.0
+PROFIT_THRESHOLD  = 0.06
 LOOP_SLEEP_SEC    = 2
 
 

@@ -23,7 +23,7 @@ logging.basicConfig(
 log = logging.getLogger("OBITrader")
 
 class OBITraderEngine:
-    def __init__(self, symbol="BTCUSDT", live=False, trade_amount=100.0, redis_host=None):
+    def __init__(self, symbol="BTCUSDT", live=False, trade_amount=30.0, redis_host=None):
         if redis_host is None:
             redis_host = os.getenv("REDIS_HOST", "127.0.0.1")
         self.symbol = symbol.upper()

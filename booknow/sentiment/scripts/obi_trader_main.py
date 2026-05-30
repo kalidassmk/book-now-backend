@@ -16,7 +16,7 @@ log = logging.getLogger("obi_trader")
 async def main():
     parser = argparse.ArgumentParser(description="OBI Trader - Real-time Order Book Imbalance Bot")
     parser.add_argument("--symbol", default="BTCUSDT", help="Trading pair (default: BTCUSDT)")
-    parser.add_argument("--amount", type=float, default=100.0, help="Trade amount in USDT")
+    parser.add_argument("--amount", type=float, default=30.0, help="Trade amount in USDT")
     parser.add_argument("--live", action="store_true", help="Enable live trading")
     
     args = parser.parse_args()

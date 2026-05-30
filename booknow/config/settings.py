@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # Verbose logging (DEBUG vs INFO).
     debug: bool = Field(default=False, alias="BOOKNOW_DEBUG")
 
+    # ── Dashboard URL (iter 48) ─────────────────────────────────────────
+    # The python rules engine calls the dashboard's /api/check-coin
+    # endpoint to reuse its filter pipeline before placing buys. The
+    # dashboard runs as the `frontend` Docker Compose service; from the
+    # backend container the service-name DNS resolves it on port 3000.
+    dashboard_url: str = Field(
+        default="http://frontend:3000", alias="BOOKNOW_DASHBOARD_URL"
+    )
+
     # ── Sentiment-engine supervisor (Phase 12) ──────────────────────────
     # When True, the engine spawns the consolidated sentiment analyzers
     # (under ``booknow/sentiment/scripts/``, see Phase 19) as supervised

@@ -62,7 +62,7 @@ class BinanceExecutor:
     """
 
     def __init__(self, api_key: str = "", api_secret: str = "",
-                 live: bool = False, trade_amount_usdt: float = 100.0):
+                 live: bool = False, trade_amount_usdt: float = 30.0):
         self.api_key = api_key
         self.api_secret = api_secret
         self.live = live
@@ -224,7 +224,33 @@ class BinanceExecutor:
     def _place_market_buy(self, symbol: str, quantity: float) -> dict | None:
         return self._place_order(symbol, "BUY", quantity)
 
+    # iter 94 — HARD KILL SWITCH for all SELLs in this trader.
+    HARD_DISABLE_AUTOSELL: bool = True
+
     def _place_market_sell(self, symbol: str, quantity: float) -> dict | None:
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                import json as _json, time as _t
+                from datetime import datetime as _dt, timezone as _tz
+                date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+                ev = {
+                    "ts": int(_t.time() * 1000),
+                    "symbol": symbol,
+                    "kind": "regime_trader_sell",
+                    "source": "_place_market_sell",
+                    "reason": "regime_close",
+                    "quantity": float(quantity),
+                    "blocked_by": "HARD_DISABLE_AUTOSELL",
+                }
+                if hasattr(self, "r") and self.r is not None:
+                    payload = _json.dumps(ev)
+                    self.r.rpush(f"BOT_SELL_SIGNALS:{date}", payload)
+                    self.r.expire(f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+                    self.r.hset("BOT_SELL_SIGNALS:LATEST", symbol, payload)
+            except Exception:
+                pass
+            return None
         return self._place_order(symbol, "SELL", quantity)
 
     def _place_order(self, symbol: str, side: str, quantity: float) -> dict | None:

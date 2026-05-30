@@ -65,9 +65,9 @@ LOCAL_REDIS = {
     'decode_responses': True,
 }
 REMOTE_REDIS = {
-    'host': 'redis-18144.c89.us-east-1-3.ec2.cloud.redislabs.com',
-    'port': 18144,
-    'password': 'Gn9jKtL0SBkMLYynSjXbblmkjkIGrdPS',
+    'host': os.getenv("REDIS_ANALYSE_HOST", "redis-analyse"),
+    'port': int(os.getenv("REDIS_ANALYSE_PORT", "6379")),
+    'password': os.getenv("REDIS_ANALYSE_PASS") or None,
     'decode_responses': True,
 }
 

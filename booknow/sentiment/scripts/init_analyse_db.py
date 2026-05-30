@@ -1,14 +1,16 @@
+import os
 import redis
 import sys
 
 def init_db():
-    print("🚀 Initializing Remote Redis Cloud for Success Patterns (AnalyseDB)...")
-    
-    # Remote Redis Cloud Configuration
+    print("🚀 Initializing AnalyseDB Redis for Success Patterns...")
+
+    # AnalyseDB Redis configuration — env-driven; defaults to the
+    # on-EC2 redis-analyse container created in compose.
     REMOTE_REDIS = {
-        'host': 'redis-18144.c89.us-east-1-3.ec2.cloud.redislabs.com',
-        'port': 18144,
-        'password': 'Gn9jKtL0SBkMLYynSjXbblmkjkIGrdPS',
+        'host': os.getenv("REDIS_ANALYSE_HOST", "redis-analyse"),
+        'port': int(os.getenv("REDIS_ANALYSE_PORT", "6379")),
+        'password': os.getenv("REDIS_ANALYSE_PASS") or None,
         'decode_responses': True
     }
     

@@ -29,9 +29,16 @@ from typing import Any, Dict, Optional, Protocol
 
 import redis.asyncio as aioredis
 
+from booknow.config.trading_config import TradingConfigService
 from booknow.processors.base import AsyncProcessor
 from booknow.repository import redis_keys
 from booknow.trading.state import Position, TradeState
+from booknow.trading.trailing_tp import (
+    FloorSell,
+    MoveUp,
+    PumpTrailExit,
+    TrailingTakeProfit,
+)
 from booknow.trading.tsl import TrailingStopLoss
 
 
@@ -85,6 +92,8 @@ class PositionMonitor(AsyncProcessor):
         tsl: TrailingStopLoss,
         executor: ExitExecutor,
         max_hold_seconds: int = 3600,  # 1 h default; live cfg.maxHoldSeconds wins regardless
+        config_service: Optional[TradingConfigService] = None,
+        trailing_tp: Optional[TrailingTakeProfit] = None,
     ):
         super().__init__()
         self._redis = redis_client
@@ -92,6 +101,8 @@ class PositionMonitor(AsyncProcessor):
         self._tsl = tsl
         self._executor = executor
         self.max_hold_seconds = max_hold_seconds
+        self._config = config_service
+        self._trailing_tp = trailing_tp
 
     async def _tick(self) -> None:
         positions = self._state.snapshot()
@@ -100,6 +111,16 @@ class PositionMonitor(AsyncProcessor):
 
         prices = await self._read_current_prices(list(positions.keys()))
         now_ts = time()
+
+        # Pull config once per tick (Redis hit; cheap).  Lets the operator
+        # tune hardStopLossPct from the dashboard without a restart.
+        hard_sl_pct: float = 0.0
+        if self._config is not None:
+            try:
+                cfg = await self._config.get()
+                hard_sl_pct = float(getattr(cfg, "hardStopLossPct", 0.0) or 0.0)
+            except Exception as e:
+                self.log.warning("[Monitor] config fetch failed: %s", e)
 
         for symbol, pos in positions.items():
             cp = prices.get(symbol)
@@ -113,19 +134,80 @@ class PositionMonitor(AsyncProcessor):
             if price <= 0:
                 continue
 
-            # 1) Trailing stop-loss
+            # iter 51 (2026-05-23) — skip ALL exit checks while the buy
+            # is still pending (limit-buy placed but not filled).  Without
+            # this gate, TSL.peak tracks price drift on a position we
+            # don't actually own yet, and the first tick after the buy
+            # fills can immediately trigger force-exit — selling at the
+            # buy price for a fees-only loss (the COMPUSDT incident).
+            # pos.qty is set by on_buy_filled → _register_trailing_tp.
+            if pos.qty <= 0:
+                continue
+
+            # 1) Hard stop-loss (iter 48) — fires regardless of TSL state.
+            #    A trade that drops straight down without ever peaking
+            #    above the buy price would skate past the trailing-stop
+            #    until the 1h max-hold timer kicks in.  Hard-SL caps
+            #    that loss at a configurable %.
+            if hard_sl_pct > 0 and pos.buy_price > 0:
+                drop_pct = float((pos.buy_price - price) / pos.buy_price * 100)
+                if drop_pct >= hard_sl_pct:
+                    self.log.warning(
+                        "[Monitor] HARD-SL %s drop=%.3f%% (buy=%s now=%s, limit=%.2f%%) — force exit",
+                        symbol, drop_pct, pos.buy_price, price, hard_sl_pct,
+                    )
+                    await self._safe_exit(symbol, price, "HARD_SL")
+                    continue
+
+            # 2) Trailing stop-loss
             if self._tsl.check_and_track(symbol, price):
                 self.log.info("[Monitor] TSL triggered for %s — forcing market exit", symbol)
                 await self._safe_exit(symbol, price, "TSL")
                 continue
 
-            # 2) Max-hold timer
-            if self.max_hold_seconds > 0:
+            # 3) Dynamic take-profit ratchet (iter 47) + pump-mode trail (iter 59).
+            #    Only ticks once the buy has filled and the trailing-TP
+            #    tracker has been armed via on_buy_filled.
+            if self._trailing_tp is not None and self._trailing_tp.is_tracking(symbol):
+                action = self._trailing_tp.on_price_tick(symbol, price)
+                if isinstance(action, MoveUp):
+                    await self._safe_move_tp(symbol, action.new_tp_price)
+                    # Don't continue; let TSL+max-hold still apply on the same tick.
+                elif isinstance(action, FloorSell):
+                    self.log.info(
+                        "[Monitor] TRAIL_FLOOR for %s at %s — market sell at base TP",
+                        symbol, price,
+                    )
+                    await self._safe_exit(symbol, price, "TRAIL_FLOOR")
+                    continue
+                elif isinstance(action, PumpTrailExit):
+                    # iter 59 — pump-mode peak-trail triggered.
+                    self.log.info(
+                        "[Monitor] PUMP_TRAIL for %s at %s (peak %s) — market sell",
+                        symbol, price, action.peak_price,
+                    )
+                    await self._safe_exit(symbol, price, "PUMP_TRAIL")
+                    continue
+
+            # 4) Max-hold timer.  iter 59: pump-mode positions use a
+            #    longer hold so multi-hour pumps can run.
+            effective_max_hold = self.max_hold_seconds
+            if (self._trailing_tp is not None
+                    and self._trailing_tp.is_pump_mode(symbol)
+                    and self._config is not None):
+                try:
+                    cfg_now = await self._config.get()
+                    effective_max_hold = int(getattr(
+                        cfg_now, "pumpModeMaxHoldSeconds", self.max_hold_seconds,
+                    ) or self.max_hold_seconds)
+                except Exception:
+                    pass
+            if effective_max_hold > 0:
                 held = now_ts - pos.entry_time
-                if held >= self.max_hold_seconds:
+                if held >= effective_max_hold:
                     self.log.info(
                         "[Monitor] Max-hold %ds exceeded for %s (held %.0fs) — forcing market exit",
-                        self.max_hold_seconds, symbol, held,
+                        effective_max_hold, symbol, held,
                     )
                     await self._safe_exit(symbol, price, "MAX_HOLD")
 
@@ -136,6 +218,23 @@ class PositionMonitor(AsyncProcessor):
             self.log.error(
                 "[Monitor] force_market_exit(%s, %s) failed: %s",
                 symbol, reason, e, exc_info=True,
+            )
+
+    async def _safe_move_tp(self, symbol: str, new_tp_price: Decimal) -> None:
+        """Best-effort cancel + replace of the resting limit-sell at the
+        new (higher) target price.  Delegates to the executor; logs and
+        swallows errors so the monitor loop keeps ticking on a transient
+        Binance failure.
+        """
+        mover = getattr(self._executor, "move_limit_sell", None)
+        if mover is None:
+            return
+        try:
+            await mover(symbol=symbol, new_price=new_tp_price)
+        except Exception as e:
+            self.log.error(
+                "[Monitor] move_limit_sell(%s, %s) failed: %s",
+                symbol, new_tp_price, e, exc_info=True,
             )
 
     async def _read_current_prices(self, symbols: list[str]) -> Dict[str, Dict[str, Any]]:

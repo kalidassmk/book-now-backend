@@ -52,7 +52,6 @@ from booknow.binance.user_data import UserDataStreamService
 from booknow.binance.ws_api import WsApiClient
 from booknow.binance.ws_streams import MarketStreamService
 from booknow.config.settings import get_settings
-from booknow.scalper import ScalperEngine
 from booknow.processors.fast_analyse import FastAnalyse
 from booknow.processors.fast_move_filter import FastMoveFilter
 from booknow.processors.time_analyser import TimeAnalyser
@@ -68,6 +67,7 @@ from booknow.subsystems import SubsystemRegistry
 from booknow.trading.executor import TradeExecutor
 from booknow.trading.monitor import LoggingExecutor, PositionMonitor
 from booknow.trading.state import TradeState
+from booknow.trading.trailing_tp import TrailingTakeProfit
 from booknow.trading.tsl import TrailingStopLoss
 
 
@@ -118,6 +118,13 @@ async def _bootstrap() -> None:
         initial_config.buyAmountUsdt, initial_config.profitAmountUsdt,
         initial_config.tslPct, initial_config.maxHoldSeconds,
     )
+    log.info(
+        "  iter48 protections: hardSL=%.2f%% checkCoinFilter=%s failClosed=%s dashboard=%s",
+        getattr(initial_config, "hardStopLossPct", 0.0),
+        getattr(initial_config, "useCheckCoinFilterEnabled", False),
+        getattr(initial_config, "checkCoinFailClosed", False),
+        settings.dashboard_url,
+    )
 
     # WS-API client — always instantiated (it doesn't connect until used).
     # Live methods (signed orders) only fire when settings.live_mode is True.
@@ -154,14 +161,6 @@ async def _bootstrap() -> None:
     await market_stream.start()
     log.info("  market-stream task started")
 
-    # ── Order-flow scalper (always on, public aggTrade + depth streams) ──
-    # Streams market buys/sells and the order book for a small set of
-    # symbols and emits BUY/SELL/HOLD from the scalper order-flow checklist.
-    # Snapshots are read by the /api/v1/scalper/* routes and dashboard.
-    scalper_engine = ScalperEngine()
-    await scalper_engine.start()
-    log.info("  scalper-engine task started")
-
     # ── Phase 8: four processor loops ────────────────────────────────
     # All four read what market_stream writes and emit derived signals
     # the rules engine (Phase 11) and dashboards consume.
@@ -175,7 +174,20 @@ async def _bootstrap() -> None:
 
     # ── Phase 9 + 10: state, TSL, monitor, and the real TradeExecutor ─
     trade_state = TradeState()
-    tsl = TrailingStopLoss(trailing_percentage=initial_config.tslPct)
+    # iter 80 — wire redis client so mark_sold clears BUY hash.
+    trade_state.attach_redis_client(redis)
+    tsl = TrailingStopLoss(
+        trailing_percentage=initial_config.tslPct,
+        min_drop_pct_per_minute=getattr(initial_config, "tslMinDropPctPerMin", 0.15),
+    )
+
+    # iter 47 (2026-05-23) — dynamic chasing take-profit.  The executor
+    # arms it on buy-fill; the position monitor consults it each tick to
+    # decide MOVE-UP (ratchet limit-sell higher) vs FLOOR-SELL (market
+    # exit at base TP).
+    trailing_tp = TrailingTakeProfit(
+        move_step_pct=initial_config.dynamicTpMoveStepPct,
+    )
 
     # CoinAnalyzer — used by both the trade-executor's pre-buy gate and
     # the /api/v1/analyze/{symbol} endpoint. One per engine, shared.
@@ -194,6 +206,8 @@ async def _bootstrap() -> None:
         config_service=config_service,
         dust_service=None,            # filled in below in live mode
         coin_analyzer=coin_analyzer,
+        dashboard_url=settings.dashboard_url,   # iter 48: /api/check-coin
+        trailing_tp=trailing_tp,                # iter 47: ratcheting TP
         live_mode=settings.live_mode,
     )
 
@@ -203,6 +217,8 @@ async def _bootstrap() -> None:
         tsl=tsl,
         executor=trade_executor,
         max_hold_seconds=initial_config.maxHoldSeconds,
+        config_service=config_service,          # iter 48: read hardStopLossPct
+        trailing_tp=trailing_tp,                # iter 47: MOVE_UP / FLOOR_SELL
     )
     await position_monitor.start()
     log.info(
@@ -316,18 +332,164 @@ async def _bootstrap() -> None:
                 order_id = event.get("i")
                 if not symbol or order_id is None:
                     return
+                side = event.get("S")
                 pos = trade_state.get_position(symbol)
+
+                # ── iter 82 (2026-05-25) CRITICAL FIX: auto-recover ──
+                # orphan BUY fills.
+                #
+                # ROOT CAUSE OF SUSDT 2026-05-11 (-$1.96, held 16h):
+                #   • A LIMIT BUY was placed via a path that didn't call
+                #     `trade_state.mark_bought()`.
+                #   • BUY filled on Binance → executionReport event arrived.
+                #   • `pos = trade_state.get_position(symbol)` returned None.
+                #   • Old code: `if pos is None: return` → BAIL OUT SILENTLY.
+                #   • Result: no auto-TP, no auto-hard-stop, no TSL.
+                #     Position sat unprotected forever.
+                #
+                # FIX: if BUY fills on an untracked position, auto-register
+                # it via mark_bought, then let the rest of the handler arm
+                # the TP. This guarantees EVERY BUY fill gets a sell order.
                 if pos is None:
+                    if side == "BUY":
+                        from decimal import Decimal as _D
+                        fp_raw = event.get("L") or event.get("p") or "0"
+                        try:
+                            recovered_price = _D(str(fp_raw))
+                        except Exception:
+                            recovered_price = _D(0)
+                        log.warning(
+                            "[ORPHAN BUY FILL] %s order #%s @ %s — "
+                            "auto-recovering (iter82). This buy bypassed "
+                            "mark_bought; would have orphaned without iter82.",
+                            symbol, order_id, recovered_price,
+                        )
+                        pos = trade_state.mark_bought(
+                            symbol, "AUTO_RECOVERED", recovered_price,
+                        )
+                    else:
+                        # SELL fill on untracked position — nothing to clean up.
+                        return
+
+                # ── BUY fill (iter 47): arm the limit-sell + dynamic TP ──
+                if side == "BUY":
+                    # Avoid double-arming if a previous fill already triggered us.
+                    if pos.open_sell_order_id is not None:
+                        return
+                    from decimal import Decimal as _D
+                    import json as _json
+                    filled_qty = _D(str(event.get("z") or event.get("l") or "0"))
+                    # 'L' = last fill price; fall back to 'p' (order price) for ack-style fills.
+                    fill_price_raw = event.get("L") or event.get("p") or "0"
+                    try:
+                        fill_price = _D(str(fill_price_raw))
+                    except Exception:
+                        fill_price = _D(0)
+                    # Recover sell_pct from the BUY row we wrote at try_buy time.
+                    # In live deployments profitAmountUsdt > 0 so sell_pct is
+                    # ignored downstream, but we forward the recorded value
+                    # for correctness in case the operator flips to %-mode.
+                    sell_pct = 9.0
+                    try:
+                        raw = await redis.hget("BUY", symbol)
+                        if raw:
+                            row = _json.loads(raw)
+                            sell_pct = float(row.get("selP") or sell_pct)
+                    except Exception:
+                        pass
+                    log.info(
+                        "[BUY FILLED] %s order #%s qty=%s price=%s — arming TP",
+                        symbol, order_id, filled_qty, fill_price,
+                    )
+                    try:
+                        await trade_executor.on_buy_filled(
+                            symbol=symbol,
+                            order_id=int(order_id),
+                            filled_qty=filled_qty,
+                            fill_price=fill_price,
+                            sell_pct=sell_pct,
+                        )
+                    except Exception as e:
+                        log.error("[BUY FILLED] on_buy_filled failed for %s: %s", symbol, e, exc_info=True)
                     return
-                if pos.open_sell_order_id is None or pos.open_sell_order_id != order_id:
-                    return
-                price = event.get("p") or event.get("L") or "0"
-                log.info(
-                    "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
-                    order_id, symbol, price,
+
+                # ── SELL fill: close-position cleanup ──
+                # iter 95 — also handle MANUAL SELL on Binance UI.
+                #
+                # Before iter95 the handler bailed if
+                # pos.open_sell_order_id != event.order_id, which meant a
+                # manual sell on Binance was completely silent on our
+                # side — TradeState still thought we owned it, the BUY
+                # hash stayed populated, the dashboard kept showing the
+                # position as "HOLDING", and no P&L was recorded.
+                #
+                # In manual-only mode (iter94 HARD_DISABLE_AUTOSELL=True)
+                # the bot never places a sell, so pos.open_sell_order_id
+                # is always None for newly-bought positions. Every SELL
+                # fill that arrives is by definition a manual operator
+                # action on Binance and we must clean up + record it.
+                is_manual_sell = (
+                    pos.open_sell_order_id is None
+                    or pos.open_sell_order_id != order_id
                 )
+                price = event.get("L") or event.get("p") or "0"
+                if is_manual_sell:
+                    log.info(
+                        "[MANUAL SELL FILL] %s order #%s @ %s — "
+                        "operator sold on Binance UI (iter95).",
+                        symbol, order_id, price,
+                    )
+                else:
+                    log.info(
+                        "[+TARGET HIT] limit-sell #%s for %s filled @ %s — closing position",
+                        order_id, symbol, price,
+                    )
+                # iter 60 — dashboard banner alert + optional Telegram.
+                try:
+                    from booknow.util.alerts import publish_trade_alert, alert_sold
+                    from time import time as _now
+                    cfg_alerts = await config_service.get()
+                    hold_s = int(max(0, _now() - pos.entry_time))
+                    try:
+                        bp = float(pos.buy_price); sp = float(price); q = float(pos.qty)
+                        gross = (sp - bp) * q
+                        fees = 2 * 0.00075 * (bp * q)
+                        realised_net = gross - fees
+                    except Exception:
+                        realised_net = None
+                    # iter 95 — label correctly: MANUAL for operator-driven
+                    # Binance UI sells (now the default in manual mode), TP
+                    # for the legacy bot-TP-filled path.
+                    sell_label = "MANUAL" if is_manual_sell else "TP"
+                    await publish_trade_alert(
+                        redis_client=redis,
+                        symbol=symbol,
+                        action="SELL",
+                        price=price,
+                        realised_net=realised_net,
+                        rule_label=sell_label,
+                    )
+                    if getattr(cfg_alerts, "alertsEnabled", False):
+                        await alert_sold(
+                            symbol=symbol,
+                            buy_price=pos.buy_price,
+                            sell_price=price,
+                            qty=pos.qty,
+                            reason=sell_label,
+                            hold_seconds=hold_s,
+                        )
+                except Exception as e:
+                    log.debug("[+TARGET HIT] alerts failed for %s: %s", symbol, e)
+
                 trade_state.mark_sold(symbol)
                 tsl.reset(symbol)
+                trailing_tp.unregister(symbol)
+                # iter 52 — start per-symbol cooldown so R1/R2/R3 don't
+                # immediately re-buy the same coin after a TP hit.
+                try:
+                    await trade_executor.set_rules_cooldown(symbol)
+                except Exception as e:
+                    log.warning("[+TARGET HIT] cooldown set failed for %s: %s", symbol, e)
                 # Sweep the leftover base-asset dust.
                 base = symbol[:-4] if symbol.endswith("USDT") else symbol
                 try:
@@ -348,6 +510,22 @@ async def _bootstrap() -> None:
             await balance_service.seed_from_rest()
             await user_data.start()
             log.info("  user-data-stream + dust-service started")
+
+            # iter 80 — Orphan Position Reconciler.  Auto-arms a safety
+            # +0.5% LIMIT SELL on any Binance balance not tracked by our
+            # TradeState (e.g. user bought via Binance UI). Runs every
+            # 30s so worst-case exposure is 30s instead of unbounded.
+            from booknow.trading.orphan_reconciler import OrphanReconciler
+            orphan_recon = OrphanReconciler(
+                redis_client=redis,
+                ws_api=ws_api,
+                filter_service=filter_service,
+                trade_state=trade_state,
+                settings=settings,
+                live_mode=True,
+            )
+            await orphan_recon.start()
+            log.info("  orphan-reconciler started (iter 80)")
     else:
         log.info("  user-data-stream + dust-service skipped (live_mode=False)")
 
@@ -368,13 +546,21 @@ async def _bootstrap() -> None:
         balance_service=balance_service,  # None in paper mode, set in live
         dust_service=dust_service,
         coin_analyzer=coin_analyzer,
-        scalper_engine=scalper_engine,
     )
     fastapi_app = build_app(app_state)
     http_server = HttpServer(fastapi_app, host="0.0.0.0", port=settings.http_port)
     await http_server.start()
 
     log.info("Engine running. Press Ctrl-C to stop.")
+
+    # iter 58 — fire-and-forget startup alert so the operator knows
+    # Telegram is wired correctly the moment the engine is up.
+    try:
+        from booknow.util.alerts import alert_startup, is_configured
+        if getattr(initial_config, "alertsEnabled", True) and is_configured():
+            await alert_startup(version_tag="iter58")
+    except Exception as e:
+        log.debug("startup alert failed: %s", e)
 
     # Idle until interrupted. Subsequent phases will spawn their own
     # tasks here; main.py's job is to supervise them and shut down
@@ -427,10 +613,6 @@ async def _bootstrap() -> None:
             await market_stream.stop()
         except Exception as e:
             log.warning("  market-stream stop error: %s", e)
-        try:
-            await scalper_engine.stop()
-        except Exception as e:
-            log.warning("  scalper-engine stop error: %s", e)
         # Subsystem registry: closes its KlinesCache WS + httpx client.
         # Safe to do here — nothing in the trade core depends on it.
         try:

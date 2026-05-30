@@ -30,7 +30,6 @@ if TYPE_CHECKING:  # pragma: no cover
     from booknow.binance.ws_api import WsApiClient
     from booknow.config.trading_config import TradingConfigService
     from booknow.config.settings import Settings
-    from booknow.scalper.engine import ScalperEngine
     from booknow.trading.executor import TradeExecutor
     from booknow.trading.state import TradeState
 
@@ -54,4 +53,3 @@ class AppState:
     balance_service: Optional["BalanceService"] = None  # live_mode only
     dust_service: Optional["DustService"] = None        # live_mode only
     coin_analyzer: Optional["CoinAnalyzer"] = None
-    scalper_engine: Optional["ScalperEngine"] = None     # order-flow scalper

@@ -4,6 +4,34 @@ import json
 import time
 import uuid
 from datetime import datetime
+from decimal import Decimal, ROUND_DOWN
+
+# iter 74 — shared pre-buy gates (USDT cooldown + check-coin + orderbook
+# depth).  Same pipeline R1/R2/R3/Pattern Bot/PumpRider/Fast Scalper use.
+# Brings Virtual Scalper into full filter parity for the first time.
+from pre_buy_gates import run_all_gates as _vs_pre_buy_gates
+
+# Optional: ccxt only needed for live mode. Import is lazy so paper-only
+# deployments without ccxt installed still run.
+try:
+    import ccxt
+except ImportError:  # pragma: no cover
+    ccxt = None  # type: ignore
+
+from booknow.util.trade_archive import archive_closed_trade
+
+# Metrics collector — captures every signal/skip/buy/fill/exit into Redis.
+# Optional import so older deploys without the helper still run.
+try:
+    from metrics_collector import make_collector
+except Exception:
+    make_collector = None  # type: ignore
+
+# Laddered Recovery state machine.
+try:
+    import laddered_position as ladder  # type: ignore
+except Exception:
+    ladder = None  # type: ignore
 
 # --- CONFIGURATION ---
 # Read from env so Docker can point at the `redis` service while local
@@ -17,15 +45,16 @@ TRADING_CONFIG_KEY = 'TRADING_CONFIG'
 
 # Fallbacks if Redis trading config is missing/corrupt; kept aligned with
 # booknow.config.trading_config.TradingConfig defaults.
-DEFAULT_BUY_AMOUNT_USDT = 100.0
-DEFAULT_PROFIT_TARGET_USDT = 0.20    # legacy USDT target — only used when profitPct == 0
-DEFAULT_PROFIT_PCT = 0.50            # % above entry; matches the user's scalping formula
-DEFAULT_LIMIT_OFFSET_PCT = 0.50      # % below signal price; from same formula
+# 2026-05-12 iter 11: $55/leg, $0.15 net target, Buy 3 disabled.
+DEFAULT_BUY_AMOUNT_USDT = 50.0
+DEFAULT_PROFIT_TARGET_USDT = 0.15
+DEFAULT_PROFIT_PCT = 0.5             # % above entry → ≈$0.15 NET on $55 buy after 0.2% fees
+DEFAULT_LIMIT_OFFSET_PCT = 0.15      # 0.15 % below signal
 
 # Risk Settings for Virtual Scalper
-STOP_LOSS = 0.003   # 0.3%
-MIN_HOLD_SECONDS = 3600 # 1 Hour "Patience" Rule
-MAX_VIRTUAL_LOSS_USDT = 1.0 # Allow up to $1 loss during patience period
+SOFT_STOP_LOSS_USDT = 0.50 # Soft stop kicks in at $0.50 loss; respects MIN_HOLD_SECONDS patience
+MIN_HOLD_SECONDS = 3600    # 1 Hour "Patience" Rule
+MAX_VIRTUAL_LOSS_USDT = 1.0 # Hard stop loss; immediate exit at $1.00 loss
 
 # Limit-buy lifecycle: when SCALP_BUY_SIGNAL fires we don't take the
 # market price. Instead we "place" a paper limit at limitBuyOffsetPct
@@ -37,7 +66,2235 @@ LIMIT_ORDER_TIMEOUT_SECONDS = 60
 class VirtualScalpExecutor:
     def __init__(self):
         self.r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+
+        # iter 22: gate trading on a successful strict Redis read. False
+        # until _sync_live_mode populates every required key.
+        self.config_loaded: bool = False
+
+        # Live-trading state. live_mode is hot-reloaded from TRADING_CONFIG
+        # every loop iteration so an operator can flip paper↔live without
+        # restarting. Default True — live trading is the intended mode.
+        self.live_mode = True
+        self.client = None
+        self.symbol_filters = {}     # symbol -> {step_size, tick_size, min_notional}
+
+        # Falling-knife filter knobs. Hot-reloaded by _sync_live_mode().
+        self.fk_enabled = True
+        self.fk_max_24h = 8.0
+        self.fk_max_1h_range = 6.0
+        self.fk_overbought_skip = True
+        self.fk_overbought_60m = 1.5
+
+        # Post-pump-bleed filter (daily timeframe, added 2026-05-12 after
+        # JTO loss). Mirrors the Fast Scalper algorithm. See spec in
+        # _passes_post_pump_filter() below.
+        self.pp_enabled = True
+        self.pp_threshold_pct = 30.0
+        self.pp_off_peak_min_pct = 10.0
+        self.pp_min_days_since_peak = 2
+        # 2026-05-12 iter 13 tuning: 14 → 15 days pump window, 7 → 10 days
+        # baseline (mirrors Fast Scalper for parity).
+        self.pp_lookback_days = 15
+        self.pp_baseline_days = 10
+        self.pp_require_below_ma7 = False    # iter 21: opt-in
+        self._d1_cache: dict = {}
+        self._d1_cache_ttl_sec = 600
+
+        # Stop-loss USDT — when 0/negative, SOFT_STOP_LOSS_USDT and
+        # MAX_VIRTUAL_LOSS_USDT below are bypassed (Option B patient hold).
+        self.stop_loss_usdt = 0.0
+
+        # Fast-drop-without-volume filter (Pattern C). Mirrors Fast Scalper.
+        self.fd_enabled = True
+        self.fd_detect_minutes = 3
+        self.fd_threshold_pct = 0.5
+        self.fd_vol_surge_mult = 2.0
+
+        # Laddered Recovery (paper or live, mirrors Fast Scalper).
+        # 2026-05-12 iter 15: $48/leg (operator wants bigger capture).
+        self.ladder_enabled = False
+        self.max_concurrent_ladders = 1
+        self.single_coin_mode = True
+        self.ladder_buy1_size = 48.0
+        self.ladder_buy2_size = 48.0
+        self.ladder_buy3_size = 0.0
+        self.ladder_buy2_offset_pct = 0.5
+        self.ladder_buy3_offset_pct = 1.0
+        self.ladder_tp_from_avg_pct = 0.6
+        self.ladder_target_net_usdt = 0.15      # iter 42: 0.20→0.15 (faster TP)
+        self.ladder_fee_rate_per_side = 0.00075
+        self.ladder_hard_stop_pct = 1.0
+        self.ladder_buy1_offset_pct = 0.15  # 0.15 % below signal
+        self.ladder_cooldown_seconds = 14400  # 4 hours
+
+        # ── iter 14: time-based + breakeven force exit (Virtual parity) ─
+        self.ladder_time_exit_enabled = True
+        self.ladder_max_hold_seconds = 14400        # 4h
+        self.ladder_breakeven_exit_enabled = True
+        self.ladder_breakeven_buffer_pct = 0.50
+
+        # ── iter 37: fixed hard-stop fallback + Buy 2 staleness ─────────
+        self.ladder_hard_stop_from_avg_enabled = True
+        self.ladder_hard_stop_from_avg_pct = 1.5
+        self.ladder_buy2_staleness_enabled = True
+        self.ladder_buy2_staleness_minutes = 10
+
+        # ── iter 38: near-top pump pre-buy filter ───────────────────────
+        self.ntp_enabled = True
+        self.ntp_min_24h_change_pct = 5.0
+        self.ntp_max_from_high_pct = 2.0
+
+        # ── iter 39: liquidity-death adaptive exit ──────────────────────
+        self.ld_enabled = True
+        self.ld_catastrophic_drop_pct = 2.5
+        self.ld_min_hold_min = 10
+        self.ld_min_drop_pct = 0.3
+        self.ld_lookback_min = 10
+        self.ld_vol_collapse_threshold = 0.7
+        self.ld_lower_lows_threshold = 0.55
+        self.ld_red_share_threshold = 0.60
+        self.ld_exit_score_threshold = 6
+        self.ld_stagnation_hold_min = 60
+        self.ld_stagnation_max_drop_pct = 1.0
+        # ── iter 41: Post-Buy-2 Careful Monitor ─────────────────────────
+        self.a2_enabled = True
+        self.a2_grace_minutes = 5
+        self.a2_quick_profit_pct = 0.2
+        self.a2_tight_breakeven_buffer_pct = 0.15
+        self.a2_patience_minutes = 20
+        self.a2_no_recovery_drop_pct = 0.5
+        self.a2_hard_stop_pct = 1.5
+        # ── iter 43: Volatility-Adaptive Entry + TP ─────────────────────
+        self.ae_enabled = True
+        self.ae_tier_calm_max = 1.0
+        self.ae_tier_normal_max = 2.0
+        self.ae_tier_volatile_max = 4.0
+        self.ae_buy1_calm = 0.15
+        self.ae_buy1_normal = 0.30
+        self.ae_buy1_volatile = 0.70
+        self.ae_buy1_xvolatile = 1.50
+        self.ae_buy2_calm = 0.50
+        self.ae_buy2_normal = 0.80
+        self.ae_buy2_volatile = 1.50
+        self.ae_buy2_xvolatile = 2.50
+        self.ae_tp_calm = 0.15
+        self.ae_tp_normal = 0.20
+        self.ae_tp_volatile = 0.30
+        self.ae_tp_xvolatile = 0.50
+
+        # ── iter 44: Macro-Top Exhaustion Filter ────────────────────────
+        self.mt_enabled = True
+        self.mt_min_return_pct = 50.0
+        self.mt_within_high_pct = 90.0
+        self.mt_min_red_days_in_7 = 3
+
+        # ── iter 45: Volatility Regime Filter ───────────────────────────
+        self.vr_enabled = True
+        self.vr_max_daily_range_pct = 20.0
+        self.vr_big_crash_pct = 15.0
+        self.vr_lookback_days = 5
+
+        # ── iter 46: Market Stress Exit ─────────────────────────────────
+        self.ms_enabled = True
+        self.ms_min_hold_min = 30
+        self.ms_min_drop_pct = 1.0   # iter 46 tuned: 0.5 → 1.0 (no false positives)
+        self.ms_btc_weakness_pct = 0.5
+        self.ms_btc_lookback_min = 30
+        self.ms_vol_spike_mult = 5.0
+        self.ms_red_share_threshold = 0.7
+        # BTC kline cache (30s TTL — shared across all symbols)
+        self._btc_cache = {"ts": 0, "candles": None}
+        self._btc_cache_ttl_sec = 30
+        # 1m kline cache for iter39 (sync ccxt → throttle to 30s/symbol).
+        self._ld_kline_cache: dict = {}
+        self._ld_kline_ttl_sec = 30
+
+        # Metrics collector — same Redis as everything else.
+        self.metrics = make_collector(self.r, enabled=True) if make_collector else None
+
+        self._init_binance_client()
         print("🚀 [VIRTUAL SCALPER] Limit-buy + %-TP mode (1h patience).")
+        print(f"   live_mode default = {self.live_mode}  client = {'ready' if self.client else 'unavailable'}")
+
+    # ── Live-trading scaffolding ─────────────────────────────────────────
+
+    def _init_binance_client(self):
+        """One-shot ccxt client init from env. None on any failure;
+        live mode degrades to paper instead of crashing the loop."""
+        if ccxt is None:
+            print("⚠️ [VIRTUAL] ccxt not installed — paper-only mode")
+            return
+        api_key = os.getenv("BINANCE_API_KEY")
+        api_secret = os.getenv("BINANCE_SECRET_KEY")
+        if not api_key or not api_secret:
+            print("⚠️ [VIRTUAL] Binance API keys missing — live mode unavailable")
+            return
+        try:
+            self.client = ccxt.binance({
+                'apiKey': api_key,
+                'secret': api_secret,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'spot'},
+            })
+            print("✅ [VIRTUAL] Binance client ready")
+        except Exception as e:
+            print(f"❌ [VIRTUAL] Binance client init failed: {e}")
+            self.client = None
+
+    # iter 22 (2026-05-13): every config key the Virtual Scalper needs.
+    # Same hard rule as Fast Scalper — no in-memory fallbacks.
+    _REQUIRED_CONFIG_KEYS = (
+        "virtualScalperLiveMode",
+        "fallingKnifeFilterEnabled", "maxChange24hPct", "maxRange1hPct",
+        "overboughtSkipEnabled", "overbought60mPct",
+        "postPumpFilterEnabled", "postPumpThresholdPct",
+        "postPumpOffPeakMinPct", "postPumpMinDaysSincePeak",
+        "postPumpLookbackDays", "postPumpBaselineDays",
+        "postPumpRequireBelowMa7",
+        "stopLossUsdt",
+        "fastDropFilterEnabled", "fastDropDetectMinutes",
+        "fastDropThresholdPct", "volSurgeThresholdMultiplier",
+        "ladderedRecoveryEnabled", "maxConcurrentLadders",
+        "singleCoinModeEnabled",
+        "ladderBuy1SizeUsdt", "ladderBuy2SizeUsdt", "ladderBuy3SizeUsdt",
+        "ladderBuy2OffsetPct", "ladderBuy3OffsetPct",
+        "ladderTpFromAvgPct", "ladderTargetNetProfitUsdt",
+        "ladderFeeRatePerSide", "ladderHardStopBelowBuy3Pct",
+        "ladderBuy1OffsetPct", "ladderCooldownSeconds",
+        # iter 14 (force-exit) — added to Virtual in iter 40 parity port
+        "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
+        "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+        # iter 37 (fallback hard stop + Buy 2 staleness)
+        "ladderHardStopFromAvgEnabled", "ladderHardStopFromAvgPct",
+        "ladderBuy2StalenessEnabled", "ladderBuy2StalenessMinutes",
+        # iter 38 (near-top pump filter)
+        "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
+        "nearTopPumpMaxFromHighPct",
+        # iter 39 (liquidity-death adaptive exit)
+        "liquidityDeathExitEnabled", "liquidityDeathCatastrophicDropPct",
+        "liquidityDeathMinHoldMin", "liquidityDeathMinDropPct",
+        "liquidityDeathLookbackMin", "liquidityDeathVolCollapseThreshold",
+        "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
+        "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
+        "liquidityDeathStagnationMaxDropPct",
+        # iter 41 (Post-Buy-2 Careful Monitor)
+        "active2MonitorEnabled", "active2GracePeriodMinutes",
+        "active2QuickProfitPct", "active2TightBreakevenBufferPct",
+        "active2PatienceMinutes", "active2NoRecoveryDropPct",
+        "active2HardStopPct",
+        # iter 43 — Volatility-Adaptive Entry + TP
+        "adaptiveEntryEnabled",
+        "adaptiveTierCalmMaxPct", "adaptiveTierNormalMaxPct", "adaptiveTierVolatileMaxPct",
+        "adaptiveBuy1OffsetCalm", "adaptiveBuy1OffsetNormal",
+        "adaptiveBuy1OffsetVolatile", "adaptiveBuy1OffsetXVolatile",
+        "adaptiveBuy2OffsetCalm", "adaptiveBuy2OffsetNormal",
+        "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
+        "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
+        "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
+        # iter 44 — Macro-Top Exhaustion Filter
+        "macroTopFilterEnabled", "macroTopMinReturnPct",
+        "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
+        # iter 45 — Volatility Regime Filter
+        "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
+        "volRegimeBigCrashPct", "volRegimeLookbackDays",
+        # iter 46 — Market Stress Exit
+        "marketStressExitEnabled", "marketStressMinHoldMin",
+        "marketStressMinDropPct", "marketStressBtcWeaknessPct",
+        "marketStressBtcLookbackMin", "marketStressVolSpikeMult",
+        "marketStressRedShareThreshold",
+        "metricsEnabled",
+    )
+
+    def _sync_live_mode(self):
+        """STRICT Redis read of every config field (iter 22).
+
+        Refuses to leave self.* populated unless ALL required keys are
+        present in TRADING_CONFIG. Sets self.config_loaded accordingly
+        — callers check that flag before performing any trading action.
+
+        No fallback defaults. If Redis is missing a key, the Virtual
+        Scalper will not place new orders until the operator fixes
+        the config. Better to halt loudly than silently use a stale
+        in-memory value.
+        """
+        try:
+            raw = self.r.get(TRADING_CONFIG_KEY)
+        except Exception as exc:
+            print(f"❌ [VIRTUAL] Redis read failed: {exc} — refusing to trade")
+            self.config_loaded = False
+            return
+        if not raw:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG missing in Redis — refusing to trade")
+            self.config_loaded = False
+            return
+        try:
+            cfg = json.loads(raw)
+        except Exception as exc:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG JSON parse failed: {exc} — refusing to trade")
+            self.config_loaded = False
+            return
+        # iter 40 (2026-05-15): for the newly-ported safety nets, gracefully
+        # fall back to defaults if the key isn't in Redis yet — avoids a
+        # cold-start blackhole on the day of the port. (Strict mode is
+        # already enforced on the Fast Scalper, which guarantees every
+        # key gets seeded.)
+        _IT40_OPTIONAL_KEYS = {
+            "ladderTimeExitEnabled", "ladderMaxHoldSeconds",
+            "ladderBreakevenExitEnabled", "ladderBreakevenBufferPct",
+            "ladderHardStopFromAvgEnabled", "ladderHardStopFromAvgPct",
+            "ladderBuy2StalenessEnabled", "ladderBuy2StalenessMinutes",
+            "nearTopPumpFilterEnabled", "nearTopPumpMin24hChangePct",
+            "nearTopPumpMaxFromHighPct",
+            "liquidityDeathExitEnabled", "liquidityDeathCatastrophicDropPct",
+            "liquidityDeathMinHoldMin", "liquidityDeathMinDropPct",
+            "liquidityDeathLookbackMin", "liquidityDeathVolCollapseThreshold",
+            "liquidityDeathLowerLowsThreshold", "liquidityDeathRedShareThreshold",
+            "liquidityDeathExitScoreThreshold", "liquidityDeathStagnationHoldMin",
+            "liquidityDeathStagnationMaxDropPct",
+            "active2MonitorEnabled", "active2GracePeriodMinutes",
+            "active2QuickProfitPct", "active2TightBreakevenBufferPct",
+            "active2PatienceMinutes", "active2NoRecoveryDropPct",
+            "active2HardStopPct",
+            "adaptiveEntryEnabled",
+            "adaptiveTierCalmMaxPct", "adaptiveTierNormalMaxPct", "adaptiveTierVolatileMaxPct",
+            "adaptiveBuy1OffsetCalm", "adaptiveBuy1OffsetNormal",
+            "adaptiveBuy1OffsetVolatile", "adaptiveBuy1OffsetXVolatile",
+            "adaptiveBuy2OffsetCalm", "adaptiveBuy2OffsetNormal",
+            "adaptiveBuy2OffsetVolatile", "adaptiveBuy2OffsetXVolatile",
+            "adaptiveTpTargetCalm", "adaptiveTpTargetNormal",
+            "adaptiveTpTargetVolatile", "adaptiveTpTargetXVolatile",
+            "macroTopFilterEnabled", "macroTopMinReturnPct",
+            "macroTopWithinHighPct", "macroTopMinRedDaysIn7",
+            "volRegimeFilterEnabled", "volRegimeMaxDailyRangePct",
+            "volRegimeBigCrashPct", "volRegimeLookbackDays",
+            "marketStressExitEnabled", "marketStressMinHoldMin",
+            "marketStressMinDropPct", "marketStressBtcWeaknessPct",
+            "marketStressBtcLookbackMin", "marketStressVolSpikeMult",
+            "marketStressRedShareThreshold",
+        }
+        missing = [k for k in self._REQUIRED_CONFIG_KEYS
+                   if k not in cfg and k not in _IT40_OPTIONAL_KEYS]
+        if missing:
+            print(f"❌ [VIRTUAL] TRADING_CONFIG missing keys {missing} — refusing to trade")
+            self.config_loaded = False
+            return
+        # Backfill any missing iter40 keys with current defaults (already in self.*)
+        for k in _IT40_OPTIONAL_KEYS:
+            if k not in cfg:
+                cfg[k] = {
+                    "ladderTimeExitEnabled": True,
+                    "ladderMaxHoldSeconds": 14400,
+                    "ladderBreakevenExitEnabled": True,
+                    "ladderBreakevenBufferPct": 0.5,
+                    "ladderHardStopFromAvgEnabled": True,
+                    "ladderHardStopFromAvgPct": 1.5,
+                    "ladderBuy2StalenessEnabled": True,
+                    "ladderBuy2StalenessMinutes": 10,
+                    "nearTopPumpFilterEnabled": True,
+                    "nearTopPumpMin24hChangePct": 5.0,
+                    "nearTopPumpMaxFromHighPct": 2.0,
+                    "liquidityDeathExitEnabled": True,
+                    "liquidityDeathCatastrophicDropPct": 2.5,
+                    "liquidityDeathMinHoldMin": 10,
+                    "liquidityDeathMinDropPct": 0.3,
+                    "liquidityDeathLookbackMin": 10,
+                    "liquidityDeathVolCollapseThreshold": 0.7,
+                    "liquidityDeathLowerLowsThreshold": 0.55,
+                    "liquidityDeathRedShareThreshold": 0.6,
+                    "liquidityDeathExitScoreThreshold": 6,
+                    "liquidityDeathStagnationHoldMin": 60,
+                    "liquidityDeathStagnationMaxDropPct": 1.0,
+                    "active2MonitorEnabled": True,
+                    "active2GracePeriodMinutes": 5,
+                    "active2QuickProfitPct": 0.2,
+                    "active2TightBreakevenBufferPct": 0.15,
+                    "active2PatienceMinutes": 20,
+                    "active2NoRecoveryDropPct": 0.5,
+                    "active2HardStopPct": 1.5,
+                    "adaptiveEntryEnabled": True,
+                    "adaptiveTierCalmMaxPct": 1.0,
+                    "adaptiveTierNormalMaxPct": 2.0,
+                    "adaptiveTierVolatileMaxPct": 4.0,
+                    "adaptiveBuy1OffsetCalm": 0.15,
+                    "adaptiveBuy1OffsetNormal": 0.30,
+                    "adaptiveBuy1OffsetVolatile": 0.70,
+                    "adaptiveBuy1OffsetXVolatile": 1.50,
+                    "adaptiveBuy2OffsetCalm": 0.50,
+                    "adaptiveBuy2OffsetNormal": 0.80,
+                    "adaptiveBuy2OffsetVolatile": 1.50,
+                    "adaptiveBuy2OffsetXVolatile": 2.50,
+                    "adaptiveTpTargetCalm": 0.15,
+                    "adaptiveTpTargetNormal": 0.20,
+                    "adaptiveTpTargetVolatile": 0.30,
+                    "adaptiveTpTargetXVolatile": 0.50,
+                    "macroTopFilterEnabled": True,
+                    "macroTopMinReturnPct": 50.0,
+                    "macroTopWithinHighPct": 90.0,
+                    "macroTopMinRedDaysIn7": 3,
+                    "volRegimeFilterEnabled": True,
+                    "volRegimeMaxDailyRangePct": 20.0,
+                    "volRegimeBigCrashPct": 15.0,
+                    "volRegimeLookbackDays": 5,
+                    "marketStressExitEnabled": True,
+                    "marketStressMinHoldMin": 30,
+                    "marketStressMinDropPct": 0.5,
+                    "marketStressBtcWeaknessPct": 0.5,
+                    "marketStressBtcLookbackMin": 30,
+                    "marketStressVolSpikeMult": 5.0,
+                    "marketStressRedShareThreshold": 0.7,
+                }[k]
+
+        # Strict population — direct key access, no .get(default).
+        self.live_mode = bool(cfg["virtualScalperLiveMode"])
+        self.fk_enabled = bool(cfg["fallingKnifeFilterEnabled"])
+        self.fk_max_24h = float(cfg["maxChange24hPct"])
+        self.fk_max_1h_range = float(cfg["maxRange1hPct"])
+        self.fk_overbought_skip = bool(cfg["overboughtSkipEnabled"])
+        self.fk_overbought_60m = float(cfg["overbought60mPct"])
+        self.pp_enabled = bool(cfg["postPumpFilterEnabled"])
+        self.pp_threshold_pct = float(cfg["postPumpThresholdPct"])
+        self.pp_off_peak_min_pct = float(cfg["postPumpOffPeakMinPct"])
+        self.pp_min_days_since_peak = int(cfg["postPumpMinDaysSincePeak"])
+        self.pp_lookback_days = int(cfg["postPumpLookbackDays"])
+        self.pp_baseline_days = int(cfg["postPumpBaselineDays"])
+        self.pp_require_below_ma7 = bool(cfg["postPumpRequireBelowMa7"])
+        self.stop_loss_usdt = float(cfg["stopLossUsdt"])
+        self.fd_enabled = bool(cfg["fastDropFilterEnabled"])
+        self.fd_detect_minutes = int(cfg["fastDropDetectMinutes"])
+        self.fd_threshold_pct = float(cfg["fastDropThresholdPct"])
+        self.fd_vol_surge_mult = float(cfg["volSurgeThresholdMultiplier"])
+        self.ladder_enabled = bool(cfg["ladderedRecoveryEnabled"])
+        self.max_concurrent_ladders = int(cfg["maxConcurrentLadders"])
+        self.single_coin_mode = bool(cfg["singleCoinModeEnabled"])
+        self.ladder_buy1_size = float(cfg["ladderBuy1SizeUsdt"])
+        self.ladder_buy2_size = float(cfg["ladderBuy2SizeUsdt"])
+        self.ladder_buy3_size = float(cfg["ladderBuy3SizeUsdt"])
+        self.ladder_buy2_offset_pct = float(cfg["ladderBuy2OffsetPct"])
+        self.ladder_buy3_offset_pct = float(cfg["ladderBuy3OffsetPct"])
+        self.ladder_tp_from_avg_pct = float(cfg["ladderTpFromAvgPct"])
+        self.ladder_target_net_usdt = float(cfg["ladderTargetNetProfitUsdt"])
+        self.ladder_fee_rate_per_side = float(cfg["ladderFeeRatePerSide"])
+        self.ladder_hard_stop_pct = float(cfg["ladderHardStopBelowBuy3Pct"])
+        self.ladder_buy1_offset_pct = float(cfg["ladderBuy1OffsetPct"])
+        self.ladder_cooldown_seconds = int(cfg["ladderCooldownSeconds"])
+        # iter 14
+        self.ladder_time_exit_enabled = bool(cfg["ladderTimeExitEnabled"])
+        self.ladder_max_hold_seconds = int(cfg["ladderMaxHoldSeconds"])
+        self.ladder_breakeven_exit_enabled = bool(cfg["ladderBreakevenExitEnabled"])
+        self.ladder_breakeven_buffer_pct = float(cfg["ladderBreakevenBufferPct"])
+        # iter 37
+        self.ladder_hard_stop_from_avg_enabled = bool(cfg["ladderHardStopFromAvgEnabled"])
+        self.ladder_hard_stop_from_avg_pct = float(cfg["ladderHardStopFromAvgPct"])
+        self.ladder_buy2_staleness_enabled = bool(cfg["ladderBuy2StalenessEnabled"])
+        self.ladder_buy2_staleness_minutes = int(cfg["ladderBuy2StalenessMinutes"])
+        # iter 38
+        self.ntp_enabled = bool(cfg["nearTopPumpFilterEnabled"])
+        self.ntp_min_24h_change_pct = float(cfg["nearTopPumpMin24hChangePct"])
+        self.ntp_max_from_high_pct = float(cfg["nearTopPumpMaxFromHighPct"])
+        # iter 39
+        self.ld_enabled = bool(cfg["liquidityDeathExitEnabled"])
+        self.ld_catastrophic_drop_pct = float(cfg["liquidityDeathCatastrophicDropPct"])
+        self.ld_min_hold_min = int(cfg["liquidityDeathMinHoldMin"])
+        self.ld_min_drop_pct = float(cfg["liquidityDeathMinDropPct"])
+        self.ld_lookback_min = int(cfg["liquidityDeathLookbackMin"])
+        self.ld_vol_collapse_threshold = float(cfg["liquidityDeathVolCollapseThreshold"])
+        self.ld_lower_lows_threshold = float(cfg["liquidityDeathLowerLowsThreshold"])
+        self.ld_red_share_threshold = float(cfg["liquidityDeathRedShareThreshold"])
+        self.ld_exit_score_threshold = int(cfg["liquidityDeathExitScoreThreshold"])
+        self.ld_stagnation_hold_min = int(cfg["liquidityDeathStagnationHoldMin"])
+        self.ld_stagnation_max_drop_pct = float(cfg["liquidityDeathStagnationMaxDropPct"])
+        # iter 41 — Post-Buy-2 careful monitor
+        self.a2_enabled = bool(cfg["active2MonitorEnabled"])
+        self.a2_grace_minutes = int(cfg["active2GracePeriodMinutes"])
+        self.a2_quick_profit_pct = float(cfg["active2QuickProfitPct"])
+        self.a2_tight_breakeven_buffer_pct = float(cfg["active2TightBreakevenBufferPct"])
+        self.a2_patience_minutes = int(cfg["active2PatienceMinutes"])
+        self.a2_no_recovery_drop_pct = float(cfg["active2NoRecoveryDropPct"])
+        self.a2_hard_stop_pct = float(cfg["active2HardStopPct"])
+        # iter 43 — Volatility-Adaptive Entry + TP
+        self.ae_enabled = bool(cfg["adaptiveEntryEnabled"])
+        self.ae_tier_calm_max = float(cfg["adaptiveTierCalmMaxPct"])
+        self.ae_tier_normal_max = float(cfg["adaptiveTierNormalMaxPct"])
+        self.ae_tier_volatile_max = float(cfg["adaptiveTierVolatileMaxPct"])
+        self.ae_buy1_calm = float(cfg["adaptiveBuy1OffsetCalm"])
+        self.ae_buy1_normal = float(cfg["adaptiveBuy1OffsetNormal"])
+        self.ae_buy1_volatile = float(cfg["adaptiveBuy1OffsetVolatile"])
+        self.ae_buy1_xvolatile = float(cfg["adaptiveBuy1OffsetXVolatile"])
+        self.ae_buy2_calm = float(cfg["adaptiveBuy2OffsetCalm"])
+        self.ae_buy2_normal = float(cfg["adaptiveBuy2OffsetNormal"])
+        self.ae_buy2_volatile = float(cfg["adaptiveBuy2OffsetVolatile"])
+        self.ae_buy2_xvolatile = float(cfg["adaptiveBuy2OffsetXVolatile"])
+        self.ae_tp_calm = float(cfg["adaptiveTpTargetCalm"])
+        self.ae_tp_normal = float(cfg["adaptiveTpTargetNormal"])
+        self.ae_tp_volatile = float(cfg["adaptiveTpTargetVolatile"])
+        self.ae_tp_xvolatile = float(cfg["adaptiveTpTargetXVolatile"])
+        # iter 44 — Macro-Top Exhaustion Filter
+        self.mt_enabled = bool(cfg["macroTopFilterEnabled"])
+        self.mt_min_return_pct = float(cfg["macroTopMinReturnPct"])
+        self.mt_within_high_pct = float(cfg["macroTopWithinHighPct"])
+        self.mt_min_red_days_in_7 = int(cfg["macroTopMinRedDaysIn7"])
+        # iter 45 — Volatility Regime Filter
+        self.vr_enabled = bool(cfg["volRegimeFilterEnabled"])
+        self.vr_max_daily_range_pct = float(cfg["volRegimeMaxDailyRangePct"])
+        self.vr_big_crash_pct = float(cfg["volRegimeBigCrashPct"])
+        self.vr_lookback_days = int(cfg["volRegimeLookbackDays"])
+        # iter 46 — Market Stress Exit
+        self.ms_enabled = bool(cfg["marketStressExitEnabled"])
+        self.ms_min_hold_min = int(cfg["marketStressMinHoldMin"])
+        self.ms_min_drop_pct = float(cfg["marketStressMinDropPct"])
+        self.ms_btc_weakness_pct = float(cfg["marketStressBtcWeaknessPct"])
+        self.ms_btc_lookback_min = int(cfg["marketStressBtcLookbackMin"])
+        self.ms_vol_spike_mult = float(cfg["marketStressVolSpikeMult"])
+        self.ms_red_share_threshold = float(cfg["marketStressRedShareThreshold"])
+        if self.metrics is not None:
+            self.metrics.enabled = bool(cfg["metricsEnabled"])
+        self.config_loaded = True
+
+    def _is_live(self) -> bool:
+        return self.client is not None and self.live_mode
+
+    @staticmethod
+    def _to_ccxt_symbol(symbol: str) -> str:
+        """BTCUSDT → BTC/USDT for ccxt's market lookups."""
+        if "/" in symbol:
+            return symbol
+        if symbol.endswith("USDT"):
+            return f"{symbol[:-4]}/USDT"
+        return symbol
+
+    @staticmethod
+    def _round_step(value: float, step: float) -> float:
+        """Round *value* down to the nearest *step* (Binance lot size)."""
+        if step <= 0:
+            return value
+        d = (Decimal(str(value)) / Decimal(str(step))).to_integral_value(rounding=ROUND_DOWN)
+        return float(d * Decimal(str(step)))
+
+    def _get_filters(self, symbol: str):
+        """Cache (step_size, tick_size, min_notional) per symbol."""
+        if symbol in self.symbol_filters:
+            return self.symbol_filters[symbol]
+        if self.client is None:
+            return None
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            self.client.load_markets()
+            market = self.client.market(ccxt_sym)
+            f = {
+                'step_size':    float(market.get('precision', {}).get('amount') or 0.00000001),
+                'tick_size':    float(market.get('precision', {}).get('price')  or 0.00000001),
+                'min_notional': float((market.get('limits', {}).get('cost') or {}).get('min') or 5.0),
+            }
+            # ccxt's "precision" can be returned as decimal-place count rather
+            # than tick — convert to a step if so. (e.g. precision=8 → 1e-8.)
+            if f['step_size'] >= 1:
+                f['step_size'] = 10 ** -int(f['step_size'])
+            if f['tick_size'] >= 1:
+                f['tick_size'] = 10 ** -int(f['tick_size'])
+            self.symbol_filters[symbol] = f
+            return f
+        except Exception as e:
+            print(f"⚠️ [VIRTUAL] filter fetch failed for {symbol}: {e}")
+            return None
+
+    # ── Paper Laddered Recovery (multi-ladder) ──────────────────────────
+    # Mirrors Fast Scalper's logic but uses simulated fills (price ≤ limit
+    # = filled). Separate Redis hash so paper + real state never collide.
+    PAPER_LADDERS_HASH = "VIRTUAL:LADDER_STATES"
+
+    def _paper_ladder_count(self) -> int:
+        try:
+            return self.r.hlen(self.PAPER_LADDERS_HASH) or 0
+        except Exception:
+            return 0
+
+    def _paper_ladder_can_open(self) -> bool:
+        return self._paper_ladder_count() < self.max_concurrent_ladders
+
+    def _paper_ladder_load(self, symbol: str):
+        try:
+            raw = self.r.hget(self.PAPER_LADDERS_HASH, symbol)
+            if not raw: return None
+            return ladder.LadderState.from_dict(json.loads(raw))
+        except Exception:
+            return None
+
+    def _paper_ladder_save(self, state):
+        try:
+            if state.state == ladder.CLOSED:
+                self.r.hdel(self.PAPER_LADDERS_HASH, state.symbol)
+            else:
+                self.r.hset(self.PAPER_LADDERS_HASH, state.symbol, json.dumps(state.to_dict()))
+        except Exception:
+            pass
+
+    def _paper_ladder_clear(self, symbol: str):
+        try:
+            self.r.hdel(self.PAPER_LADDERS_HASH, symbol)
+        except Exception:
+            pass
+
+    def _paper_ladder_load_all(self):
+        try:
+            raw = self.r.hgetall(self.PAPER_LADDERS_HASH)
+        except Exception:
+            return []
+        out = []
+        for sym, val in (raw or {}).items():
+            try:
+                out.append(ladder.LadderState.from_dict(json.loads(val)))
+            except Exception:
+                try: self.r.hdel(self.PAPER_LADDERS_HASH, sym)
+                except Exception: pass
+        return out
+
+    def _paper_ladder_active_for_symbol(self, symbol: str) -> bool:
+        return self._paper_ladder_load(symbol) is not None
+
+    def _paper_ladder_start(self, symbol, signal_price, features=None):
+        """Start a ladder. Real-money path uses Binance (when live_mode=True);
+        paper path simulates instant fill. Both share the same state machine."""
+        if self._is_live() and self.client is not None:
+            self._ladder_start_live(symbol, signal_price, features=features)
+        else:
+            self._ladder_start_paper(symbol, signal_price, features=features)
+
+    def _ladder_start_paper(self, symbol, signal_price, features=None):
+        """Paper start: simulate instant buy 1 fill at signal price."""
+        now_ms = int(time.time() * 1000)
+        adapt = self._compute_adaptive_entry_params(features)
+        buy1_qty = self.ladder_buy1_size / max(signal_price, 1e-12)
+        state = ladder.LadderState(
+            symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+            state=ladder.ACTIVE_1,
+            buy_1=ladder.Leg(
+                label="buy_1", target_price=signal_price,
+                size_usdt=self.ladder_buy1_size,
+                qty_filled=buy1_qty * 0.999,
+                fill_price=signal_price, fill_ts=now_ms, status="filled",
+            ),
+            pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+            dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+            dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+            dyn_tp_target_usdt=adapt['tp_target_usdt'],
+            dyn_strategy=adapt['strategy'],
+        )
+        # 2026-05-11 iter 6: reference price = Buy 1 fill price (= signal
+        # in paper since no spread). Keeps semantics identical to live.
+        ref_price = state.buy_1.fill_price if state.buy_1 else signal_price
+        # iter 43: use per-ladder dyn Buy 2 offset
+        eff_buy2_off = adapt['buy2_offset_pct'] if adapt['buy2_offset_pct'] > 0 else self.ladder_buy2_offset_pct
+        state.buy_2 = ladder.Leg(
+            label="buy_2",
+            target_price=ref_price * (1 - eff_buy2_off / 100.0),
+            size_usdt=self.ladder_buy2_size, status="pending",
+        )
+        state.buy_3 = ladder.Leg(
+            label="buy_3",
+            target_price=ref_price * (1 - self.ladder_buy3_offset_pct / 100.0),
+            size_usdt=self.ladder_buy3_size, status="pending",
+        )
+        state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
+        self._paper_ladder_save(state)
+        print(f"🪜 [paper-ladder] {symbol} buy 1 filled @ {signal_price} "
+              f"buy2@{state.buy_2.target_price:.6g} buy3@{state.buy_3.target_price:.6g} "
+              f"tp@{state.tp_target_price:.6g}")
+        if self.metrics is not None:
+            audit = self._compute_audit_snapshot(symbol, signal_price, signal_price)
+            self.metrics.buy_placed(
+                symbol, signal_price, self.ladder_buy1_size,
+                features=features, order_type="virtual_ladder_buy_1_paper",
+                **audit,
+            )
+            self.metrics.fill_recorded(symbol, signal_price, state.buy_1.qty_filled)
+
+    def _compute_audit_snapshot(self, symbol, signal_price, buy1_limit_price):
+        """Same logic as Fast Scalper's helper — but sync (Virtual uses sync ccxt).
+        Captures pre_signal_price (5m back), pre_signal_price_2 (10m back),
+        past 15m extremes, Buy 2 limit, three target-sell prices, and tags
+        scalper_origin = 'VIRTUAL'."""
+        out = {
+            "signal_price": signal_price,
+            "buy_1_limit_price": buy1_limit_price,
+            "pre_signal_price": None,
+            "pre_signal_price_2": None,
+            "past_15min_low": None,
+            "past_15min_high": None,
+            "buy_2_limit_price": None,
+            "target_sell_005": None,
+            "target_sell_010": None,
+            "target_sell_015": None,
+            "scalper_origin": "VIRTUAL",
+        }
+        if self.client is not None:
+            try:
+                ccxt_sym = self._to_ccxt_symbol(symbol)
+                candles = self.client.fetch_ohlcv(ccxt_sym, "1m", limit=20)
+                if candles and len(candles) >= 5:
+                    pre1 = candles[-6] if len(candles) >= 6 else candles[0]
+                    out["pre_signal_price"] = float(pre1[4] or 0)
+                    if len(candles) >= 11:
+                        pre2 = candles[-11]
+                        out["pre_signal_price_2"] = float(pre2[4] or 0)
+                    last_15 = candles[-15:] if len(candles) >= 15 else candles
+                    highs = [float(c[2] or 0) for c in last_15 if float(c[2] or 0) > 0]
+                    lows  = [float(c[3] or 0) for c in last_15 if float(c[3] or 0) > 0]
+                    if highs: out["past_15min_high"] = max(highs)
+                    if lows:  out["past_15min_low"]  = min(lows)
+            except Exception as e:
+                print(f"audit 15m candles failed for {symbol}: {e}")
+        try:
+            out["buy_2_limit_price"] = signal_price * (1 - self.ladder_buy2_offset_pct / 100.0)
+        except Exception:
+            pass
+        fee_2 = 2 * self.ladder_fee_rate_per_side
+        try:
+            buy_size = self.ladder_buy1_size or 1.0
+            for net, key in ((0.05, "target_sell_005"), (0.10, "target_sell_010"), (0.15, "target_sell_015")):
+                tp_pct = (net / buy_size) + fee_2
+                out[key] = buy1_limit_price * (1 + tp_pct)
+        except Exception:
+            pass
+        return out
+
+    def _has_sufficient_usdt(self, required: float) -> bool:
+        """Pre-flight balance check (sync). Returns True if we can proceed."""
+        if self.client is None: return True
+        try:
+            bal = self.client.fetch_balance()
+            free = float((bal.get('USDT') or {}).get('free') or 0)
+        except Exception as e:
+            print(f"⚠️ [v-ladder] balance fetch failed ({e}); proceeding")
+            return True
+        # 2026-05-12 iter 13: margin 10% → 3% (mirrors Fast Scalper).
+        # Fees on $100 ladder are ~$0.20 net; 3% = $3 buffer is plenty.
+        margin = required * 0.03
+        if free < required + margin:
+            print(f"⚠️ [v-ladder] insufficient USDT: free=${free:.4f} need=${required:.4f} (+margin)")
+            return False
+        return True
+
+    def _handle_external_cancel_live(self, state, who: str):
+        """Manual cancel detected — bot STANDS DOWN on this symbol.
+
+        iter 23 (2026-05-13): mirrors the Fast Scalper change. The bot
+        no longer cancels any other bot-placed orders when the operator
+        manually cancels one — the operator is taking control and any
+        bot interference (cancelling Buy 2, placing a new TP, etc.) just
+        fights against their manual position management. Setting
+        cooldown so the bot doesn't auto-enter this symbol again, and
+        leaving the held qty untouched (operator sells it themselves)."""
+        print(f"🛑 [v-ladder] {state.symbol} {who} cancelled externally — bot STANDING DOWN "
+              f"(no auto-cancel of other legs; operator is in control)")
+
+        remaining = []
+        for leg in (state.buy_1, state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                remaining.append(f"{leg.label}@{leg.order_id} ({leg.target_price})")
+                # iter 23: do not cancel. Mark as operator-managed.
+                leg.status = "operator_managed"
+        if state.tp_order_id and who != "TP":
+            remaining.append(f"tp@{state.tp_order_id} ({state.tp_target_price})")
+        if remaining:
+            print(f"   [v-ladder] {state.symbol} bot-placed orders left ALONE for operator: {remaining}")
+        state.tp_order_id = None
+
+        # Record + free
+        state.state = ladder.CLOSED
+        state.exit_reason = "manual_cancel"
+        state.closed_ts = int(time.time() * 1000)
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, state.weighted_avg() or 0,
+                                           0, reason="manual_cancel", pnl_usdt=0)
+            except Exception:
+                pass
+        self._paper_ladder_clear(state.symbol)
+        ladder.set_cooldown(self.r, state.symbol, self.ladder_cooldown_seconds)
+
+    # iter 87 — HARD KILL SWITCH for Virtual Scalper (live path).
+    # Mirrors iter86 / iter87 in other paths.  Manual-only mode.
+    HARD_DISABLE_AUTOBUY: bool = True
+
+    # iter 94 — HARD KILL SWITCH for Virtual Scalper SELLs.
+    # Blocks every exit path so the operator manages every sell on
+    # Binance directly. Flip by editing this constant + redeploy.
+    HARD_DISABLE_AUTOSELL: bool = True
+
+    def _publish_blocked_sell(self, symbol, price, reason, source="virtual_scalper"):
+        """iter 94 — publish a 'would-have-sold' event so the dashboard
+        shows which positions the bot wanted to exit.
+        """
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            date = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "virtual_scalper_sell",
+                "source": source,
+                "reason": reason,
+                "would_sell_price": float(price) if price is not None else None,
+                "blocked_by": "HARD_DISABLE_AUTOSELL",
+            }
+            payload = _json.dumps(event)
+            self.r.rpush(f"BOT_SELL_SIGNALS:{date}", payload)
+            self.r.expire(f"BOT_SELL_SIGNALS:{date}", 14 * 24 * 3600)
+            self.r.hset("BOT_SELL_SIGNALS:LATEST", symbol, payload)
+            print(f"⛔ [v-scalper-sell-block] {symbol} {reason} @ {price} blocked")
+        except Exception as e:
+            print(f"[v-scalper-sell-block] publish failed: {e}")
+
+    def _publish_scalper_signal(self, symbol, signal_price, features, source="ladder"):
+        """iter 88 — When Virtual Scalper would have bought but is blocked
+        by HARD_DISABLE_AUTOBUY, publish a signal so operator sees it.
+        Redis key: VIRTUAL_SCALPER:DETECTIONS:<date>
+        """
+        import json as _json
+        from datetime import datetime, timezone
+        try:
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            event = {
+                "ts": int(time.time() * 1000),
+                "symbol": symbol,
+                "kind": "virtual_scalper",
+                "source": source,
+                "signal_price": float(signal_price),
+                "features": features or {},
+                "would_buy": True,
+                "blocked_by": "HARD_DISABLE_AUTOBUY",
+            }
+            payload = _json.dumps(event)
+            self.r.rpush(f"VIRTUAL_SCALPER:DETECTIONS:{date}", payload)
+            self.r.expire(f"VIRTUAL_SCALPER:DETECTIONS:{date}", 14 * 24 * 3600)
+            self.r.hset("VIRTUAL_SCALPER:LATEST", symbol, payload)
+            print(f"📡 [v-scalper-signal] {symbol} would_buy @ {signal_price} (source={source})")
+        except Exception as e:
+            print(f"[v-scalper-signal] publish failed: {e}")
+
+    def _ladder_start_live(self, symbol, signal_price, features=None):
+        """Live start: place Buy 1 as MARKET (default) so Buy 2/3 limits
+        can be placed in the same call. Falls back to aggressive-limit-
+        at-ask when ladderBuy1UseMarketOrder is False."""
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            self._publish_scalper_signal(symbol, signal_price, features, source="ladder")
+            print(f"[v-ladder-live] {symbol} ignored — HARD_DISABLE_AUTOBUY=True (manual-only mode)")
+            return
+        f = self._get_filters(symbol)
+        if f is None:
+            print(f"⚠️ [v-ladder] {symbol} missing filters; skipping")
+            return
+        # Pre-flight balance check: full 3-leg total
+        total_needed = (self.ladder_buy1_size
+                        + self.ladder_buy2_size + self.ladder_buy3_size)
+        if not self._has_sufficient_usdt(total_needed):
+            print(f"⏸️  [v-ladder] {symbol} skipped — funds short for full ladder")
+            return
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        tick = f['tick_size'] or 0.00000001
+        now_ms = int(time.time() * 1000)
+
+        # Determine routing: offset > 0 takes priority over market flag
+        cfg = {}
+        try:
+            raw = self.r.get(TRADING_CONFIG_KEY)
+            if raw: cfg = json.loads(raw)
+        except Exception:
+            pass
+        use_market = bool(cfg.get("ladderBuy1UseMarketOrder", True))
+        buy1_offset = float(cfg.get("ladderBuy1OffsetPct", 0.15))
+
+        # iter 43: compute volatility-adaptive params from features
+        adapt = self._compute_adaptive_entry_params(features)
+        if adapt['strategy'] != 'STATIC':
+            buy1_offset = adapt['buy1_offset_pct']  # dynamic override
+            print(f"🎚️ [v-ladder] {symbol} adaptive={adapt['strategy']} "
+                  f"range_1h={adapt['range_1h_pct']:.2f}% → "
+                  f"buy1={buy1_offset}% buy2={adapt['buy2_offset_pct']}% tp=${adapt['tp_target_usdt']}")
+
+        # ── iter 74 — Pre-buy gates (USDT cooldown + check-coin + depth) ──
+        # Virtual Scalper was the LAST live buy path bypassing the
+        # safety pipeline.  iter74 brings it to parity with everything
+        # else (R1/R2/R3/Pattern Bot/PumpRider/EP/VSP/LMC/CCP/Fast
+        # Scalper) using the shared `pre_buy_gates` module.  Entry
+        # detection logic (above) stays untouched — this is a final
+        # sanity check.  Reverts via Redis flags without redeploy.
+        try:
+            v_block = _vs_pre_buy_gates(symbol, float(self.ladder_buy1_size), cfg, self.r)
+        except Exception:
+            v_block = None
+        if v_block:
+            print(f"⛔ [v-ladder] {symbol} pre-buy gate BLOCKED: {v_block}")
+            try:
+                self.r.lpush(
+                    f"METRICS:SKIP:{time.strftime('%Y-%m-%d')}",
+                    json.dumps({
+                        "ts": int(time.time() * 1000),
+                        "symbol": symbol,
+                        "rule": "virtual_scalper_pre_buy_gate",
+                        "reason": v_block,
+                        "rule_label": f"VIRTUAL_SCALPER:{adapt['strategy']}",
+                    }),
+                )
+            except Exception:
+                pass
+            return
+
+        # If offset > 0: place LIMIT BUY at signal × (1 - offset/100)
+        if buy1_offset > 0:
+            buy1_price = self._round_step(signal_price * (1 - buy1_offset / 100.0), tick)
+            buy1_qty = self._round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f['step_size'])
+            if buy1_qty * buy1_price < f['min_notional']:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
+                return
+            try:
+                placed = self.client.create_limit_buy_order(ccxt_sym, buy1_qty, buy1_price)
+            except Exception as e:
+                print(f"❌ [v-ladder] {symbol} limit buy failed: {e}")
+                return
+            order_id = str(placed.get("id") or "")
+            if not order_id:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 returned no order id")
+                return
+            state = ladder.LadderState(
+                symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                state=ladder.PENDING_BUY_1,
+                buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
+                                 size_usdt=self.ladder_buy1_size, order_id=order_id),
+                pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+                dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+                dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+                dyn_tp_target_usdt=adapt['tp_target_usdt'],
+                dyn_strategy=adapt['strategy'],
+            )
+            self._paper_ladder_save(state)
+            print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT @ {buy1_price} "
+                  f"(-{buy1_offset}% from signal {signal_price}) qty={buy1_qty} "
+                  f"[strategy={adapt['strategy']}]")
+            if self.metrics is not None:
+                audit = self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+                self.metrics.buy_placed(
+                    symbol, buy1_price, self.ladder_buy1_size,
+                    features=features, order_type="virtual_ladder_buy_1_offset_limit",
+                    offset_pct=buy1_offset, **audit,
+                )
+            return
+
+        if use_market:
+            # MARKET PATH — fast-path: legs 2/3 + TP go on the book immediately
+            buy1_qty = self._round_step(self.ladder_buy1_size / max(signal_price, 1e-12), f['step_size'])
+            if buy1_qty * signal_price < f['min_notional']:
+                print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
+                return
+            try:
+                placed = self.client.create_market_buy_order(ccxt_sym, buy1_qty)
+            except Exception as e:
+                print(f"❌ [v-ladder] {symbol} market buy failed: {e}")
+                return
+            filled_qty = float(placed.get("filled") or buy1_qty)
+            fill_price = float(placed.get("average") or placed.get("price") or signal_price)
+            if filled_qty <= 0:
+                print(f"⚠️ [v-ladder] {symbol} market buy returned filled=0")
+                return
+            base_qty = self._round_step(filled_qty * 0.999, f['step_size'])
+            state = ladder.LadderState(
+                symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+                state=ladder.ACTIVE_1,
+                buy_1=ladder.Leg(
+                    label="buy_1", target_price=fill_price,
+                    size_usdt=self.ladder_buy1_size, order_id=str(placed.get("id") or ""),
+                    qty_filled=base_qty, fill_price=fill_price, fill_ts=now_ms,
+                    status="filled",
+                ),
+                pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+                dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+                dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+                dyn_tp_target_usdt=adapt['tp_target_usdt'],
+                dyn_strategy=adapt['strategy'],
+            )
+            print(f"🪜 [v-ladder] {symbol} buy 1 MARKET filled qty={base_qty} @ {fill_price}")
+            if self.metrics is not None:
+                audit = self._compute_audit_snapshot(symbol, signal_price, fill_price)
+                self.metrics.buy_placed(
+                    symbol, fill_price, self.ladder_buy1_size,
+                    features=features, order_type="virtual_ladder_buy_1_market",
+                    **audit,
+                )
+                self.metrics.fill_recorded(symbol, fill_price, base_qty)
+            self._ladder_place_legs_after_buy1_live(state, f, tick)
+            self._paper_ladder_save(state)
+            return
+
+        # LIMIT PATH (legacy) — wait for fill before placing legs 2/3
+        try:
+            book = self.client.fetch_order_book(ccxt_sym, limit=5)
+            best_ask = float(book["asks"][0][0]) if book.get("asks") else signal_price
+        except Exception:
+            best_ask = signal_price
+        buy1_price = self._round_step(best_ask, tick)
+        buy1_qty = self._round_step(self.ladder_buy1_size / max(buy1_price, 1e-12), f['step_size'])
+        if buy1_qty * buy1_price < f['min_notional']:
+            print(f"⚠️ [v-ladder] {symbol} buy 1 notional too low")
+            return
+        try:
+            placed = self.client.create_limit_buy_order(ccxt_sym, buy1_qty, buy1_price)
+        except Exception as e:
+            print(f"❌ [v-ladder] {symbol} create_limit_buy_order failed: {e}")
+            return
+        order_id = str(placed.get("id") or "")
+        if not order_id:
+            print(f"⚠️ [v-ladder] {symbol} buy 1 returned no order id")
+            return
+        state = ladder.LadderState(
+            symbol=symbol, signal_price=signal_price, signal_ts=now_ms,
+            state=ladder.PENDING_BUY_1,
+            buy_1=ladder.Leg(label="buy_1", target_price=buy1_price,
+                             size_usdt=self.ladder_buy1_size, order_id=order_id),
+            pre_vol_baseline_usdt=float((features or {}).get("pre_vol_baseline_usdt") or 0),
+            dyn_buy1_offset_pct=adapt['buy1_offset_pct'],
+            dyn_buy2_offset_pct=adapt['buy2_offset_pct'],
+            dyn_tp_target_usdt=adapt['tp_target_usdt'],
+            dyn_strategy=adapt['strategy'],
+        )
+        self._paper_ladder_save(state)
+        print(f"🪜 [v-ladder] {symbol} buy 1 LIMIT placed @ {buy1_price} qty={buy1_qty}")
+        if self.metrics is not None:
+            audit = self._compute_audit_snapshot(symbol, signal_price, buy1_price)
+            self.metrics.buy_placed(
+                symbol, buy1_price, self.ladder_buy1_size,
+                features=features, order_type="virtual_ladder_buy_1_limit",
+                **audit,
+            )
+
+    def _ladder_place_legs_after_buy1_live(self, state, f, tick):
+        """Shared helper: places Buy 2/3 limits + TP once buy 1 is filled.
+        Called by both the market fast-path and the polling slow-path.
+
+        2026-05-11 iter 6: reference price is Buy 1's actual fill (was
+        signal_price). Market orders pay the spread; offsets measured
+        from the real entry price are more accurate for DCA logic."""
+        symbol = state.symbol
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        ref_price = (state.buy_1.fill_price if state.buy_1 and state.buy_1.fill_price
+                     else state.signal_price)
+        # iter 43: state-aware dynamic Buy 2 offset
+        eff_buy2_off = (state.dyn_buy2_offset_pct
+                        if getattr(state, 'dyn_buy2_offset_pct', 0) > 0
+                        else self.ladder_buy2_offset_pct)
+        buy2_price = self._round_step(ref_price * (1 - eff_buy2_off / 100.0), tick)
+        buy3_price = self._round_step(ref_price * (1 - self.ladder_buy3_offset_pct / 100.0), tick)
+        buy2_qty = self._round_step(self.ladder_buy2_size / max(buy2_price, 1e-12), f['step_size'])
+        buy3_qty = self._round_step(self.ladder_buy3_size / max(buy3_price, 1e-12), f['step_size'])
+
+        buy2_oid = buy3_oid = None
+        if buy2_qty * buy2_price >= f['min_notional']:
+            try:
+                o2 = self.client.create_limit_buy_order(ccxt_sym, buy2_qty, buy2_price)
+                buy2_oid = str(o2.get('id') or '')
+            except Exception as e:
+                print(f"⚠️ [v-ladder] {symbol} buy 2 placement failed: {e}")
+        if buy3_qty * buy3_price >= f['min_notional']:
+            try:
+                o3 = self.client.create_limit_buy_order(ccxt_sym, buy3_qty, buy3_price)
+                buy3_oid = str(o3.get('id') or '')
+            except Exception as e:
+                print(f"⚠️ [v-ladder] {symbol} buy 3 placement failed: {e}")
+
+        state.buy_2 = ladder.Leg(label="buy_2", target_price=buy2_price,
+                                 size_usdt=self.ladder_buy2_size, order_id=buy2_oid)
+        state.buy_3 = ladder.Leg(label="buy_3", target_price=buy3_price,
+                                 size_usdt=self.ladder_buy3_size, order_id=buy3_oid)
+        self._ladder_place_tp_live(state, state.total_qty(), f, tick)
+        print(f"🪜 [v-ladder] {symbol} legs placed buy2@{buy2_price} buy3@{buy3_price} "
+              f"tp@{state.tp_target_price:.6g}")
+
+    def _paper_ladder_tick(self, curr_price_by_symbol):
+        """Drive all paper ladders forward — called each loop iteration."""
+        states = self._paper_ladder_load_all()
+        if not states: return
+        for state in states:
+            if state.state == ladder.CLOSED: continue
+            sym = state.symbol
+            last = curr_price_by_symbol.get(sym) or self._current_price(sym) or 0
+            if last <= 0: continue
+            try:
+                self._paper_ladder_tick_one(state, last)
+            except Exception as exc:
+                print(f"⚠️ [paper-ladder] tick failed for {sym}: {exc}")
+
+    # ── iter 40 Virtual parity helpers (mirror Fast Scalper iter14/37/38/39)
+    # 2026-05-15: ported from ultra_fast_scalper.py. Logic identical;
+    # implementation is sync because Virtual Scalper uses sync ccxt.
+
+    def _passes_near_top_pump_filter(self, symbol: str, features):
+        """iter 38: SKIP buys when 24h is up >= ntp_min_24h_change_pct AND
+        price is within ntp_max_from_high_pct of the 24h high. Pattern
+        from QNT/USDT 2026-05-15. Reuses features computed by
+        passes_falling_knife — no extra Binance call."""
+        if not self.ntp_enabled:
+            return True
+        if not features:
+            return True
+        try:
+            change_24h = float(features.get("change_24h_pct") or 0.0)
+            from_high = float(features.get("from_24h_high_pct") or 0.0)
+        except (TypeError, ValueError):
+            return True
+        first = change_24h >= self.ntp_min_24h_change_pct
+        second = from_high >= -self.ntp_max_from_high_pct
+        if first and second:
+            reason = (f"near top of 24h pump: 24h_change=+{change_24h:.2f}% "
+                      f"(>= {self.ntp_min_24h_change_pct:.1f}%) AND "
+                      f"from_24h_high={from_high:.2f}% "
+                      f"(within {self.ntp_max_from_high_pct:.1f}% of peak)")
+            print(f"🚧 [{symbol}] virtual skip near_top_pump: {reason}")
+            if self.metrics is not None:
+                try:
+                    self.metrics.signal_skipped(symbol, "near_top_pump", reason, features)
+                except Exception:
+                    pass
+            return False
+        return True
+
+    def _ld_get_recent_1m_klines(self, symbol: str):
+        """Throttled 1m kline fetch for iter39. 30s TTL per symbol so a
+        ladder tick batch doesn't hammer the REST endpoint."""
+        if self.client is None:
+            return None
+        now = time.time()
+        cached = self._ld_kline_cache.get(symbol)
+        if cached and now - cached["ts"] < self._ld_kline_ttl_sec:
+            return cached["candles"]
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            candles = self.client.fetch_ohlcv(ccxt_sym, "1m", limit=self.ld_lookback_min)
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] kline fetch for liquidity-death {symbol} failed: {exc}")
+            return None
+        if not candles:
+            return None
+        self._ld_kline_cache[symbol] = {"ts": now, "candles": candles}
+        return candles
+
+    def _get_btc_recent_1m(self):
+        """iter 46 (Virtual): throttled BTC fetch (30s TTL). Returns a
+        list of OHLCV rows or None."""
+        if self.client is None:
+            return None
+        now = time.time()
+        if (self._btc_cache.get("candles")
+                and now - self._btc_cache.get("ts", 0) < self._btc_cache_ttl_sec):
+            return self._btc_cache["candles"]
+        try:
+            candles = self.client.fetch_ohlcv("BTC/USDT", "1m",
+                                              limit=self.ms_btc_lookback_min + 1)
+        except Exception:
+            return None
+        if candles:
+            self._btc_cache = {"ts": now, "candles": candles}
+        return candles
+
+    def _check_market_stress_exit(self, state, current_price: float, avg: float,
+                                   held_min: float, drop_pct: float):
+        """iter 46 (Virtual parity) — Market Stress Exit.
+
+        Same algorithm as Fast Scalper. Sync version uses
+        _get_btc_recent_1m (30s cached) and _ld_get_recent_1m_klines
+        (also 30s cached) so this doesn't spam the REST endpoint."""
+        if not self.ms_enabled:
+            return False, ""
+        if held_min < self.ms_min_hold_min:
+            return False, ""
+        if drop_pct < self.ms_min_drop_pct:
+            return False, ""
+
+        # Trigger 1: BTC weakness
+        btc = self._get_btc_recent_1m()
+        if btc and len(btc) >= 2:
+            try:
+                btc_now = float(btc[-1][4])
+                btc_ago = float(btc[0][4])
+                if btc_ago > 0:
+                    btc_chg = (btc_now / btc_ago - 1) * 100
+                    if btc_chg <= -self.ms_btc_weakness_pct:
+                        return True, (f"market_stress:btc_weakness "
+                                      f"BTC={btc_chg:+.2f}% in {self.ms_btc_lookback_min}m "
+                                      f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        # Triggers 2 + 3: symbol klines (cached)
+        candles = self._ld_get_recent_1m_klines(state.symbol) or []
+        baseline = state.pre_vol_baseline_usdt or 0.0
+        if candles and baseline > 0:
+            try:
+                last = candles[-1]
+                last_vol_usdt = float(last[5]) * float(last[4])
+                spike_ratio = last_vol_usdt / baseline
+                is_red = float(last[4]) < float(last[1])
+                if spike_ratio >= self.ms_vol_spike_mult and is_red:
+                    return True, (f"market_stress:vol_capitulation "
+                                  f"vol={spike_ratio:.1f}× baseline RED "
+                                  f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        if candles and len(candles) >= 10:
+            try:
+                recent = candles[-10:]
+                red_count = sum(1 for r in recent
+                                if float(r[4]) < float(r[1]))
+                red_share = red_count / 10
+                if red_share >= self.ms_red_share_threshold:
+                    return True, (f"market_stress:red_velocity "
+                                  f"red_share={red_share*100:.0f}% "
+                                  f"drop={drop_pct:.2f}% held={held_min:.0f}m")
+            except Exception:
+                pass
+
+        return False, ""
+
+    def _check_active2_monitor(self, state, current_price: float, avg: float,
+                                drop_pct: float):
+        """iter 41 (Virtual parity): Post-Buy-2 Careful Monitor.
+
+        Mirrors the Fast Scalper algorithm — see ``_check_active2_monitor``
+        there for the full design rationale. Differences are purely
+        sync (uses ``self._ld_get_recent_1m_klines`` for kline access)."""
+        if not self.a2_enabled:
+            return False, ""
+        if state.state != ladder.ACTIVE_2:
+            return False, ""
+        if not (state.buy_2 and state.buy_2.fill_ts and state.buy_2.fill_price):
+            return False, ""
+
+        now_ms = int(time.time() * 1000)
+        held_since_b2_min = (now_ms - int(state.buy_2.fill_ts)) / 60_000.0
+
+        # 1. Grace period
+        if held_since_b2_min < self.a2_grace_minutes:
+            return False, ""
+
+        # 2. Quick profit
+        qp_threshold = avg * (1 + self.a2_quick_profit_pct / 100.0)
+        if current_price >= qp_threshold:
+            return True, (f"active2_quick_profit "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_quick_profit_pct}%)=${qp_threshold:.6g} "
+                          f"held={held_since_b2_min:.0f}m")
+
+        # Pull klines for #3 + #4
+        candles = self._ld_get_recent_1m_klines(state.symbol) or []
+
+        # 3. Tight breakeven
+        tb_threshold = avg * (1 + self.a2_tight_breakeven_buffer_pct / 100.0)
+        ever_underwater_since_b2 = False
+        ever_recovered_since_b2 = False
+        for c in candles:
+            try:
+                ts = int(c[0])
+                if ts < int(state.buy_2.fill_ts):
+                    continue
+                if float(c[3]) < avg:    # low < avg
+                    ever_underwater_since_b2 = True
+                if float(c[2]) >= avg * 0.999:  # high >= avg×0.999
+                    ever_recovered_since_b2 = True
+            except Exception:
+                continue
+        if not candles:
+            ever_underwater_since_b2 = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+            ever_recovered_since_b2 = True
+
+        if ever_underwater_since_b2 and current_price >= tb_threshold:
+            return True, (f"active2_tight_breakeven "
+                          f"current=${current_price:.6g} >= "
+                          f"avg×(1+{self.a2_tight_breakeven_buffer_pct}%)=${tb_threshold:.6g}")
+
+        # 4. No recovery
+        if (held_since_b2_min >= self.a2_patience_minutes
+                and drop_pct >= self.a2_no_recovery_drop_pct
+                and not ever_recovered_since_b2):
+            return True, (f"active2_no_recovery "
+                          f"held={held_since_b2_min:.0f}m drop={drop_pct:.2f}% "
+                          f"never_touched_avg")
+
+        # 5. Hard stop
+        if self.a2_hard_stop_pct > 0 and drop_pct >= self.a2_hard_stop_pct:
+            return True, (f"active2_hard_stop drop={drop_pct:.2f}% "
+                          f">= {self.a2_hard_stop_pct}%")
+
+        return False, ""
+
+    def _check_liquidity_death(self, state, current_price: float, avg: float,
+                               held_min: float, drop_pct: float):
+        """iter 39: multi-factor adaptive hard-stop. Returns
+        (should_exit, reason). Same algorithm as the Fast Scalper —
+        see _check_liquidity_death there for the full forensic.
+
+        Sync version: fetches its own 1m klines via self.client (cached
+        30s/symbol) since Virtual has no KlinesCache."""
+        if not self.ld_enabled:
+            return False, ""
+        if avg <= 0 or current_price <= 0:
+            return False, ""
+
+        # Tier 1: catastrophic.
+        if (self.ld_catastrophic_drop_pct > 0
+                and drop_pct >= self.ld_catastrophic_drop_pct):
+            return True, f"liquidity_death:catastrophic drop={drop_pct:.2f}%"
+
+        candles = self._ld_get_recent_1m_klines(state.symbol)
+        if not candles or len(candles) < max(3, self.ld_lookback_min // 2):
+            return False, ""
+
+        opens = [float(c[1]) for c in candles]
+        highs = [float(c[2]) for c in candles]
+        lows = [float(c[3]) for c in candles]
+        closes = [float(c[4]) for c in candles]
+        vols = [float(c[5]) for c in candles]   # base-asset volume
+
+        n = len(candles)
+        recent_usdt = sum(v * c for v, c in zip(vols, closes))
+        vol_per_min = recent_usdt / n if n > 0 else 0.0
+        baseline = state.pre_vol_baseline_usdt or 0.0
+        vol_ratio = (vol_per_min / baseline) if baseline > 0 else 1.0
+
+        lower_lows = sum(1 for i in range(1, n) if lows[i] < lows[i - 1])
+        lower_lows_pct = lower_lows / max(1, n - 1)
+        red = sum(1 for o, c in zip(opens, closes) if c < o)
+        red_share = red / n
+        max_high = max(highs)
+        ever_recovered = max_high >= avg * 0.999
+
+        # Tier 2: score-based.
+        if held_min >= self.ld_min_hold_min and drop_pct >= self.ld_min_drop_pct:
+            score = 0
+            factors = []
+            if vol_ratio < self.ld_vol_collapse_threshold:
+                score += 3; factors.append(f"vol={vol_ratio:.2f}x")
+                if vol_ratio < self.ld_vol_collapse_threshold * 0.5:
+                    score += 2; factors.append("vol_extreme")
+            if not ever_recovered:
+                score += 2; factors.append("never_recovered")
+            if drop_pct >= 1.0:
+                score += 2; factors.append(f"drop={drop_pct:.2f}%")
+            if lower_lows_pct >= self.ld_lower_lows_threshold:
+                score += 2; factors.append(f"ll={lower_lows_pct:.0%}")
+            if red_share >= self.ld_red_share_threshold:
+                score += 1; factors.append(f"red={red_share:.0%}")
+            if score >= self.ld_exit_score_threshold:
+                reason = (f"liquidity_death:score={score} "
+                          + " ".join(factors)
+                          + f" drop={drop_pct:.2f}% held={held_min:.0f}m")
+                return True, reason
+
+        # Tier 3: stagnation.
+        if (held_min >= self.ld_stagnation_hold_min and
+                0 <= drop_pct <= self.ld_stagnation_max_drop_pct and
+                vol_ratio < self.ld_vol_collapse_threshold and
+                (state.tp_target_price <= 0 or
+                 max_high / state.tp_target_price < 0.7)):
+            return True, (f"liquidity_death:stagnation "
+                          f"held={held_min:.0f}m drop={drop_pct:.2f}% "
+                          f"vol={vol_ratio:.2f}x no_tp_approach")
+        return False, ""
+
+    def _maybe_force_exit_ladder_live(self, state, f, last):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(state.symbol, last, "v_force_exit_ladder_live", source="_maybe_force_exit_ladder_live")
+            except Exception:
+                pass
+            print(f"[v-ForceExit] {state.symbol} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return False
+        """iter 14 + 37 + 39 (Virtual): unified force-exit pipeline.
+        Returns True iff the ladder was closed via a force exit (caller
+        should ``return`` immediately, skipping further state-machine
+        handlers for this tick).
+
+        Resolution order (first match wins):
+          0-A liquidity-death (iter 39, multi-factor)
+          0-B fixed hard-stop fallback (iter 37)
+          1   breakeven recovery (iter 14)
+          2   time exit (iter 14)
+        """
+        if state is None or state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return False
+        if not (self.ladder_time_exit_enabled
+                or self.ladder_breakeven_exit_enabled
+                or self.ladder_hard_stop_from_avg_enabled
+                or self.ld_enabled):
+            return False
+
+        filled = [L for L in (state.buy_1, state.buy_2, state.buy_3)
+                  if L and L.qty_filled and L.fill_price]
+        if not filled:
+            return False
+        total_qty = sum(L.qty_filled for L in filled)
+        total_cost = sum(L.qty_filled * L.fill_price for L in filled)
+        avg = total_cost / total_qty if total_qty > 0 else 0
+        if avg <= 0:
+            return False
+
+        # Use the tick's `last` price (already fetched by the scanner)
+        # — avoids a per-tick fetch_ticker round-trip.
+        current_price = float(last or 0)
+        if current_price <= 0:
+            return False
+
+        now_ms = int(time.time() * 1000)
+        signal_ts = int(state.signal_ts or 0)
+        age_sec = (now_ms - signal_ts) / 1000.0 if signal_ts else 0
+        fill_ts = state.buy_1.fill_ts if state.buy_1 else 0
+        held_min = ((now_ms - fill_ts) / 60_000.0) if fill_ts else 0.0
+        drop_pct = (avg - current_price) / avg * 100
+        be_threshold = avg * (1 + self.ladder_breakeven_buffer_pct / 100.0)
+        hs_threshold = avg * (1 - self.ladder_hard_stop_from_avg_pct / 100.0)
+
+        force_reason = None
+
+        # Path -1 (iter 41): POST-BUY-2 CAREFUL MONITOR — runs FIRST
+        # whenever the ladder is in ACTIVE_2. Uses a specialised tree
+        # with grace period + quick-profit + tight-breakeven + no-recovery
+        # + tighter hard-stop. Falls through to the other paths below.
+        a2_exit, a2_reason = self._check_active2_monitor(
+            state, current_price, avg, drop_pct,
+        )
+        if a2_exit:
+            force_reason = a2_reason
+
+        # Path -0.5 (iter 46): MARKET STRESS EXIT — earlier than iter39.
+        if force_reason is None:
+            ms_exit, ms_reason = self._check_market_stress_exit(
+                state, current_price, avg, held_min, drop_pct,
+            )
+            if ms_exit:
+                force_reason = ms_reason
+
+        # Path 0-A: liquidity-death smart exit
+        if force_reason is None:
+            ld_exit, ld_reason = self._check_liquidity_death(
+                state, current_price, avg, held_min, drop_pct,
+            )
+            if ld_exit:
+                force_reason = ld_reason
+
+        # Path 0-B: fixed hard-stop fallback
+        if (force_reason is None
+                and self.ladder_hard_stop_from_avg_enabled
+                and self.ladder_hard_stop_from_avg_pct > 0
+                and current_price <= hs_threshold):
+            force_reason = "hard_stop_from_avg"
+
+        # Path 1: breakeven recovery — but skip in ACTIVE_2 (iter 41 has
+        # a tighter breakeven exit which took precedence above).
+        ever_underwater = (state.total_underwater_ms or 0) > 0 or (state.below_avg_started_ts or 0) > 0
+        if (force_reason is None
+                and state.state != ladder.ACTIVE_2
+                and self.ladder_breakeven_exit_enabled
+                and ever_underwater
+                and current_price >= be_threshold):
+            force_reason = "breakeven_recovery"
+
+        # Path 2: time exit
+        if (force_reason is None
+                and self.ladder_time_exit_enabled
+                and age_sec >= self.ladder_max_hold_seconds):
+            force_reason = "time_exit"
+
+        if force_reason is None:
+            return False
+
+        # Cancel TP if any
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        if state.tp_order_id:
+            try:
+                self.client.cancel_order(state.tp_order_id, ccxt_sym)
+            except Exception:
+                pass
+            state.tp_order_id = None
+        # Cancel any unfilled buy legs
+        for leg in (state.buy_2, state.buy_3):
+            if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                try:
+                    self.client.cancel_order(leg.order_id, ccxt_sym)
+                except Exception:
+                    pass
+                leg.status = "cancelled"
+                leg.order_id = None
+
+        sell_qty = self._round_step(total_qty * 0.999, f["step_size"])
+        if sell_qty <= 0:
+            print(f"⚠️ [v-ladder] {state.symbol} force-exit qty rounded to 0; clearing")
+            self._paper_ladder_close(state, current_price, force_reason)
+            return True
+
+        exit_price = current_price
+        try:
+            sold = self.client.create_market_sell_order(ccxt_sym, sell_qty)
+            exit_price = float(sold.get("average") or sold.get("price") or current_price)
+            print(f"🚪 [v-ladder] {state.symbol} {force_reason} — sold {sell_qty} @ ~${exit_price:.6g}")
+        except Exception as exc:
+            print(f"❌ [v-ladder] {state.symbol} force-exit market sell failed: {exc}; clearing anyway")
+
+        # Compute PnL (fee-adjusted)
+        pnl = (exit_price - avg) * total_qty
+        pnl -= 2 * self.ladder_fee_rate_per_side * total_cost
+        if self.metrics is not None:
+            try:
+                self.metrics.exit_recorded(state.symbol, avg, exit_price,
+                                           reason=force_reason, pnl_usdt=pnl)
+            except Exception:
+                pass
+        print(f"🪜 [v-ladder] {state.symbol} CLOSED reason={force_reason} "
+              f"net=${pnl:+.4f} age={age_sec/60:.1f}m avg=${avg:.6g} exit=${exit_price:.6g}")
+        self._paper_ladder_close(state, exit_price, force_reason)
+        return True
+
+    def _maybe_cancel_stale_buy2(self, state, last):
+        """iter 37 (Virtual): if Buy 2 LIMIT hasn't filled within
+        ladder_buy2_staleness_minutes after Buy 1's fill, cancel Buy 2
+        (and Buy 3 if any). Refreshes TP at the new (Buy 1 only) avg.
+        Returns True if a cancel happened."""
+        if not self.ladder_buy2_staleness_enabled:
+            return False
+        if state.state != ladder.ACTIVE_1:
+            return False
+        if not (state.buy_2 and state.buy_2.order_id
+                and state.buy_1 and state.buy_1.fill_ts):
+            return False
+        if state.buy_2.status in ("filled", "cancelled"):
+            return False
+        staleness_ms = self.ladder_buy2_staleness_minutes * 60 * 1000
+        age = int(time.time() * 1000) - int(state.buy_1.fill_ts)
+        if age < staleness_ms:
+            return False
+
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        try:
+            self.client.cancel_order(state.buy_2.order_id, ccxt_sym)
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] {state.symbol} stale buy 2 cancel failed: {exc}")
+        state.buy_2.status = "cancelled"
+        state.buy_2.order_id = None
+        if state.buy_3 and state.buy_3.order_id:
+            try:
+                self.client.cancel_order(state.buy_3.order_id, ccxt_sym)
+            except Exception:
+                pass
+            state.buy_3.status = "cancelled"
+            state.buy_3.order_id = None
+
+        # Refresh TP at Buy 1-only avg.
+        f = self._get_filters(state.symbol)
+        if f is not None:
+            tick = f.get("tick_size") or 0.00000001
+            try:
+                self._ladder_refresh_tp_live(state, f, tick)
+            except Exception as exc:
+                print(f"⚠️ [v-ladder] {state.symbol} TP refresh after stale buy 2 failed: {exc}")
+        self._paper_ladder_save(state)
+        print(f"⏱️  [v-ladder] {state.symbol} buy 2 cancelled — stale "
+              f"({age/60000:.1f}m >= {self.ladder_buy2_staleness_minutes}m); "
+              f"new TP={state.tp_target_price:.6g}")
+        return True
+
+    def _ladder_update_underwater(self, state, last):
+        """Mirror of the paper-tick underwater accumulator. Required so
+        the iter14 breakeven-recovery exit knows whether the ladder ever
+        went underwater. Called from _ladder_tick_one_live every tick."""
+        if state.state in (ladder.CLOSED, ladder.PENDING_BUY_1):
+            return
+        avg = state.weighted_avg()
+        if avg <= 0 or not last or last <= 0:
+            return
+        now_ms = int(time.time() * 1000)
+        if last < avg:
+            if state.below_avg_started_ts == 0:
+                state.below_avg_started_ts = now_ms
+        else:
+            if state.below_avg_started_ts > 0:
+                state.total_underwater_ms += (now_ms - state.below_avg_started_ts)
+                state.below_avg_started_ts = 0
+
+    def _paper_ladder_tick_one(self, state, last):
+        """Dispatch: live mode polls Binance, paper mode simulates."""
+        if self._is_live() and self.client is not None and self._state_is_live(state):
+            self._ladder_tick_one_live(state, last)
+        else:
+            self._ladder_tick_one_paper(state, last)
+
+    def _state_is_live(self, state) -> bool:
+        """A state is 'live' if any leg has an order_id (real Binance order)."""
+        for leg in (state.buy_1, state.buy_2, state.buy_3):
+            if leg and leg.order_id:
+                return True
+        return False
+
+    def _ladder_tick_one_paper(self, state, last):
+        """Per-ladder state transitions — paper mode."""
+        sym = state.symbol
+        now_ms = int(time.time() * 1000)
+
+        # TP check
+        if state.tp_target_price > 0 and last >= state.tp_target_price:
+            self._paper_ladder_close(state, last, ladder.EXIT_TP)
+            return
+
+        # Hard stop (only when buy 3 filled)
+        if state.state == ladder.ACTIVE_3 and state.hard_stop_price > 0 and last <= state.hard_stop_price:
+            self._paper_ladder_close(state, last, ladder.EXIT_STOP)
+            return
+
+        # ACTIVE_1: watch buy 2 and buy 3 limits
+        if state.state == ladder.ACTIVE_1:
+            if state.buy_2 and state.buy_2.status == "pending" and last <= state.buy_2.target_price:
+                qty = state.buy_2.size_usdt / max(state.buy_2.target_price, 1e-12)
+                state.buy_2.qty_filled = qty * 0.999
+                state.buy_2.fill_price = state.buy_2.target_price
+                state.buy_2.fill_ts = now_ms
+                state.buy_2.status = "filled"
+                # Cancel buy 3 per operator rule
+                if state.buy_3:
+                    state.buy_3.status = "cancelled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
+                state.state = ladder.ACTIVE_2
+                print(f"📥 [paper-ladder] {sym} buy 2 filled @ {state.buy_2.target_price:.6g} "
+                      f"avg={state.weighted_avg():.6g} new TP={state.tp_target_price:.6g}; buy 3 cancelled")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_2.target_price, state.buy_2.qty_filled)
+            elif state.buy_3 and state.buy_3.status == "pending" and last <= state.buy_3.target_price:
+                # Gap-down: buy 3 fills first
+                qty = state.buy_3.size_usdt / max(state.buy_3.target_price, 1e-12)
+                state.buy_3.qty_filled = qty * 0.999
+                state.buy_3.fill_price = state.buy_3.target_price
+                state.buy_3.fill_ts = now_ms
+                state.buy_3.status = "filled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
+                state.hard_stop_price = ladder.hard_stop_price(
+                    state.buy_3.target_price, self.ladder_hard_stop_pct
+                )
+                state.state = ladder.ACTIVE_3
+                print(f"📥 [paper-ladder] {sym} buy 3 filled (gap) @ {state.buy_3.target_price:.6g} "
+                      f"avg={state.weighted_avg():.6g} hard_stop={state.hard_stop_price:.6g}")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_3.target_price, state.buy_3.qty_filled)
+
+        elif state.state == ladder.ACTIVE_2:
+            if state.buy_3 and state.buy_3.status == "pending" and last <= state.buy_3.target_price:
+                # Race condition: cancel didn't beat fill. Honour the fill.
+                qty = state.buy_3.size_usdt / max(state.buy_3.target_price, 1e-12)
+                state.buy_3.qty_filled = qty * 0.999
+                state.buy_3.fill_price = state.buy_3.target_price
+                state.buy_3.fill_ts = now_ms
+                state.buy_3.status = "filled"
+                state.tp_target_price = ladder.tp_price(state.weighted_avg(), self._effective_tp_pct(state))
+                state.hard_stop_price = ladder.hard_stop_price(
+                    state.buy_3.target_price, self.ladder_hard_stop_pct
+                )
+                state.state = ladder.ACTIVE_3
+                print(f"📥 [paper-ladder] {sym} buy 3 race-filled @ {state.buy_3.target_price:.6g}")
+                if self.metrics is not None:
+                    self.metrics.fill_recorded(sym, state.buy_3.target_price, state.buy_3.qty_filled)
+
+        # Underwater tracking for TBE
+        if state.filled_legs():
+            avg = state.weighted_avg()
+            if last < avg:
+                if state.below_avg_started_ts == 0:
+                    state.below_avg_started_ts = now_ms
+            else:
+                if state.below_avg_started_ts > 0:
+                    state.total_underwater_ms += (now_ms - state.below_avg_started_ts)
+                    state.below_avg_started_ts = 0
+                    state.recovered_to_break_even = True
+
+        self._paper_ladder_save(state)
+
+    # ── Live-mode per-ladder transitions (real Binance polling) ──────────
+    def _ladder_tick_one_live(self, state, last):
+        sym = state.symbol
+        ccxt_sym = self._to_ccxt_symbol(sym)
+        f = self._get_filters(sym)
+        if f is None: return
+        tick = f.get('tick_size') or 0.00000001
+        now_ms = int(time.time() * 1000)
+
+        # iter 40 (Virtual parity, 2026-05-15): unified force-exit
+        # pipeline. Checks liquidity-death (iter39), fixed hard-stop
+        # fallback (iter37), breakeven-recovery (iter14), time-exit
+        # (iter14) BEFORE the normal state-machine handlers. If any
+        # fires, the ladder is closed and we return.
+        try:
+            self._ladder_update_underwater(state, last)
+            if self._maybe_force_exit_ladder_live(state, f, last):
+                return
+            # iter 37: Buy 2 staleness — cancel stale Buy 2 LIMIT
+            if self._maybe_cancel_stale_buy2(state, last):
+                return
+        except Exception as exc:
+            print(f"⚠️ [v-ladder] {sym} force-exit pipeline error: {exc}")
+
+        # 1. PENDING_BUY_1 (slow-path limit): poll Buy 1, then place legs
+        if state.state == ladder.PENDING_BUY_1 and state.buy_1 and state.buy_1.order_id:
+            try:
+                o = self.client.fetch_order(state.buy_1.order_id, ccxt_sym)
+            except Exception:
+                return
+            status = (o.get('status') or '').lower()
+            if status in ('canceled', 'cancelled', 'expired'):
+                self._handle_external_cancel_live(state, "buy 1")
+                return
+            if status != 'closed':
+                return
+            filled_qty = float(o.get('filled') or 0)
+            fill_price = float(o.get('average') or o.get('price') or state.buy_1.target_price)
+            if filled_qty <= 0:
+                self._paper_ladder_clear(sym)
+                return
+            base_qty = self._round_step(filled_qty * 0.999, f['step_size'])
+            state.buy_1.qty_filled = base_qty
+            state.buy_1.fill_price = fill_price
+            state.buy_1.fill_ts = now_ms
+            state.buy_1.status = "filled"
+            state.state = ladder.ACTIVE_1
+            self._ladder_place_legs_after_buy1_live(state, f, tick)
+            self._paper_ladder_save(state)
+            print(f"✅ [v-ladder] {sym} buy 1 (limit) filled qty={base_qty} @ {fill_price}")
+            if self.metrics is not None:
+                self.metrics.fill_recorded(sym, fill_price, base_qty)
+            return
+
+        # 2. ACTIVE_*: poll TP and remaining buy orders
+        # TP check first
+        if state.tp_order_id:
+            try:
+                tp_o = self.client.fetch_order(state.tp_order_id, ccxt_sym)
+                tp_status = (tp_o.get('status') or '').lower()
+                if tp_status == 'closed':
+                    exit_price = float(tp_o.get('average') or tp_o.get('price') or state.tp_target_price)
+                    self._paper_ladder_close(state, exit_price, ladder.EXIT_TP)
+                    return
+                if tp_status in ('canceled', 'cancelled', 'expired'):
+                    self._handle_external_cancel_live(state, "TP")
+                    return
+            except Exception:
+                pass
+
+        # In ACTIVE_1: watch buy 2 and buy 3
+        if state.state == ladder.ACTIVE_1:
+            if state.buy_2 and state.buy_2.order_id:
+                try:
+                    o2 = self.client.fetch_order(state.buy_2.order_id, ccxt_sym)
+                except Exception:
+                    o2 = None
+                o2_status = (o2.get('status') or '').lower() if o2 else ''
+                if o2_status in ('canceled', 'cancelled', 'expired'):
+                    self._handle_external_cancel_live(state, "buy 2")
+                    return
+                if o2 and o2_status == 'closed':
+                    qty = float(o2.get('filled') or 0)
+                    price = float(o2.get('average') or o2.get('price') or state.buy_2.target_price)
+                    if qty > 0:
+                        state.buy_2.qty_filled = self._round_step(qty * 0.999, f['step_size'])
+                        state.buy_2.fill_price = price
+                        state.buy_2.fill_ts = now_ms
+                        state.buy_2.status = "filled"
+                        # Cancel buy 3
+                        if state.buy_3 and state.buy_3.order_id:
+                            try: self.client.cancel_order(state.buy_3.order_id, ccxt_sym)
+                            except Exception: pass
+                            state.buy_3.status = "cancelled"
+                            state.buy_3.order_id = None
+                        self._ladder_refresh_tp_live(state, f, tick)
+                        state.state = ladder.ACTIVE_2
+                        self._paper_ladder_save(state)
+                        print(f"📥 [v-ladder] {sym} buy 2 filled @ {price} avg={state.weighted_avg():.6g} "
+                              f"new TP={state.tp_target_price:.6g}; buy 3 cancelled")
+                        if self.metrics is not None:
+                            self.metrics.fill_recorded(sym, price, state.buy_2.qty_filled)
+                        return
+            # Buy 3 gap-fill check
+            if state.buy_3 and state.buy_3.order_id:
+                try:
+                    o3 = self.client.fetch_order(state.buy_3.order_id, ccxt_sym)
+                except Exception:
+                    o3 = None
+                o3_status = (o3.get('status') or '').lower() if o3 else ''
+                if o3_status in ('canceled', 'cancelled', 'expired'):
+                    state.buy_3.status = "cancelled"
+                    state.buy_3.order_id = None
+                    self._paper_ladder_save(state)
+                    print(f"⚠️  [v-ladder] {sym} buy 3 cancelled externally; continuing")
+                    return
+                if o3 and o3_status == 'closed':
+                    qty = float(o3.get('filled') or 0)
+                    price = float(o3.get('average') or o3.get('price') or state.buy_3.target_price)
+                    if qty > 0:
+                        state.buy_3.qty_filled = self._round_step(qty * 0.999, f['step_size'])
+                        state.buy_3.fill_price = price
+                        state.buy_3.fill_ts = now_ms
+                        state.buy_3.status = "filled"
+                        self._ladder_refresh_tp_live(state, f, tick)
+                        state.hard_stop_price = ladder.hard_stop_price(price, self.ladder_hard_stop_pct, tick)
+                        state.state = ladder.ACTIVE_3
+                        self._paper_ladder_save(state)
+                        print(f"📥 [v-ladder] {sym} buy 3 gap-filled @ {price} hard_stop={state.hard_stop_price:.6g}")
+                        if self.metrics is not None:
+                            self.metrics.fill_recorded(sym, price, state.buy_3.qty_filled)
+                        return
+
+        elif state.state == ladder.ACTIVE_3:
+            # Hard-stop check using live ticker
+            if state.hard_stop_price > 0 and last > 0 and last <= state.hard_stop_price:
+                print(f"🛡️ [v-ladder] {sym} HARD STOP @ {last:.6g} threshold={state.hard_stop_price:.6g}")
+                if state.tp_order_id:
+                    try: self.client.cancel_order(state.tp_order_id, ccxt_sym)
+                    except Exception: pass
+                qty = state.total_qty()
+                try:
+                    book = self.client.fetch_order_book(ccxt_sym, limit=5)
+                    bid = float(book['bids'][0][0]) if book.get('bids') else last
+                    bid = self._round_step(bid, tick)
+                    sell = self.client.create_limit_sell_order(ccxt_sym, qty, bid)
+                    exit_price = float(sell.get('average') or sell.get('price') or bid)
+                except Exception as e:
+                    print(f"⚠️ [v-ladder] hard-stop sell failed for {sym}: {e}")
+                    exit_price = last
+                self._paper_ladder_close(state, exit_price, ladder.EXIT_STOP)
+                return
+
+        # Underwater tracking
+        if state.filled_legs() and last > 0:
+            avg = state.weighted_avg()
+            if last < avg:
+                if state.below_avg_started_ts == 0:
+                    state.below_avg_started_ts = now_ms
+            else:
+                if state.below_avg_started_ts > 0:
+                    state.total_underwater_ms += (now_ms - state.below_avg_started_ts)
+                    state.below_avg_started_ts = 0
+                    state.recovered_to_break_even = True
+        self._paper_ladder_save(state)
+
+    def _compute_adaptive_entry_params(self, features):
+        """iter 43 (Virtual parity) — same algorithm as Fast Scalper."""
+        defaults = {
+            'strategy': 'STATIC',
+            'buy1_offset_pct': self.ladder_buy1_offset_pct,
+            'buy2_offset_pct': self.ladder_buy2_offset_pct,
+            'tp_target_usdt':  self.ladder_target_net_usdt,
+            'range_1h_pct':    -1.0,
+        }
+        if not self.ae_enabled or not features:
+            return defaults
+        try:
+            r1h = float(features.get('range_1h_pct') or -1)
+        except (TypeError, ValueError):
+            return defaults
+        if r1h < 0:
+            return defaults
+        if r1h < self.ae_tier_calm_max:
+            return {'strategy':'CALM',
+                    'buy1_offset_pct': self.ae_buy1_calm,
+                    'buy2_offset_pct': self.ae_buy2_calm,
+                    'tp_target_usdt':  self.ae_tp_calm,
+                    'range_1h_pct':    r1h}
+        if r1h < self.ae_tier_normal_max:
+            return {'strategy':'NORMAL',
+                    'buy1_offset_pct': self.ae_buy1_normal,
+                    'buy2_offset_pct': self.ae_buy2_normal,
+                    'tp_target_usdt':  self.ae_tp_normal,
+                    'range_1h_pct':    r1h}
+        if r1h < self.ae_tier_volatile_max:
+            return {'strategy':'VOLATILE',
+                    'buy1_offset_pct': self.ae_buy1_volatile,
+                    'buy2_offset_pct': self.ae_buy2_volatile,
+                    'tp_target_usdt':  self.ae_tp_volatile,
+                    'range_1h_pct':    r1h}
+        return {'strategy':'X_VOLATILE',
+                'buy1_offset_pct': self.ae_buy1_xvolatile,
+                'buy2_offset_pct': self.ae_buy2_xvolatile,
+                'tp_target_usdt':  self.ae_tp_xvolatile,
+                'range_1h_pct':    r1h}
+
+    def _effective_tp_pct(self, state=None) -> float:
+        """Same semantics as Fast Scalper. iter 43: state-aware dynamic TP."""
+        if state is not None and getattr(state, 'dyn_tp_target_usdt', 0) > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                state.dyn_tp_target_usdt,
+                self.ladder_fee_rate_per_side,
+            )
+        if self.ladder_target_net_usdt > 0:
+            return ladder.required_tp_pct_for_net_profit(
+                self.ladder_buy1_size,
+                self.ladder_target_net_usdt,
+                self.ladder_fee_rate_per_side,
+            )
+        return self.ladder_tp_from_avg_pct
+
+    def _ladder_place_tp_live(self, state, qty_total, f, tick):
+        """Place a LIMIT SELL at avg × (1 + tp_pct) — real Binance."""
+        avg = state.weighted_avg()
+        tp_p = ladder.tp_price(avg, self._effective_tp_pct(state), tick)  # iter 43
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        try:
+            placed = self.client.create_limit_sell_order(ccxt_sym, qty_total, tp_p)
+            state.tp_order_id = str(placed.get('id') or '')
+            state.tp_target_price = tp_p
+        except Exception as e:
+            print(f"⚠️ [v-ladder] {state.symbol} TP placement failed: {e}")
+            state.tp_order_id = None
+            state.tp_target_price = tp_p
+
+    def _ladder_refresh_tp_live(self, state, f, tick):
+        """Cancel old TP + place fresh TP at updated avg."""
+        ccxt_sym = self._to_ccxt_symbol(state.symbol)
+        if state.tp_order_id:
+            try: self.client.cancel_order(state.tp_order_id, ccxt_sym)
+            except Exception: pass
+        qty_total = state.total_qty()
+        self._ladder_place_tp_live(state, qty_total, f, tick)
+
+    def _paper_ladder_close(self, state, exit_price, reason):
+        """Finalise a ladder — cancel pending legs, record metrics, clear."""
+        # When in live mode, cancel any still-pending Buy 2 / Buy 3 limit
+        # orders on Binance so they don't fill after we've already exited.
+        if self._is_live() and self.client is not None:
+            ccxt_sym = self._to_ccxt_symbol(state.symbol)
+            for leg in (state.buy_2, state.buy_3):
+                if leg and leg.order_id and leg.status not in ("filled", "cancelled"):
+                    try:
+                        self.client.cancel_order(leg.order_id, ccxt_sym)
+                        leg.status = "cancelled"
+                        leg.order_id = None
+                        print(f"🚫 [v-ladder] {state.symbol} cancelled pending {leg.label} on close")
+                    except Exception:
+                        pass
+
+        if state.below_avg_started_ts > 0:
+            state.total_underwater_ms += int(time.time() * 1000) - state.below_avg_started_ts
+            state.below_avg_started_ts = 0
+        state.state = ladder.CLOSED
+        state.exit_reason = reason
+        state.closed_ts = int(time.time() * 1000)
+        summary = ladder.summarise_closed_trade(state, exit_price)
+
+        if self.metrics is not None:
+            avg = summary["weighted_avg"]
+            net = summary["net_pnl_usdt"]
+            if reason == ladder.EXIT_TP:
+                self.metrics.tp_hit(state.symbol, avg, exit_price)
+            self.metrics.exit_recorded(state.symbol, avg, exit_price,
+                                       reason=f"paper_{reason}", pnl_usdt=net)
+
+        try:
+            date = datetime.now().strftime("%Y-%m-%d")
+            key = f"METRICS:LADDER_PAPER:{date}"
+            self.r.lpush(key, json.dumps(summary))
+            self.r.ltrim(key, 0, 999)
+            self.r.expire(key, 30 * 24 * 3600)
+        except Exception:
+            pass
+
+        try:
+            archive_closed_trade(state.symbol, "VIRTUAL_LADDER", {
+                "entry_price": summary["weighted_avg"],
+                "exit_price": exit_price,
+                "qty": summary["qty"],
+                "investment": summary["invested_usdt"],
+                "pnl_usdt": summary["net_pnl_usdt"],
+                "pnl_pct": (
+                    (exit_price - summary["weighted_avg"]) / summary["weighted_avg"] * 100.0
+                ) if summary["weighted_avg"] else 0.0,
+                "fees_paid": summary["fees_usdt"],
+                "reason": f"VIRTUAL_LADDER_{reason.upper()}",
+                "exit_time": datetime.now().strftime("%H:%M:%S"),
+            })
+        except Exception:
+            pass
+
+        color = "🟢" if summary["net_pnl_usdt"] > 0 else "🔴"
+        print(f"{color}🪜 [paper-ladder] {state.symbol} CLOSED reason={reason} "
+              f"net=${summary['net_pnl_usdt']:+.4f} buys_filled={summary['buys_filled']} "
+              f"rer_recovered={summary['rer_recovered']} tbe_min={summary['tbe_minutes']:.1f}")
+        self._paper_ladder_clear(state.symbol)
+        # Per-coin cooldown to prevent immediate re-entry
+        ladder.set_cooldown(self.r, state.symbol, self.ladder_cooldown_seconds)
+
+    def passes_falling_knife(self, symbol, timeline):
+        """Apply the same 3 falling-knife rules used by the Fast Scalper,
+        but using the recent ANALYSIS_020_TIMELINE timeline points instead
+        of a Binance ticker. Returns ``(ok, features_dict)``.
+
+        Heuristic: timeline stores per-tick price+volume snapshots. We use
+        the last ~60 points as a 1h proxy and the entire timeline as a
+        24h proxy. Falls open (returns ok=True) if data is too sparse.
+
+        2026-05-11 iter 9: also enforces the 24h-volume floor (Fast Scalper
+        applies this in evaluate_entry; mirroring here for parity)."""
+        if not self.fk_enabled or not timeline:
+            return True, None
+
+        # 24h volume gate — uses Binance ticker (cached briefly).
+        try:
+            min_vol = float(self.r.get('TRADING_CONFIG') and __import__('json').loads(self.r.get('TRADING_CONFIG') or '{}').get('minVol24hUsd', 2_000_000) or 2_000_000)
+        except Exception:
+            min_vol = 2_000_000
+        if self.client is not None and min_vol > 0:
+            try:
+                tk = self.client.fetch_ticker(self._to_ccxt_symbol(symbol))
+                vol_24h = float(tk.get('quoteVolume') or 0)
+                if vol_24h < min_vol:
+                    reason = f"24h vol ${vol_24h/1_000_000:.2f}M < ${min_vol/1_000_000:.0f}M floor"
+                    if self.metrics is not None:
+                        self.metrics.signal_skipped(symbol, "low_volume_24h", reason,
+                                                    {"symbol": symbol, "vol_24h_usd": vol_24h})
+                    return False, {"symbol": symbol, "vol_24h_usd": vol_24h, "reason": reason}
+            except Exception:
+                pass
+
+        try:
+            prices = [float(t.get("price", 0) or 0) for t in timeline]
+            prices = [p for p in prices if p > 0]
+            if len(prices) < 10:
+                return True, None
+
+            curr = prices[-1]
+            window = prices[-60:] if len(prices) >= 60 else prices
+            hi_1h = max(window); lo_1h = min(window)
+            range_1h_pct = (hi_1h - lo_1h) / lo_1h * 100 if lo_1h else 0
+            change_1h_pct = (curr - window[0]) / window[0] * 100 if window[0] else 0
+            origin = prices[0]
+            change_24h_pct = (curr - origin) / origin * 100 if origin else 0
+
+            # Pre-signal USDT-volume baseline = avg per-tick (price × vol)
+            # over the last 60 ticks. Used by the fast-drop filter to
+            # decide whether a quick down-move is real capitulation.
+            usdt_vols = []
+            for t in timeline[-60:]:
+                p = float(t.get("price") or 0); v = float(t.get("volume") or 0)
+                if p > 0 and v > 0:
+                    usdt_vols.append(p * v)
+            pre_vol_baseline_usdt = (sum(usdt_vols) / len(usdt_vols)) if usdt_vols else 0.0
+
+            features = {
+                "symbol": symbol, "price": curr,
+                "change_24h_pct": change_24h_pct,
+                "change_1h_pct": change_1h_pct,
+                "range_1h_pct": range_1h_pct,
+                "high_1h": hi_1h, "low_1h": lo_1h,
+                "pre_vol_baseline_usdt": pre_vol_baseline_usdt,
+            }
+
+            if change_24h_pct > self.fk_max_24h:
+                reason = f"24h change {change_24h_pct:+.2f}% > {self.fk_max_24h}%"
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "pump_24h", reason, features)
+                return False, features
+
+            if range_1h_pct > self.fk_max_1h_range:
+                reason = f"1h range {range_1h_pct:.2f}% > {self.fk_max_1h_range}%"
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "volatile_1h", reason, features)
+                return False, features
+
+            if (self.fk_overbought_skip and change_24h_pct > 0
+                    and change_1h_pct > self.fk_overbought_60m):
+                reason = (f"overbought (24h {change_24h_pct:+.2f}% AND "
+                          f"60m {change_1h_pct:+.2f}%)")
+                if self.metrics is not None:
+                    self.metrics.signal_skipped(symbol, "overbought", reason, features)
+                return False, features
+
+            return True, features
+        except Exception:
+            return True, None
+
+    def _fetch_d1_klines(self, symbol):
+        """Cached fetch of daily klines (sync). One Binance REST call per
+        symbol per 10 minutes. Returns None if data unavailable."""
+        if self.client is None:
+            return None
+        now = time.time()
+        cached = self._d1_cache.get(symbol)
+        if cached and (now - cached["_ts"]) < self._d1_cache_ttl_sec:
+            return cached["data"]
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            limit = self.pp_lookback_days + self.pp_baseline_days + 2
+            data = self.client.fetch_ohlcv(ccxt_sym, "1d", limit=limit)
+        except Exception:
+            return None
+        if data:
+            self._d1_cache[symbol] = {"_ts": now, "data": data}
+        return data
+
+    def _passes_vol_regime_filter(self, symbol):
+        """iter 45 (Virtual parity) — Volatility Regime Filter.
+
+        Mirrors Fast Scalper. Returns (True, None) when allowed."""
+        if not self.vr_enabled:
+            return True, None
+        candles = self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 3:
+            return True, None
+        recent = candles[-self.vr_lookback_days:]
+        try:
+            highs = [float(k[2]) for k in recent]
+            lows  = [float(k[3]) for k in recent]
+            opens = [float(k[1]) for k in recent]
+            closes= [float(k[4]) for k in recent]
+        except Exception:
+            return True, None
+        if any(l <= 0 for l in lows) or any(o <= 0 for o in opens):
+            return True, None
+        ranges = [(h - l) / l * 100 for h, l in zip(highs, lows)]
+        max_range = max(ranges) if ranges else 0
+        daily_changes = [(c - o) / o * 100 for o, c in zip(opens, closes)]
+        worst_day = min(daily_changes) if daily_changes else 0
+        block_range = max_range > self.vr_max_daily_range_pct
+        block_crash = worst_day <= -self.vr_big_crash_pct
+        if not (block_range or block_crash):
+            return True, None
+        triggers = []
+        if block_range: triggers.append(f"max_5d_range={max_range:.1f}% > {self.vr_max_daily_range_pct}%")
+        if block_crash: triggers.append(f"worst_day={worst_day:+.1f}% <= -{self.vr_big_crash_pct}%")
+        reason = "vol regime: " + " AND ".join(triggers)
+        feats = {"filter":"vol_regime","max_5d_range_pct":round(max_range,2),"worst_5d_day_pct":round(worst_day,2)}
+        print(f"🌪️ [{symbol}] virtual skip vol_regime: {reason}")
+        if self.metrics is not None:
+            try: self.metrics.signal_skipped(symbol, "vol_regime", reason, feats)
+            except Exception: pass
+        return False, feats
+
+    def _passes_macro_top_filter(self, symbol):
+        """iter 44 (Virtual parity) — Macro-Top Exhaustion Filter.
+
+        Mirrors the Fast Scalper algorithm. Returns (True, None) when
+        the buy is allowed; (False, features) when it must be skipped."""
+        if not self.mt_enabled:
+            return True, None
+        candles = self._fetch_d1_klines(symbol)
+        if not candles or len(candles) < 8:
+            return True, None
+        candles = candles[-30:]
+        try:
+            closes = [float(k[4]) for k in candles]
+            opens  = [float(k[1]) for k in candles]
+            highs  = [float(k[2]) for k in candles]
+        except Exception:
+            return True, None
+        if closes[0] <= 0:
+            return True, None
+        last_close = closes[-1]
+        h30 = max(highs)
+        ret30 = (last_close / closes[0] - 1) * 100
+        within_hi = (last_close / h30) * 100 if h30 > 0 else 0
+        red7 = sum(1 for o, cl in zip(opens[-7:], closes[-7:]) if cl < o)
+        block = (ret30 >= self.mt_min_return_pct
+                 and within_hi >= self.mt_within_high_pct
+                 and red7 >= self.mt_min_red_days_in_7)
+        if not block:
+            return True, None
+        reason = (f"macro-top exhaustion: 30d_return={ret30:+.1f}% "
+                  f"(>= {self.mt_min_return_pct}%) AND "
+                  f"within_30d_high={within_hi:.1f}% "
+                  f"(>= {self.mt_within_high_pct}%) AND "
+                  f"red_days_in_7={red7} (>= {self.mt_min_red_days_in_7})")
+        feats = {"filter": "macro_top",
+                 "30d_return_pct": round(ret30, 2),
+                 "30d_high": h30,
+                 "within_30d_high_pct": round(within_hi, 2),
+                 "red_days_in_7": red7,
+                 "last_close": last_close}
+        print(f"🪦 [{symbol}] virtual skip macro_top: {reason}")
+        if self.metrics is not None:
+            try:
+                self.metrics.signal_skipped(symbol, "macro_top", reason, feats)
+            except Exception:
+                pass
+        return False, feats
+
+    def _passes_post_pump_filter(self, symbol):
+        """Daily-timeframe post-pump-bleed filter (mirrors Fast Scalper).
+
+        The 24h/1h falling-knife filter cannot see multi-day pumps. This
+        filter looks at the last (lookback + baseline) daily candles to
+        catch coins that pumped hard a few days ago and are now bleeding
+        off the peak — JTO is the canonical case (2026-05-12 loss).
+
+        Returns (ok, features_dict). On any data error returns (True, None)
+        so a Binance hiccup does not silently disable the filter.
+        """
+        if not self.pp_enabled:
+            return True, None
+        data = self._fetch_d1_klines(symbol)
+        if not data or len(data) < (self.pp_lookback_days + 2):
+            return True, None
+        try:
+            closes = [float(c[4]) for c in data]
+            highs  = [float(c[2]) for c in data]
+        except Exception:
+            return True, None
+
+        L = self.pp_lookback_days
+        B = self.pp_baseline_days
+        current_price = closes[-1]
+        ma7 = sum(closes[-7:]) / 7 if len(closes) >= 7 else current_price
+
+        pump_window = highs[-(L + 1):-1]
+        if not pump_window:
+            return True, None
+        peak = max(pump_window)
+        peak_idx = pump_window.index(peak)
+        days_since_peak = (len(pump_window) - 1) - peak_idx
+
+        baseline_slice = closes[-(L + 1 + B):-(L + 1)]
+        if not baseline_slice:
+            return True, None
+        baseline = sum(baseline_slice) / len(baseline_slice)
+        if baseline <= 0:
+            return True, None
+
+        pump_pct = (peak - baseline) / baseline * 100.0
+        off_peak_pct = (peak - current_price) / peak * 100.0 if peak > 0 else 0.0
+
+        features = {
+            "filter": "post_pump_bleed",
+            "current_price": round(current_price, 8),
+            "ma7": round(ma7, 8),
+            "peak_14d": round(peak, 8),
+            "baseline_7d_pre_pump": round(baseline, 8),
+            "pump_pct": round(pump_pct, 2),
+            "off_peak_pct": round(off_peak_pct, 2),
+            "days_since_peak": int(days_since_peak),
+        }
+
+        # iter 21: MA7 gate is opt-in. See ultra_fast_scalper.py for context.
+        gates_met = (
+            pump_pct        >= self.pp_threshold_pct       and
+            off_peak_pct    >= self.pp_off_peak_min_pct    and
+            days_since_peak >= self.pp_min_days_since_peak
+        )
+        if gates_met and self.pp_require_below_ma7:
+            gates_met = current_price < ma7
+        rejected = gates_met
+        if rejected:
+            ma7_note = f", < MA7 {ma7:.4f}" if self.pp_require_below_ma7 else ""
+            reason = (f"post-pump bleed: pumped +{pump_pct:.0f}% to {peak:.4f} "
+                      f"{days_since_peak}d ago, now {current_price:.4f} "
+                      f"(-{off_peak_pct:.1f}% off peak{ma7_note})")
+            print(f"📉 [{symbol}] virtual skip post_pump_bleed: {reason}")
+            if self.metrics is not None:
+                self.metrics.signal_skipped(symbol, "post_pump_bleed", reason, features)
+            return False, features
+        return True, features
 
     def _load_trading_config(self):
         """Read live TradingConfig from Redis at position-open time.
@@ -62,12 +2319,21 @@ class VirtualScalpExecutor:
         last_heartbeat = 0
         while True:
             try:
+                # iter 22: STRICT Redis read. _sync_live_mode sets
+                # self.config_loaded only when all required keys are
+                # present; if False, we skip the cycle and don't trade.
+                self._sync_live_mode()
+                if not self.config_loaded:
+                    time.sleep(5)
+                    continue
+
                 now = time.time()
                 all_analysis = self.r.hgetall(ANALYSIS_020_KEY)
 
                 if now - last_heartbeat > 30:
                     active_pos_count = self.r.hlen(VIRTUAL_POSITIONS_KEY)
-                    print(f"💓 [HEARTBEAT] Monitoring {len(all_analysis)} coins | Active Virtual Positions: {active_pos_count}")
+                    mode = "LIVE" if self._is_live() else "PAPER"
+                    print(f"💓 [HEARTBEAT] mode={mode} | Monitoring {len(all_analysis)} coins | Active Positions: {active_pos_count}")
                     last_heartbeat = now
 
                 # Sweep PENDING_LIMIT orders first so a fill from this
@@ -75,6 +2341,22 @@ class VirtualScalpExecutor:
                 # Decoupled from the analysis loop so orders on coins
                 # that drop out still get cleaned up.
                 self._sweep_pending_orders()
+
+                # Drive paper-ladder state machines (if enabled). Build a
+                # quick {symbol: latest_price} map so each ladder doesn't
+                # need to refetch.
+                if self.ladder_enabled and ladder is not None:
+                    px_map = {}
+                    for symbol, data_json in all_analysis.items():
+                        try:
+                            tl = json.loads(data_json)
+                            if tl: px_map[symbol] = float(tl[-1].get("price") or 0)
+                        except Exception:
+                            pass
+                    try:
+                        self._paper_ladder_tick(px_map)
+                    except Exception as exc:
+                        print(f"⚠️ paper-ladder tick failed: {exc}")
 
                 for symbol, data_json in all_analysis.items():
                     timeline = json.loads(data_json)
@@ -86,11 +2368,62 @@ class VirtualScalpExecutor:
                     curr_vol = last.get('volume', 0)
 
                     if signal == 'SCALP_BUY_SIGNAL':
-                        # Skip if there's already any state (PENDING_LIMIT
-                        # or OPEN) for this symbol — prevents duplicate
-                        # orders on hot signals.
-                        if not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
-                            self.place_limit_order(symbol, curr_price)
+                        # Laddered Recovery (paper or live): multi-coin
+                        # gate + 3-tier averaging-down. Falls back to the
+                        # legacy single-limit path when ladder mode is off.
+                        if self.ladder_enabled and ladder is not None:
+                            if ladder.is_active_anywhere(self.r, symbol):
+                                pass  # already in flight (either scalper)
+                            elif ladder.is_on_cooldown(self.r, symbol):
+                                pass  # on per-coin cooldown
+                            elif ladder.count_total_active(self.r) >= self.max_concurrent_ladders:
+                                pass  # GLOBAL cap reached across both scalpers
+                            else:
+                                ok, features = self.passes_falling_knife(symbol, timeline)
+                                if self.metrics is not None:
+                                    self.metrics.signal_evaluated(
+                                        symbol, curr_price, features=features,
+                                        decision="pass" if ok else "skipped",
+                                    )
+                                if ok:
+                                    # iter 38 (Virtual parity): near-top pump filter
+                                    if not self._passes_near_top_pump_filter(symbol, features):
+                                        pass
+                                    # iter 44: macro-top exhaustion
+                                    elif not self._passes_macro_top_filter(symbol)[0]:
+                                        pass
+                                    # iter 45: volatility regime
+                                    elif not self._passes_vol_regime_filter(symbol)[0]:
+                                        pass
+                                    else:
+                                        pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                        if pp_ok:
+                                            self._paper_ladder_start(symbol, curr_price, features=features)
+                                else:
+                                    print(f"🔪 [{symbol}] virtual buy skipped by filter")
+                        # Legacy single-limit path: still honoured when
+                        # ladder is off.
+                        elif not self.r.hexists(VIRTUAL_POSITIONS_KEY, symbol):
+                            ok, features = self.passes_falling_knife(symbol, timeline)
+                            if self.metrics is not None:
+                                self.metrics.signal_evaluated(
+                                    symbol, curr_price, features=features,
+                                    decision="pass" if ok else "skipped",
+                                )
+                            if ok:
+                                # iter 38 (Virtual parity)
+                                if not self._passes_near_top_pump_filter(symbol, features):
+                                    pass
+                                elif not self._passes_macro_top_filter(symbol)[0]:
+                                    pass  # iter 44
+                                elif not self._passes_vol_regime_filter(symbol)[0]:
+                                    pass  # iter 45
+                                else:
+                                    pp_ok, _pp_features = self._passes_post_pump_filter(symbol)
+                                    if pp_ok:
+                                        self.place_limit_order(symbol, curr_price, features=features)
+                            else:
+                                print(f"🔪 [{symbol}] virtual buy skipped by filter")
 
                     self.monitor_positions(symbol, curr_price, signal, curr_vol)
 
@@ -99,10 +2432,24 @@ class VirtualScalpExecutor:
                 print(f"❌ [VIRTUAL SCALPER ERROR] {e}")
                 time.sleep(5)
 
-    def place_limit_order(self, symbol, signal_price):
-        """Stage a paper limit order at limitBuyOffsetPct below signal
-        price. The order sits in VIRTUAL_POSITIONS_KEY with status
-        PENDING_LIMIT until _sweep_pending_orders fills or expires it."""
+    def place_limit_order(self, symbol, signal_price, features=None):
+        """Place a limit-buy at limitBuyOffsetPct below signal price.
+
+        In paper mode (default fallback): just stages a row in
+        VIRTUAL_POSITIONS_KEY with status=PENDING_LIMIT for the in-process
+        fill simulator to handle.
+
+        In live mode: also calls Binance create_limit_buy_order, stores
+        the returned order_id and rounded qty/price on the row, then
+        defers fill detection to _sweep_pending_orders which polls
+        Binance for the order's actual status.
+        """
+        # iter 87 — hard kill switch (manual-only mode)
+        if self.HARD_DISABLE_AUTOBUY:
+            # iter 88 — publish signal so operator sees what scalper would have bought
+            self._publish_scalper_signal(symbol, signal_price, features, source="place_limit_order")
+            print(f"[v-scalper] place_limit_order {symbol} ignored — HARD_DISABLE_AUTOBUY=True")
+            return
         investment, profit_target_usdt, profit_pct, limit_offset_pct = self._load_trading_config()
         base_price = self._fetch_base_price(symbol)
         limit_price = signal_price * (1 - limit_offset_pct / 100.0)
@@ -112,6 +2459,7 @@ class VirtualScalpExecutor:
             "id": str(uuid.uuid4())[:8],
             "symbol": symbol,
             "status": "PENDING_LIMIT",
+            "mode": "live" if self._is_live() else "paper",
             "signal_price": signal_price,
             "signal_timestamp": now_ts,
             "signal_time": datetime.now().strftime('%H:%M:%S'),
@@ -127,13 +2475,74 @@ class VirtualScalpExecutor:
             "entry_time": None,
             "quantity": None,
             "max_drawdown": 0,
+            # Live-only fields (None in paper mode)
+            "order_id": None,
+            "live_limit_price": None,
+            "live_qty": None,
+            # Pre-signal market features that passed the falling-knife filter
+            "features": features or {},
         }
+
+        # In live mode, place the real order BEFORE writing the position
+        # row — if Binance rejects the order (insufficient balance, filter
+        # mismatch, etc.) we don't want a stale PENDING_LIMIT row.
+        if self._is_live():
+            placed = self._place_real_limit_buy(symbol, limit_price, investment)
+            if placed is None:
+                # Real order failed → drop the trade entirely. Don't fall
+                # back to paper, that would mask a misconfiguration.
+                print(f"❌ [VIRTUAL] live limit-buy rejected for {symbol}; skipping signal")
+                return
+            pos["order_id"]         = placed["order_id"]
+            pos["live_limit_price"] = placed["price"]
+            pos["live_qty"]         = placed["qty"]
+
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
-        print(f"📍 [LIMIT PLACED] {symbol} signal={signal_price} limit={limit_price:.6f} (-{limit_offset_pct}%) inv=${investment:.0f} TP=+{profit_pct}%")
+        tag = "LIVE" if pos["mode"] == "live" else "PAPER"
+        print(f"📍 [{tag} LIMIT] {symbol} signal={signal_price} limit={limit_price:.6f} (-{limit_offset_pct}%) inv=${investment:.0f} TP=+{profit_pct}%"
+              + (f" order_id={pos['order_id']}" if pos["order_id"] else ""))
+
+    def _place_real_limit_buy(self, symbol: str, limit_price: float, investment_usdt: float):
+        """Round qty/price by symbol filters and place a Binance limit
+        buy. Returns dict with order_id/price/qty on success, None on
+        any failure (caller skips the trade)."""
+        f = self._get_filters(symbol)
+        if f is None:
+            return None
+        rounded_price = self._round_step(limit_price, f['tick_size'])
+        if rounded_price <= 0:
+            return None
+        qty = self._round_step(investment_usdt / rounded_price, f['step_size'])
+        notional = qty * rounded_price
+        if qty <= 0 or notional < f['min_notional']:
+            print(f"⚠️ [VIRTUAL] {symbol} below min_notional (${notional:.2f} < ${f['min_notional']}); skipping")
+            return None
+        try:
+            ccxt_sym = self._to_ccxt_symbol(symbol)
+            order = self.client.create_limit_buy_order(ccxt_sym, qty, rounded_price)
+            return {
+                "order_id": str(order.get("id") or ""),
+                "price":    rounded_price,
+                "qty":      qty,
+            }
+        except Exception as e:
+            print(f"❌ [VIRTUAL] create_limit_buy_order failed for {symbol}: {e}")
+            return None
 
     def _sweep_pending_orders(self):
-        """Walk every PENDING_LIMIT order. Fill if price has reached the
-        limit, cancel if 60s timeout has elapsed."""
+        """Walk every PENDING_LIMIT order. Logic differs by mode:
+
+        - paper: fill when the analyzer's last price ≤ limit_price;
+          cancel after LIMIT_ORDER_TIMEOUT_SECONDS without fill.
+        - live: poll Binance for the actual order state; on FILLED mark
+          OPEN with the real fill price; on CANCELED/EXPIRED drop the
+          position; on timeout cancel the order on Binance and drop.
+
+        Both modes also run the fast-drop pattern check (Pattern C):
+        if price falls past the threshold within the detection window
+        AND volume isn't surging, cancel the order — we don't want to
+        fill into a coin that's bleeding without capitulation.
+        """
         all_pos = self.r.hgetall(VIRTUAL_POSITIONS_KEY)
         now_ts = time.time()
         for symbol, raw in all_pos.items():
@@ -145,21 +2554,183 @@ class VirtualScalpExecutor:
                 continue
 
             elapsed = now_ts - pos.get('signal_timestamp', now_ts)
+            mode = pos.get('mode', 'paper')
 
-            if elapsed > LIMIT_ORDER_TIMEOUT_SECONDS:
-                self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
-                print(f"⏰ [LIMIT EXPIRED] {symbol} — no fill in {int(elapsed)}s, cancelling")
+            # Fast-drop check applies to both modes — cancel before fill.
+            if self._fast_drop_should_cancel(symbol, pos, elapsed):
+                self._cancel_pending_due_to_fast_drop(symbol, pos)
                 continue
 
-            # Read current price from the analyzer's latest snapshot —
-            # same source of truth as monitor_positions, so fill check
-            # and exit check stay in sync.
+            if mode == 'live':
+                self._sweep_pending_live(symbol, pos, elapsed)
+                continue
+
+            # ── Paper-mode lifecycle (original behaviour) ────────────
+            if elapsed > LIMIT_ORDER_TIMEOUT_SECONDS:
+                self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+                print(f"⏰ [PAPER LIMIT EXPIRED] {symbol} — no fill in {int(elapsed)}s")
+                continue
+
             curr_price = self._current_price(symbol)
             if curr_price is None:
                 continue
-
             if curr_price <= pos['limit_price']:
                 self._fill_pending_limit(symbol, pos, curr_price, elapsed)
+
+    def _fast_drop_should_cancel(self, symbol, pos, elapsed) -> bool:
+        """Return True iff the limit-buy should be cancelled because the
+        coin is falling fast WITHOUT a volume surge (Pattern C)."""
+        if not self.fd_enabled:
+            return False
+        if elapsed > self.fd_detect_minutes * 60:
+            return False
+        baseline = float((pos.get('features') or {}).get('pre_vol_baseline_usdt') or 0)
+        if baseline <= 0:
+            return False
+        signal_price = float(pos.get('signal_price') or 0)
+        if signal_price <= 0:
+            return False
+        curr = self._current_price(symbol)
+        if not curr or curr <= 0:
+            return False
+        drop_pct = (curr - signal_price) / signal_price * 100
+        if drop_pct > -self.fd_threshold_pct:
+            return False  # not a fast drop yet
+
+        # Volume estimate from the latest analyser tick — same source
+        # as _current_price uses, so consistent.
+        try:
+            raw = self.r.hget(ANALYSIS_020_KEY, symbol.replace('/', ''))
+            if not raw:
+                return False
+            tl = json.loads(raw)
+            tail = tl[-12:] if len(tl) >= 12 else tl   # ~last 12 ticks
+            tail_usdt = []
+            for t in tail:
+                p = float(t.get('price') or 0); v = float(t.get('volume') or 0)
+                if p > 0 and v > 0:
+                    tail_usdt.append(p * v)
+            if not tail_usdt:
+                return False
+            recent_per_tick = sum(tail_usdt) / len(tail_usdt)
+        except Exception:
+            return False
+
+        ratio = recent_per_tick / baseline if baseline > 0 else 0
+        return ratio < self.fd_vol_surge_mult
+
+    def _update_trajectory_metrics(self, symbol, pos, curr_price, curr_vol):
+        """Persist running BtmDrop% / MaxRise% / vol-ratio into the
+        per-coin OUTCOME hash so the dashboard can render a live
+        trajectory. Best-effort (Redis hiccups never crash the loop)."""
+        if self.metrics is None or not self.metrics.enabled:
+            return
+        try:
+            entry = float(pos.get('entry_price') or 0)
+            if entry <= 0 or curr_price <= 0:
+                return
+            now_pct = (curr_price - entry) / entry * 100
+
+            from datetime import datetime as _dt
+            date = _dt.utcnow().strftime("%Y-%m-%d")
+            key = f"METRICS:OUTCOME:{date}:{symbol.replace('/', '')}"
+            prev = self.r.hmget(key, 'bottom_pct', 'max_pct', 'pre_vol_baseline_usdt')
+            prev_btm = float(prev[0]) if prev[0] else 0.0
+            prev_max = float(prev[1]) if prev[1] else 0.0
+            baseline = float(prev[2]) if prev[2] else float(
+                (pos.get('features') or {}).get('pre_vol_baseline_usdt') or 0
+            )
+
+            updates = {
+                'now_pct': round(now_pct, 4),
+                'last_tick_ts': int(time.time() * 1000),
+            }
+            if now_pct < prev_btm:
+                updates['bottom_pct'] = round(now_pct, 4)
+                updates['bottom_ts'] = int(time.time() * 1000)
+            if now_pct > prev_max:
+                updates['max_pct'] = round(now_pct, 4)
+                updates['max_ts'] = int(time.time() * 1000)
+
+            # Vol-1m proxy: most recent tick volume × price.
+            if baseline > 0 and curr_vol > 0:
+                vol_usdt = curr_price * curr_vol
+                updates['vol_1m_usdt'] = round(vol_usdt, 2)
+                updates['vol_ratio'] = round(vol_usdt / baseline, 3)
+                # Stamp baseline once so trajectory can read it later.
+                if not prev[2]:
+                    updates['pre_vol_baseline_usdt'] = round(baseline, 2)
+
+            self.r.hset(key, mapping=updates)
+            self.r.expire(key, 30 * 24 * 3600)
+        except Exception:
+            pass
+
+    def _cancel_pending_due_to_fast_drop(self, symbol, pos):
+        """Cancel the resting LIMIT (live) and clear the row."""
+        order_id = pos.get('order_id')
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        if order_id and self.client is not None:
+            try:
+                self.client.cancel_order(order_id, ccxt_sym)
+            except Exception as e:
+                print(f"⚠️ [FAST-DROP CANCEL] {symbol} cancel failed: {e}")
+        self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+        print(f"🔪🩸 [FAST-DROP CANCEL] {symbol} cancelled before fill (no vol surge)")
+        if self.metrics is not None:
+            self.metrics.signal_skipped(
+                symbol, "fast_drop_no_volume",
+                "fast drop within detection window without volume surge",
+                pos.get('features') or {},
+            )
+
+    def _sweep_pending_live(self, symbol, pos, elapsed):
+        """Query Binance for a live PENDING_LIMIT order's current state."""
+        order_id = pos.get('order_id')
+        if not order_id or self.client is None:
+            # Misconfigured row — drop it so we don't loop forever.
+            self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+            print(f"⚠️ [LIVE LIMIT] {symbol} missing order_id/client — dropping row")
+            return
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+
+        # Hard timeout: cancel on Binance, drop locally.
+        if elapsed > LIMIT_ORDER_TIMEOUT_SECONDS:
+            try:
+                self.client.cancel_order(order_id, ccxt_sym)
+            except Exception as e:
+                print(f"⚠️ [LIVE LIMIT] cancel failed for {symbol} ({order_id}): {e}")
+            self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+            print(f"⏰ [LIVE LIMIT EXPIRED] {symbol} — cancelled on Binance after {int(elapsed)}s")
+            return
+
+        try:
+            order = self.client.fetch_order(order_id, ccxt_sym)
+        except Exception as e:
+            # Transient — try again next tick.
+            print(f"⚠️ [LIVE LIMIT] fetch_order failed for {symbol}: {e}")
+            return
+
+        status = (order.get("status") or "").lower()  # 'open', 'closed', 'canceled'
+        filled = float(order.get("filled") or 0.0)
+        live_qty = float(pos.get("live_qty") or 0.0)
+
+        if status == "closed" and filled > 0:
+            # ccxt 'closed' for limit orders means fully filled.
+            avg_price = float(order.get("average") or order.get("price") or pos.get("live_limit_price"))
+            # Per-fill audit log — same as Fast Scalper.
+            for i, fl in enumerate(order.get('fills') or order.get('trades') or []):
+                fl_qty = fl.get('qty') or fl.get('amount')
+                fl_pr  = fl.get('price')
+                fl_fee = (fl.get('fee') or {}).get('cost') if isinstance(fl.get('fee'), dict) else fl.get('commission')
+                fl_cur = (fl.get('fee') or {}).get('currency') if isinstance(fl.get('fee'), dict) else fl.get('commissionAsset')
+                print(f"   fill[{i}] qty={fl_qty} @ {fl_pr} fee={fl_fee} {fl_cur}")
+            self._fill_pending_limit(symbol, pos, avg_price, elapsed, real_filled_qty=filled)
+        elif status in ("canceled", "expired"):
+            self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+            print(f"❌ [LIVE LIMIT] {symbol} {status} on Binance — dropping position")
+        # status == 'open' → keep waiting; partial fills are rare on
+        # spot limits and are handled implicitly by the next tick.
 
     def _current_price(self, symbol):
         """Best-effort current price from the analyzer's timeline."""
@@ -174,24 +2745,180 @@ class VirtualScalpExecutor:
         except Exception:
             return None
 
-    def _fill_pending_limit(self, symbol, pos, observed_price, elapsed):
-        """Convert a PENDING_LIMIT into an OPEN position. Fill at the
-        original limit price (conservative — real exchange fills the
-        resting order at L when the market touches L)."""
-        fill_price = pos['limit_price']
+    def _fill_pending_limit(self, symbol, pos, observed_price, elapsed, real_filled_qty=None):
+        """Convert a PENDING_LIMIT into an OPEN position.
+
+        Paper mode: fill at the original limit price (conservative —
+        exchanges fill resting orders at L when the market touches L).
+
+        Live mode: fill at the actual fill price returned by Binance,
+        with the real filled quantity. Same fee/qty trap as Fast
+        Scalper: Binance's `filled` is GROSS-of-fees. The 0.1 % spot
+        fee is taken from the base asset received, so we apply a
+        0.999 safety floor (and round down by step_size) before any
+        downstream sell uses the qty. Without this the OCO leg would
+        be rejected with "insufficient balance".
+        """
+        if real_filled_qty is not None:
+            # Live fill — apply fee-safety floor + step_size rounding.
+            fill_price = observed_price
+            f = self._get_filters(symbol) if self.client is not None else None
+            step = (f or {}).get('step_size', 0.00000001) or 0.00000001
+            quantity = self._round_step(real_filled_qty * 0.999, step)
+        else:
+            # Paper fill — synthetic at the limit.
+            fill_price = pos['limit_price']
+            quantity   = pos['investment'] / fill_price
+
         now_ts = time.time()
 
         pos['status'] = 'OPEN'
         pos['entry_price'] = fill_price
         pos['entry_timestamp'] = now_ts
         pos['entry_time'] = datetime.now().strftime('%H:%M:%S')
-        pos['quantity'] = pos['investment'] / fill_price
+        pos['quantity'] = quantity
         pos['max_drawdown'] = 0  # restart tracking from fill, not from order placement
+        pos['oco_list_id'] = None    # populated below if live + OCO succeeds
+
+        # In live mode, place an OCO sell on Binance so TP/SL fire
+        # inside the matching engine — same protection Fast Scalper has.
+        # If placement fails (filter, balance, network) we fall back to
+        # the polling-based exit logic in monitor_positions.
+        if pos.get('mode') == 'live' and self.client is not None and quantity > 0:
+            list_id = self._place_oco_sell(symbol, quantity, fill_price, pos.get('profit_pct') or DEFAULT_PROFIT_PCT)
+            pos['oco_list_id'] = list_id
 
         self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
         signal_price = pos.get('signal_price', fill_price)
         improvement = (signal_price - fill_price) / signal_price * 100 if signal_price else 0
-        print(f"✅ [LIMIT FILLED] {symbol} fill={fill_price:.6f} (-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s | observed={observed_price:.6f}")
+        tag = "LIVE" if pos.get("mode") == "live" else "PAPER"
+        oco_tag = f" oco={pos['oco_list_id']}" if pos.get('oco_list_id') else (" oco=FAILED→polling" if pos.get('mode') == 'live' else "")
+        print(f"✅ [{tag} FILLED] {symbol} fill={fill_price:.6f} qty={quantity:.6f} "
+              f"(-{improvement:.2f}% vs signal {signal_price:.6f}) after {elapsed:.0f}s{oco_tag}")
+
+        if self.metrics is not None:
+            order_type = ("virtual_live" if pos.get("mode") == "live" else "virtual_paper")
+            self.metrics.buy_placed(symbol, fill_price, pos.get('investment') or 0,
+                                    features=pos.get('features') or {},
+                                    order_type=order_type,
+                                    offset_pct=pos.get('limit_offset_pct') or 0)
+            self.metrics.fill_recorded(symbol, fill_price, quantity)
+
+    # ── OCO helpers (mirror the Fast Scalper pattern) ────────────────────
+
+    def _place_oco_sell(self, symbol, qty, entry_price, profit_pct):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, entry_price, "v_oco_sell", source="_place_oco_sell")
+            except Exception:
+                pass
+            print(f"[v-OCO] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
+        """Place a Binance OCO sell — LIMIT TP + STOP_LOSS_LIMIT SL.
+
+        Returns the orderListId on success, None on any failure (caller
+        falls back to polling-based exits).
+
+            TP = entry × (1 + profit_pct / 100)              ← +0.5 % default
+            SL_trig = entry × (1 - MAX_VIRTUAL_LOSS_USDT /
+                                   pos['investment'])         ← -$1 hard stop
+            SL_lim  = SL_trig × 0.998                         ← 0.2 % slack
+        """
+        if self.client is None:
+            return None
+        try:
+            f = self._get_filters(symbol)
+            if not f:
+                return None
+            tick = f.get('tick_size', 0.00000001) or 0.00000001
+            tp_price   = self._round_step(entry_price * (1 + profit_pct / 100.0), tick)
+            sl_loss_pct = MAX_VIRTUAL_LOSS_USDT / DEFAULT_BUY_AMOUNT_USDT  # ratio of investment
+            sl_trigger = self._round_step(entry_price * (1 - sl_loss_pct), tick)
+            sl_limit   = self._round_step(sl_trigger * 0.998, tick)
+
+            if not (tp_price > entry_price > sl_trigger > sl_limit > 0):
+                print(f"⚠️ [OCO] {symbol} bad price triplet "
+                      f"entry={entry_price} tp={tp_price} sl_trig={sl_trigger} sl_lim={sl_limit} — skipping")
+                return None
+
+            params = {
+                'symbol':                 symbol.replace('/', ''),
+                'side':                   'SELL',
+                'quantity':               str(qty),
+                'price':                  str(tp_price),
+                'stopPrice':              str(sl_trigger),
+                'stopLimitPrice':         str(sl_limit),
+                'stopLimitTimeInForce':   'GTC',
+            }
+            result = self.client.private_post_order_oco(params)
+            list_id = result.get('orderListId')
+            if list_id is None:
+                print(f"⚠️ [OCO] {symbol} response missing orderListId: {result}")
+                return None
+            print(f"📋 [OCO] {symbol} placed list={list_id} TP={tp_price} SL={sl_trigger}/{sl_limit}")
+            return str(list_id)
+        except Exception as e:
+            print(f"⚠️ [OCO] placement failed for {symbol}: {e}")
+            return None
+
+    def _check_oco_status(self, symbol, pos):
+        """Poll OCO list status. Returns True if the position has been
+        closed by the exchange (one leg filled, the other auto-cancelled)."""
+        list_id = pos.get('oco_list_id')
+        if not list_id or self.client is None:
+            return False
+        try:
+            result = self.client.private_get_orderlist({'orderListId': list_id})
+        except Exception as e:
+            # Transient — try again next tick.
+            return False
+        list_status = (result.get('listOrderStatus') or '').upper()
+        if list_status != 'ALL_DONE':
+            return False
+
+        print(f"✅ [OCO] {symbol} resolved by exchange — list={list_id}")
+        # Best-effort archive so dashboards see the close. Compute net
+        # PnL from entry→avg-fill via the leg orders if we can.
+        try:
+            avg_exit_price = pos.get('entry_price') or 0.0
+            for leg in result.get('orders', []) or []:
+                child = self.client.fetch_order(leg.get('orderId'), self._to_ccxt_symbol(symbol))
+                if child.get('status') == 'closed':
+                    avg_exit_price = float(child.get('average') or child.get('price') or avg_exit_price)
+                    break
+            entry_price = float(pos.get('entry_price') or avg_exit_price)
+            qty = float(pos.get('quantity') or 0.0)
+            buy_value  = entry_price * qty
+            sell_value = avg_exit_price * qty
+            buy_fee    = buy_value * 0.001
+            sell_fee   = sell_value * 0.001
+            net_pnl    = (sell_value - buy_value) - (buy_fee + sell_fee)
+            archived = dict(pos)
+            archived['exit_price'] = avg_exit_price
+            archived['pnl_usdt'] = net_pnl
+            archived['fees_paid'] = buy_fee + sell_fee
+            archived['reason'] = 'OCO_FILLED'
+            archive_closed_trade(symbol, "VIRTUAL_LIVE", archived)
+        except Exception:
+            pass
+
+        self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
+        return True
+
+    def _cancel_oco(self, symbol, list_id):
+        """Best-effort OCO cancel — absorbs failures so the caller can
+        always continue to a market sell."""
+        if not list_id or self.client is None:
+            return
+        try:
+            self.client.private_delete_orderlist({
+                'symbol':       symbol.replace('/', ''),
+                'orderListId':  list_id,
+            })
+            print(f"🚫 [OCO] cancelled list={list_id} for {symbol}")
+        except Exception as e:
+            print(f"⚠️ [OCO] cancel failed for {symbol} list={list_id}: {e}")
 
     def _fetch_base_price(self, symbol):
         """Return the symbol's stored base price, or None if not available."""
@@ -217,6 +2944,13 @@ class VirtualScalpExecutor:
         if pos.get('status') == 'PENDING_LIMIT':
             return
 
+        # If we placed an OCO sell at fill time, check it first. When the
+        # exchange resolves the OCO (TP or SL leg fills), we drop the
+        # local row and skip the polling logic — Binance already exited.
+        if pos.get('oco_list_id'):
+            if self._check_oco_status(symbol, pos):
+                return
+
         entry_price = pos['entry_price']
         elapsed = time.time() - pos['entry_timestamp']
         investment = pos.get('investment', DEFAULT_BUY_AMOUNT_USDT)
@@ -232,6 +2966,9 @@ class VirtualScalpExecutor:
             pos['max_drawdown'] = pnl_pct
             self.r.hset(VIRTUAL_POSITIONS_KEY, symbol, json.dumps(pos))
 
+        # Live trajectory metrics for the dashboard
+        self._update_trajectory_metrics(symbol, pos, curr_price, curr_vol)
+
         exit_reason = None
 
         # 1. Take Profit — percentage target wins when profit_pct > 0;
@@ -244,16 +2981,18 @@ class VirtualScalpExecutor:
         if tp_hit:
             exit_reason = "TAKE_PROFIT"
 
-        # 2. Hard Stop Loss (Instant if loss > $1)
-        elif pnl_usdt <= -MAX_VIRTUAL_LOSS_USDT:
+        # 2. Hard Stop Loss (Instant if loss > $1) — DISABLED when
+        # stopLossUsdt <= 0 (Option B patient-hold mode).
+        elif self.stop_loss_usdt > 0 and pnl_usdt <= -MAX_VIRTUAL_LOSS_USDT:
             exit_reason = "HARD_STOP_LOSS"
 
         # 3. Strategy Exit (Instant if exhaustion detected)
         elif signal == "EXHAUSTION_EXIT":
             exit_reason = "STRATEGY_EXIT"
 
-        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss < $1)
-        elif pnl_pct <= -STOP_LOSS:
+        # 4. Soft Stop Loss (Patience Logic: Wait 1h if loss between
+        # $0.50 and $1) — also DISABLED when stopLossUsdt <= 0.
+        elif self.stop_loss_usdt > 0 and pnl_usdt <= -SOFT_STOP_LOSS_USDT:
             if elapsed < MIN_HOLD_SECONDS:
                 pass # Patiently holding for recovery...
             else:
@@ -263,32 +3002,183 @@ class VirtualScalpExecutor:
             self.close_virtual_position(symbol, pos, curr_price, pnl_pct, exit_reason, curr_vol)
 
     def close_virtual_position(self, symbol, pos, exit_price, pnl_pct, reason, exit_vol):
+        mode = pos.get("mode", "paper")
+
+        # ── LIVE EXIT: place real market sell first; only finalize the
+        #    accounting when the exchange confirms. If the sell fails we
+        #    re-queue the position and bail so a future tick retries it.
+        if mode == "live" and pos.get("quantity"):
+            # Cancel any active OCO BEFORE the market sell so a TP/SL
+            # leg can't fire in parallel and oversell what we own.
+            list_id = pos.get('oco_list_id')
+            if list_id:
+                self._cancel_oco(symbol, list_id)
+
+            real_exit = self._place_real_market_sell(symbol, float(pos["quantity"]))
+            if real_exit is None:
+                # Don't delete the position — we still own the coin on
+                # Binance. Surface the failure and try again next tick.
+                print(f"⚠️ [LIVE EXIT] {symbol} sell failed; will retry next tick (reason was {reason})")
+                return
+            # Use the actual fill price from Binance for PnL math.
+            exit_price = real_exit["price"]
+            pnl_pct    = (exit_price - pos["entry_price"]) / pos["entry_price"]
+
         # Investment is the per-position snapshot taken at open (from TradingConfig).
         investment = pos.get('investment', DEFAULT_BUY_AMOUNT_USDT)
-        # Calculate Real-World Fees (0.1% per side)
+        # Real-world Binance spot fees: 0.10 % per side.
         buy_fee = investment * 0.001
         sell_value = investment * (1 + pnl_pct)
         sell_fee = sell_value * 0.001
         total_fees = buy_fee + sell_fee
-        
+
         net_pnl_usdt = (sell_value - investment) - total_fees
-        
+
         pos['exit_price'] = exit_price
         pos['exit_time'] = datetime.now().strftime('%H:%M:%S')
         pos['exit_vol'] = exit_vol
         pos['pnl_pct'] = pnl_pct * 100
-        pos['pnl_usdt'] = net_pnl_usdt # Now showing NET after fees
+        pos['pnl_usdt'] = net_pnl_usdt
         pos['fees_paid'] = total_fees
         pos['reason'] = reason
         pos['status'] = "CLOSED"
         pos['hold_duration'] = time.time() - pos['entry_timestamp']
-        
+
         self.r.lpush(VIRTUAL_HISTORY_KEY, json.dumps(pos))
         self.r.ltrim(VIRTUAL_HISTORY_KEY, 0, 99)
         self.r.hdel(VIRTUAL_POSITIONS_KEY, symbol)
-        
+
+        # Long-term archive on the analyse Redis (best-effort).
+        kind = "VIRTUAL_LIVE" if mode == "live" else "VIRTUAL_PAPER"
+        archive_closed_trade(symbol, kind, pos)
+
+        if self.metrics is not None:
+            entry_price = pos.get('entry_price', exit_price)
+            if reason == "TAKE_PROFIT":
+                latency_min = pos.get('hold_duration', 0) / 60.0
+                self.metrics.tp_hit(symbol, entry_price, exit_price, latency_min=latency_min)
+            self.metrics.exit_recorded(symbol, entry_price, exit_price,
+                                       reason=reason.lower(), pnl_usdt=net_pnl_usdt)
+
         color = "🟢" if net_pnl_usdt > 0 else "🔴"
-        print(f"{color} [VIRTUAL SELL] {symbol} | Net PnL: ${net_pnl_usdt:.4f} | Fees: ${total_fees:.4f} | Held: {int(pos['hold_duration'])}s")
+        tag = "LIVE" if mode == "live" else "PAPER"
+        print(f"{color} [{tag} SELL] {symbol} | Net PnL: ${net_pnl_usdt:.4f} | Fees: ${total_fees:.4f} | Held: {int(pos['hold_duration'])}s")
+
+    def _place_real_market_sell(self, symbol: str, qty: float):
+        """Wrapper kept for API compatibility — internally now uses an
+        aggressive-limit-at-bid sell instead of a market sell. Returns
+        {price, qty} on success, None on failure."""
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, None, "v_market_sell", source="_place_real_market_sell")
+            except Exception:
+                pass
+            print(f"[v-MarketSell] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
+        return self._place_real_aggressive_limit_sell(symbol, qty, max_wait_sec=5, retries=3)
+
+    def _place_real_aggressive_limit_sell(self, symbol: str, qty: float,
+                                          max_wait_sec: int = 5, retries: int = 3):
+        # iter 94 — hard kill switch (manual-only sell mode).
+        if self.HARD_DISABLE_AUTOSELL:
+            try:
+                self._publish_blocked_sell(symbol, None, "v_aggressive_limit_sell", source="_place_real_aggressive_limit_sell")
+            except Exception:
+                pass
+            print(f"[v-AggressiveSell] {symbol} qty={qty} blocked — HARD_DISABLE_AUTOSELL=True (iter94)")
+            return None
+        """Synchronous version of the aggressive-limit-sell pattern
+        (matches Fast Scalper's async helper, including the
+        partial-fill safety from the AAVE/PENGU bug).
+
+        Each attempt re-fetches the actual free balance for the base
+        asset and caps the order qty at that — so a partial fill on
+        attempt N doesn't cause attempt N+1 to be rejected with
+        "insufficient balance" (which would orphan the unsold
+        remainder in the wallet).
+        """
+        if self.client is None:
+            return None
+
+        ccxt_sym = self._to_ccxt_symbol(symbol)
+        base_asset = ccxt_sym.split('/')[0].upper()
+        f = self._get_filters(symbol) or {}
+        step_size = f.get('step_size') or 0.00000001
+
+        accumulated_filled = 0.0
+        last_avg_price = 0.0
+        remaining = qty
+
+        for attempt in range(1, retries + 1):
+            try:
+                # 1) Re-anchor qty to actual wallet balance (handles
+                #    partial fills from earlier attempts).
+                bal = self.client.fetch_balance()
+                free = float((bal.get(base_asset) or {}).get('free') or 0)
+                usable = self._round_step(min(remaining, free), step_size)
+                if usable <= 0:
+                    print(f"✅ [LIMIT-SELL] {symbol} nothing left to sell (free={free:.6f}) — done")
+                    break
+
+                book = self.client.fetch_order_book(ccxt_sym, limit=5)
+                bids = book.get('bids') or []
+                if not bids:
+                    print(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt}: empty bid book — retrying")
+                    time.sleep(1)
+                    continue
+                bid_price = float(bids[0][0])
+                print(f"⚡ [VIRTUAL] {symbol} attempt {attempt}/{retries}: LIMIT SELL {usable} @ {bid_price} (free={free:.6f})")
+                order = self.client.create_limit_sell_order(ccxt_sym, usable, bid_price)
+                order_id = order.get('id')
+                if not order_id:
+                    print(f"⚠️ [LIMIT-SELL] {symbol} placement returned no order id")
+                    continue
+
+                deadline = time.time() + max_wait_sec
+                final = None
+                while time.time() < deadline:
+                    time.sleep(1)
+                    o = self.client.fetch_order(order_id, ccxt_sym)
+                    if (o.get('status') or '').lower() == 'closed':
+                        final = o
+                        break
+
+                if final is not None:
+                    just_filled = float(final.get('filled') or usable)
+                    avg = float(final.get('average') or bid_price)
+                    accumulated_filled += just_filled
+                    last_avg_price = avg
+                    print(f"✅ [LIMIT-SELL] {symbol} filled @ {avg} "
+                          f"(this attempt: {just_filled}, total: {accumulated_filled})")
+                    return {'price': avg, 'qty': accumulated_filled}
+
+                # Capture any partial fill before cancelling.
+                try:
+                    last = self.client.fetch_order(order_id, ccxt_sym)
+                    partial = float(last.get('filled') or 0)
+                    if partial > 0:
+                        accumulated_filled += partial
+                        last_avg_price = float(last.get('average') or bid_price)
+                        remaining = max(0.0, remaining - partial)
+                        print(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} partial-filled {partial}, "
+                              f"remaining={remaining}")
+                except Exception:
+                    pass
+                try:
+                    self.client.cancel_order(order_id, ccxt_sym)
+                except Exception:
+                    pass
+                print(f"⏱  [LIMIT-SELL] {symbol} attempt {attempt} timed out — cancelling and retrying")
+            except Exception as e:
+                print(f"⚠️ [LIMIT-SELL] {symbol} attempt {attempt} error: {e}")
+                time.sleep(1)
+
+        if accumulated_filled > 0:
+            print(f"⚠️ [LIMIT-SELL] {symbol} exhausted retries with partial fills "
+                  f"({accumulated_filled} of {qty}) — returning partial result")
+            return {'price': last_avg_price, 'qty': accumulated_filled}
+        return None
 
 if __name__ == "__main__":
     executor = VirtualScalpExecutor()

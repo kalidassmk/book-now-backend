@@ -108,4 +108,53 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("virtual_scalp_executor.py",),
         kind="persistent",
     ),
+    SubprocessTask(
+        name="VP History Recorder",
+        cmd_argv=("vp_history_recorder.py",),
+        kind="persistent",
+    ),
+    SubprocessTask(
+        name="Stale Cleaner",
+        cmd_argv=("stale_cleaner.py",),
+        kind="persistent",
+    ),
+    # iter 55 (2026-05-23) — volume-leads-price pump detector.  Calls
+    # the python backend's /api/v1/order/pattern-buy/{sym} endpoint so
+    # positions inherit iter47/48/52/54 protections.
+    SubprocessTask(
+        name="Pump Rider",
+        cmd_argv=("pump_rider.py",),
+        kind="persistent",
+    ),
+    # iter 69 (2026-05-24) — Volume-Spike Pattern (VSP) classifier.
+    # Detects volume spikes and uses taker-buy-ratio + candle structure
+    # to classify direction (BIG_PUMP / BIG_DUMP / MODERATE / UNCERTAIN)
+    # and magnitude (0-100).  Paper mode for first 7 days, then live.
+    # Live buys delegate via the same pattern-buy endpoint so they
+    # inherit iter65/66 + all safety gates.
+    SubprocessTask(
+        name="Volume Spike Pattern",
+        cmd_argv=("volume_spike_pattern.py",),
+        kind="persistent",
+    ),
+    # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC).
+    # Small caps (7d avg vol < $10M) suddenly getting 3x+ volume =
+    # explosive-move chance.  Scores 0-100 from 6 factors, classifies
+    # direction (PUMP/DUMP/NEUTRAL) via hourly candles + VWAP.
+    # Paper mode default; live mode delegates EXPLOSIVE_PUMP buys.
+    SubprocessTask(
+        name="Low MCap Explosive",
+        cmd_argv=("low_mcap_explosive.py",),
+        kind="persistent",
+    ),
+    # iter 72 (2026-05-24) — Calm Consolidation Pattern (CCP).
+    # Detects price flat + volume drying up = sellers exhausted /
+    # accumulation phase.  Direction bias from position in 24h/7d
+    # range: near low = REVERSAL_UP setup, near high = BREAKDOWN_RISK.
+    # Paper mode default; live mode delegates CALM_REVERSAL_UP buys.
+    SubprocessTask(
+        name="Calm Consolidation",
+        cmd_argv=("calm_consolidation.py",),
+        kind="persistent",
+    ),
 ]
