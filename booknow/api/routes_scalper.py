@@ -91,10 +91,34 @@ async def scalper_delisted(state: AppState = Depends(get_state)):
     except Exception as e:  # noqa: BLE001
         logger.warning("delisted: redis scan failed: %s", e)
 
+    # iter 115 — pull per-symbol reasons (MONITORING / SEED / ANNOUNCEMENT).
+    reasons: dict = {}
+    try:
+        rkeys = await state.redis.keys("BINANCE:DELIST_REASON:*")
+        for k in rkeys:
+            sym = k.split(":", 2)[-1]
+            val = await state.redis.get(k)
+            if val is not None:
+                reasons[sym] = val
+    except Exception as e:  # noqa: BLE001
+        logger.warning("delisted: reason scan failed: %s", e)
+
+    # Bucket symbols by reason so the dashboard can render a nice
+    # breakdown.
+    by_reason = {"MONITORING": [], "SEED": [], "ANNOUNCEMENT": [], "OTHER": []}
+    for s in scraped:
+        r = reasons.get(s) or "ANNOUNCEMENT"
+        by_reason.setdefault(r, []).append(s)
+    for k in by_reason:
+        by_reason[k].sort()
+
     return {
         "success": True,
         "scraped_delisted": scraped,
         "scraped_count": len(scraped),
+        "by_reason": by_reason,
+        "by_reason_counts": {k: len(v) for k, v in by_reason.items()},
+        "reasons_map": reasons,
         "legacy_skip_seed": sorted(DEFAULT_DELIST_SEED),
         "scalper": {
             "configured": engine.configured_symbols,
