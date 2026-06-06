@@ -49,6 +49,13 @@ TAG_REASONS = {
     "Seed":       "SEED",
 }
 
+# iter 116 — `exchangeInfo` statuses that mean "do not trade".
+# BREAK = pair not actively trading (Binance pauses).
+# HALT  = pair temporarily halted (e.g. incident response).
+# AUCTION_MATCH = scheduled auction state — not regular trading either.
+EXCHANGEINFO_BLOCK_STATUSES = {"BREAK", "HALT", "AUCTION_MATCH"}
+EXCHANGEINFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+
 # Article codes are 32-hex-digit ids prefixed with `c`. The CMS body
 # embeds them in href links; this regex pulls them out for nested
 # article expansion.
@@ -164,14 +171,28 @@ class DelistService:
             await self._scrape_bapi_tags()
         except Exception as e:
             logger.warning("[DelistService] BAPI tag scrape failed: %s", e)
+        # iter 116 — also scan exchangeInfo for BREAK / HALT / AUCTION_MATCH.
+        try:
+            await self._scrape_exchangeinfo_statuses()
+        except Exception as e:
+            logger.warning("[DelistService] exchangeInfo status scrape failed: %s", e)
 
     async def _scrape_bapi_tags(self) -> None:
-        """iter 115 — fetch Binance BAPI product list and mark every
-        USDT pair tagged Monitoring or Seed as delisted (with reason).
+        """iter 115 + iter 116 — fetch Binance BAPI product list and mark
+        USDT pairs that are either tagged Monitoring/Seed OR have the
+        `pom: true` pre-delisting flag.
+
+        Reason precedence (strongest signal wins):
+            PRE_DELISTING (pom=true)  >  MONITORING (tag)  >  SEED (tag)
+
+        iter 116 PRE_DELISTING also records the delisting timestamp
+        (BAPI `pomt`, ms since epoch) in BINANCE:DELIST_AT:<sym> so the
+        dashboard can show "delisting in X hours".  Motivating case:
+        DUSDT with pom=true and pomt=1781838000000 (2026-06-19).
         """
         import json as _json
         import urllib.request
-        logger.info("[DelistService] scanning BAPI for Monitoring/Seed tagged pairs…")
+        logger.info("[DelistService] scanning BAPI for Monitoring/Seed/pre-delist pairs…")
 
         def _fetch() -> dict:
             req = urllib.request.Request(
@@ -185,27 +206,73 @@ class DelistService:
         products = (payload or {}).get("data") or []
         marked_monitoring = 0
         marked_seed = 0
+        marked_predelist = 0
         for p in products:
             sym = p.get("s") or ""
             if not sym.endswith("USDT"):
                 continue
             tags = p.get("tags") or []
             if not isinstance(tags, list):
-                continue
+                tags = []
+            pom = bool(p.get("pom"))   # iter 116
+            pomt = p.get("pomt")       # iter 116 — delisting ms timestamp
+
             reason = None
-            # Monitoring beats Seed if a pair has both — Monitoring is
-            # a stronger "we're about to delist this" signal.
-            if "Monitoring" in tags:
+            if pom:
+                reason = "PRE_DELISTING"
+                marked_predelist += 1
+            elif "Monitoring" in tags:
                 reason = TAG_REASONS["Monitoring"]
                 marked_monitoring += 1
             elif "Seed" in tags:
                 reason = TAG_REASONS["Seed"]
                 marked_seed += 1
+
             if reason is not None:
                 await self.mark(sym, reason=reason)
+                # iter 116 — store the announced delisting timestamp too.
+                if pom and pomt:
+                    try:
+                        await self._redis.set(f"BINANCE:DELIST_AT:{sym}", str(int(pomt)))
+                    except Exception:
+                        pass
         logger.info(
-            "[DelistService] BAPI tag scan complete — %d MONITORING, %d SEED pairs blocked",
-            marked_monitoring, marked_seed,
+            "[DelistService] BAPI scan complete — %d PRE_DELISTING, %d MONITORING, %d SEED",
+            marked_predelist, marked_monitoring, marked_seed,
+        )
+
+    async def _scrape_exchangeinfo_statuses(self) -> None:
+        """iter 116 — read /api/v3/exchangeInfo and mark every USDT pair
+        whose `status` is BREAK / HALT / AUCTION_MATCH as delisted.
+        These are pairs Binance has paused so the bots must not try to
+        trade them.
+        """
+        import json as _json
+        import urllib.request
+        logger.info("[DelistService] scanning exchangeInfo for BREAK/HALT statuses…")
+
+        def _fetch() -> dict:
+            req = urllib.request.Request(
+                EXCHANGEINFO_URL,
+                headers={"User-Agent": "BookNow/1.0 (delist-tag-scraper)"},
+            )
+            with urllib.request.urlopen(req, timeout=15) as r:
+                return _json.loads(r.read().decode("utf-8"))
+
+        payload = await asyncio.to_thread(_fetch)
+        syms = (payload or {}).get("symbols") or []
+        marked_by_status: dict = {}
+        for s in syms:
+            sym = s.get("symbol") or ""
+            if not sym.endswith("USDT"):
+                continue
+            status = s.get("status") or ""
+            if status in EXCHANGEINFO_BLOCK_STATUSES:
+                await self.mark(sym, reason=status)
+                marked_by_status[status] = marked_by_status.get(status, 0) + 1
+        logger.info(
+            "[DelistService] exchangeInfo scan complete — %s",
+            ", ".join(f"{k}={v}" for k, v in marked_by_status.items()) or "no halted pairs",
         )
 
     async def _scrape_once(self) -> None:

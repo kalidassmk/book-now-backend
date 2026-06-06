@@ -91,7 +91,7 @@ async def scalper_delisted(state: AppState = Depends(get_state)):
     except Exception as e:  # noqa: BLE001
         logger.warning("delisted: redis scan failed: %s", e)
 
-    # iter 115 — pull per-symbol reasons (MONITORING / SEED / ANNOUNCEMENT).
+    # iter 115 + iter 116 — pull per-symbol reasons.
     reasons: dict = {}
     try:
         rkeys = await state.redis.keys("BINANCE:DELIST_REASON:*")
@@ -103,9 +103,34 @@ async def scalper_delisted(state: AppState = Depends(get_state)):
     except Exception as e:  # noqa: BLE001
         logger.warning("delisted: reason scan failed: %s", e)
 
-    # Bucket symbols by reason so the dashboard can render a nice
-    # breakdown.
-    by_reason = {"MONITORING": [], "SEED": [], "ANNOUNCEMENT": [], "OTHER": []}
+    # iter 116 — also pull the announced delisting timestamps so the
+    # dashboard can show "delisting in X hours" for PRE_DELISTING coins.
+    delist_at: dict = {}
+    try:
+        atkeys = await state.redis.keys("BINANCE:DELIST_AT:*")
+        for k in atkeys:
+            sym = k.split(":", 2)[-1]
+            val = await state.redis.get(k)
+            if val is not None:
+                try:
+                    delist_at[sym] = int(val)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+
+    # Bucket symbols by reason.  iter 116 adds PRE_DELISTING, BREAK,
+    # HALT, AUCTION_MATCH buckets.
+    by_reason: dict = {
+        "PRE_DELISTING": [],
+        "MONITORING": [],
+        "SEED": [],
+        "BREAK": [],
+        "HALT": [],
+        "AUCTION_MATCH": [],
+        "ANNOUNCEMENT": [],
+        "OTHER": [],
+    }
     for s in scraped:
         r = reasons.get(s) or "ANNOUNCEMENT"
         by_reason.setdefault(r, []).append(s)
@@ -119,6 +144,7 @@ async def scalper_delisted(state: AppState = Depends(get_state)):
         "by_reason": by_reason,
         "by_reason_counts": {k: len(v) for k, v in by_reason.items()},
         "reasons_map": reasons,
+        "delist_at_ms": delist_at,   # iter 116 — PRE_DELISTING scheduled times
         "legacy_skip_seed": sorted(DEFAULT_DELIST_SEED),
         "scalper": {
             "configured": engine.configured_symbols,
