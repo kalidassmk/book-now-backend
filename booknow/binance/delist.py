@@ -41,12 +41,14 @@ REFRESH_INTERVAL_S = 6 * 60 * 60  # 6 hours
 TARGET_TITLE = "Notice of Removal of Spot Trading Pairs"
 
 # iter 115 — Binance BAPI endpoint exposing per-product `tags` (incl.
-# Monitoring / Seed labels).  Public, no auth required.
+# Monitoring tag.  Public, no auth required.
 BAPI_PRODUCTS_URL = "https://www.binance.com/bapi/asset/v2/public/asset-service/product/get-products"
 # Tag → reason label stored in Redis next to the delist marker.
+# iter 117 — Seed tag REMOVED from blocking.  Operator decided new
+# Seed-tagged listings are fine to trade (they're risky but not
+# delisted).  Only Monitoring + Pre-delisting + BREAK/HALT remain.
 TAG_REASONS = {
     "Monitoring": "MONITORING",
-    "Seed":       "SEED",
 }
 
 # iter 116 — `exchangeInfo` statuses that mean "do not trade".
@@ -205,7 +207,6 @@ class DelistService:
         payload = await asyncio.to_thread(_fetch)
         products = (payload or {}).get("data") or []
         marked_monitoring = 0
-        marked_seed = 0
         marked_predelist = 0
         for p in products:
             sym = p.get("s") or ""
@@ -224,9 +225,8 @@ class DelistService:
             elif "Monitoring" in tags:
                 reason = TAG_REASONS["Monitoring"]
                 marked_monitoring += 1
-            elif "Seed" in tags:
-                reason = TAG_REASONS["Seed"]
-                marked_seed += 1
+            # iter 117 — SEED branch removed; Seed-tagged coins are no
+            # longer blocked.
 
             if reason is not None:
                 await self.mark(sym, reason=reason)
@@ -236,10 +236,46 @@ class DelistService:
                         await self._redis.set(f"BINANCE:DELIST_AT:{sym}", str(int(pomt)))
                     except Exception:
                         pass
+
+        # iter 117 — clean up any leftover SEED entries from previous scans
+        # so coins blocked under the SEED policy become tradable again.
+        cleaned_seed = await self._cleanup_reason("SEED")
+
         logger.info(
-            "[DelistService] BAPI scan complete — %d PRE_DELISTING, %d MONITORING, %d SEED",
-            marked_predelist, marked_monitoring, marked_seed,
+            "[DelistService] BAPI scan complete — %d PRE_DELISTING, %d MONITORING, "
+            "%d legacy SEED cleared",
+            marked_predelist, marked_monitoring, cleaned_seed,
         )
+
+    async def _cleanup_reason(self, reason: str) -> int:
+        """iter 117 — purge BINANCE:DELIST:<sym> + BINANCE:DELIST_REASON:<sym>
+        for every symbol where the reason matches `reason`.
+        Returns the number of symbols cleaned.
+        """
+        cleared = 0
+        try:
+            keys = await self._redis.keys("BINANCE:DELIST_REASON:*")
+            for k in keys:
+                try:
+                    val = await self._redis.get(k)
+                    if val != reason:
+                        continue
+                    sym = k.split(":", 2)[-1]
+                    # Delete both the delist marker and the reason.
+                    try:
+                        await self._redis.delete(f"{redis_keys.DELIST_PREFIX}{sym}")
+                    except Exception:
+                        pass
+                    try:
+                        await self._redis.delete(k)
+                    except Exception:
+                        pass
+                    cleared += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return cleared
 
     async def _scrape_exchangeinfo_statuses(self) -> None:
         """iter 116 — read /api/v3/exchangeInfo and mark every USDT pair
