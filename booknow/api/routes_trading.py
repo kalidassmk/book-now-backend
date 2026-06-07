@@ -294,6 +294,13 @@ async def cancel_order(
         await state.trade_executor.cancel_order(symbol, order_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cancel failed: {e}")
+    # iter 135 — Free up the symbol so the next manual buy isn't blocked
+    # by `is_already_bought()`.  Best-effort; failures are logged inside
+    # the helper.  See booknow/trading/executor.py:evict_if_matches.
+    try:
+        await state.trade_executor.evict_if_matches(symbol, order_id)
+    except Exception as e:
+        logger.warning("[/order/cancel] evict_if_matches failed: %s", e)
     return "Order cancelled successfully."
 
 

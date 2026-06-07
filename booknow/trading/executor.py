@@ -1391,6 +1391,59 @@ class TradeExecutor:
             logger.error("[Cancel] %s #%s failed: %s", symbol, order_id, e)
             raise
 
+    # iter 135 — If the cancelled order is the SAME order we registered as
+    # the symbol's open position (via _record_manual_buy), evict the
+    # Redis BUY hash + in-memory state so the operator can immediately
+    # place a NEW order on the same symbol.  Used by the Quick Trade
+    # cancel-and-replace flow.
+    #
+    # Bug it fixes: try_manual_limit_buy / market_buy both gate on
+    # `is_already_bought()`.  Without this eviction the edit flow
+    # silently dropped the new order with HTTP 400 "Failed to place
+    # limit order" — operator saw cancel succeed then nothing.
+    async def evict_if_matches(self, symbol: str, order_id: int) -> bool:
+        try:
+            raw = await self._redis.hget(redis_keys.BUY_KEY, symbol)
+            if not raw:
+                # No tracked position for this symbol — still clear in-memory
+                # in case state and Redis drifted apart.
+                if self._state.is_already_bought(symbol):
+                    self._state.mark_sold(symbol)
+                    self._tsl.reset(symbol)
+                    logger.info("[Evict] %s in-memory only (no Redis BUY) — cleared", symbol)
+                    return True
+                return False
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                logger.warning("[Evict] %s BUY-hash JSON unparseable; clearing anyway", symbol)
+                await self._redis.hdel(redis_keys.BUY_KEY, symbol)
+                self._state.mark_sold(symbol)
+                self._tsl.reset(symbol)
+                return True
+            tracked_id = rec.get("orderId")
+            try:
+                tracked_id_int = int(tracked_id) if tracked_id is not None else None
+            except (TypeError, ValueError):
+                tracked_id_int = None
+            if tracked_id_int is None or tracked_id_int == int(order_id):
+                await self._redis.hdel(redis_keys.BUY_KEY, symbol)
+                self._state.mark_sold(symbol)
+                self._tsl.reset(symbol)
+                logger.info(
+                    "[Evict] %s #%s matched tracked orderId %s — BUY hash + state cleared",
+                    symbol, order_id, tracked_id_int,
+                )
+                return True
+            logger.info(
+                "[Evict] %s #%s did NOT match tracked orderId %s — position kept",
+                symbol, order_id, tracked_id_int,
+            )
+            return False
+        except Exception as e:
+            logger.error("[Evict] %s #%s eviction check failed: %s", symbol, order_id, e)
+            return False
+
     # ── Internal helpers ─────────────────────────────────────────────────
 
     async def _calculate_qty(
