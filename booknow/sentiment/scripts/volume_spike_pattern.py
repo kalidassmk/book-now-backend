@@ -751,31 +751,73 @@ def delegate_buy(symbol: str, event: Dict[str, Any], cfg: Dict[str, Any]) -> boo
         return False
 
 
+# iter172 — token sets that mark an event as an ACTIONABLE PUMP/LONG
+# signal.  Only these block a VSP pump auto-buy.  Everything else
+# (dump / neutral / uncertain / watch-only log noise) is ignored, because
+# a FLASH_DUMP detection on the same coin is NOT a competing buy signal.
+_PUMP_DIRECTIONS = {"PUMP", "LONG", "UP", "REVERSAL_UP", "BULLISH"}
+_PUMP_LABEL_TOKENS = ("PUMP", "REVERSAL_UP", "BREAKOUT", "LONG", "SURGE")
+_BLOCK_LABEL_TOKENS = ("DUMP", "DOWN", "BEAR", "BREAKDOWN", "SHORT", "SELL")
+
+
+def _is_actionable_pump(ev: Dict[str, Any]) -> bool:
+    """True only when an event represents a real PUMP/LONG signal.
+
+    Logic:
+      • Direction wins when present: a DUMP/SHORT direction is never a buy
+        signal; an explicit PUMP/LONG/REVERSAL_UP direction is.
+      • Otherwise fall back to the label text — a label containing a dump
+        token (FLASH_DUMP, BREAKDOWN_RISK, BIG_DUMP …) is rejected; one
+        containing a pump token (EXPLOSIVE_PUMP, WATCH_REVERSAL_UP …) is
+        accepted.
+      • UNCERTAIN / WATCH_NEUTRAL / NEUTRAL and anything ambiguous → False.
+    """
+    direction = str(ev.get("direction", "")).upper()
+    if direction:
+        if direction in _PUMP_DIRECTIONS:
+            return True
+        # An explicit non-pump direction (DUMP/NEUTRAL/SHORT) never blocks.
+        return False
+
+    label = str(ev.get("label", "")).upper()
+    if not label:
+        # No direction, no label → not enough to call it a pump signal.
+        return False
+    if any(tok in label for tok in _BLOCK_LABEL_TOKENS):
+        return False
+    if any(tok in label for tok in _PUMP_LABEL_TOKENS):
+        return True
+    return False
+
+
 def other_algo_signaled_today(
     r: redis.Redis,
     r_an: Optional[redis.Redis],
     symbol: str,
 ) -> Optional[str]:
-    """iter171 — VSP-only exclusivity gate.
+    """iter171/172 — VSP-only exclusivity gate (PUMP signals only).
 
-    Return the NAME of another detector that already fired ``symbol``
-    TODAY (UTC), or ``None`` if VSP is the only one.  We check:
+    Return the NAME of another detector that already fired an ACTIONABLE
+    PUMP/LONG signal for ``symbol`` TODAY (UTC), or ``None`` if VSP is the
+    only pump source.  We check:
 
       • EarlyPump → EARLY_PUMP:LATEST hash on the analyse-DB (per-symbol,
-        carries ``ts`` ms — counted only if today).
+        carries ``ts`` ms — counted only if today).  EarlyPump is pump-only
+        by design.
       • CCP       → CCP:DETECTIONS:<date>        (today-only by key)
       • LMC       → LMC:DETECTIONS:<date> +
                     INSTANT_PUMP:DETECTIONS:<date> (same algo family)
       • PumpRider → PUMP_RIDER:DETECTIONS:<date>
 
-    The DETECTIONS:<date> lists are already scoped to today by their key,
-    so for those we just look for the symbol; for EarlyPump's LATEST hash
-    we verify the timestamp is from today.
+    iter172 fix: every DETECTIONS list logs *every* fire, including
+    dump-direction detections (e.g. LMC FLASH_DUMP, CCP BREAKDOWN_RISK).
+    Those are NOT competing buy signals, so we now count an entry only when
+    :func:`_is_actionable_pump` says it's a genuine PUMP/LONG signal.
     """
     symbol = symbol.upper()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # 1) EarlyPump — analyse-DB LATEST hash (timestamped).
+    # 1) EarlyPump — analyse-DB LATEST hash (timestamped). Pump-only detector.
     if r_an is not None:
         try:
             raw = r_an.hget("EARLY_PUMP:LATEST", symbol)
@@ -791,13 +833,15 @@ def other_algo_signaled_today(
             log.debug(f"[VSP] EarlyPump cross-check {symbol}: {exc}")
 
     # 2-4) Today's DETECTIONS lists on the main DB (key already = today).
+    #      PumpRider's list is pump-only by design, so any same-symbol entry
+    #      counts; CCP/LMC log dumps too, so we require an actionable pump.
     checks = (
-        ("CCP", f"CCP:DETECTIONS:{today}"),
-        ("LMC", f"LMC:DETECTIONS:{today}"),
-        ("LMC", f"INSTANT_PUMP:DETECTIONS:{today}"),
-        ("PumpRider", f"PUMP_RIDER:DETECTIONS:{today}"),
+        ("CCP", f"CCP:DETECTIONS:{today}", True),
+        ("LMC", f"LMC:DETECTIONS:{today}", True),
+        ("LMC", f"INSTANT_PUMP:DETECTIONS:{today}", False),
+        ("PumpRider", f"PUMP_RIDER:DETECTIONS:{today}", False),
     )
-    for name, key in checks:
+    for name, key, pump_filter in checks:
         try:
             items = r.lrange(key, 0, 999) or []
         except Exception as exc:
@@ -808,8 +852,11 @@ def other_algo_signaled_today(
                 ev = json.loads(it)
             except Exception:
                 continue
-            if str(ev.get("symbol", "")).upper() == symbol:
-                return name
+            if str(ev.get("symbol", "")).upper() != symbol:
+                continue
+            if pump_filter and not _is_actionable_pump(ev):
+                continue  # dump / neutral / watch-only — not a buy signal
+            return name
     return None
 
 
