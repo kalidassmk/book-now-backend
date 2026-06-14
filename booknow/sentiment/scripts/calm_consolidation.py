@@ -499,6 +499,17 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
     else:
         label = f"WATCH_{direction}"
 
+    # ── Buy/Sell volume over closed 5m consolidation window (UI-only; additive) ──
+    buy_vol = sell_vol = None
+    try:
+        closed_5m = klines_5m[:-1]  # exclude in-progress candle
+        total_qv = sum(float(k[7]) for k in closed_5m)
+        taker_buy = sum(float(k[10]) for k in closed_5m)
+        buy_vol = round(taker_buy, 2)
+        sell_vol = round(max(0.0, total_qv - taker_buy), 2)
+    except (ValueError, IndexError, TypeError):
+        buy_vol = sell_vol = None
+
     return {
         "symbol": symbol,
         "ts": int(time.time() * 1000),
@@ -506,6 +517,8 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
         "score": score,
         "direction": direction,
         "trigger_price": last_price,
+        "buy_vol": buy_vol,
+        "sell_vol": sell_vol,
         "chg_24h_pct": round(chg_24h, 2),
         "today_vol_usd": round(qv_24h, 0),
         "gate": gate_meta,

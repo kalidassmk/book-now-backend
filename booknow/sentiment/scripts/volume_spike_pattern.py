@@ -602,6 +602,17 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any],
     elif abs(d_score) >= mod_dir and m_score >= mod_mag:
         label = "MODERATE_PUMP" if d_score > 0 else "MODERATE_DUMP"
 
+    # ── Buy/Sell volume on trigger candle (UI-only; additive) ──
+    buy_vol = sell_vol = None
+    try:
+        tk = closed[-1]
+        total_qv = float(tk[7])          # quote asset volume (USDT)
+        taker_buy = float(tk[10])        # taker buy quote volume (USDT)
+        buy_vol = round(taker_buy, 2)
+        sell_vol = round(max(0.0, total_qv - taker_buy), 2)
+    except (ValueError, IndexError, TypeError):
+        buy_vol = sell_vol = None
+
     return {
         "symbol": symbol,
         "ts": int(time.time() * 1000),
@@ -610,6 +621,8 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any],
         "magnitude_score": round(m_score, 1),
         "confidence": round(confidence, 1),
         "trigger_close": closes[-1],
+        "buy_vol": buy_vol,
+        "sell_vol": sell_vol,
         "entry": {
             "vol_1m_mult": round(vol_1m_mult, 2),
             "vol_5m_mult": round(vol_5m_mult, 2),
