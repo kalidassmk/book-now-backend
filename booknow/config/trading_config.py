@@ -871,6 +871,11 @@ class TradingConfig:
     vspAutoBuyMaxPositions: int = 5        # concurrent cap ($100 total)
     vspAutoBuyNoChase: bool = True         # skip when current > signal
     vspAutoBuyMinConfidence: int = 75      # min VSP confidence to act
+    # iter171 (2026-06-15) — cross-algorithm exclusivity.  Skip the VSP
+    # buy if the SAME coin was already signalled TODAY (UTC) by any other
+    # detector (EarlyPump / CCP / LMC / PumpRider).  Keeps VSP buys
+    # "VSP-only" — no overlap with coins another algo already flagged.
+    vspAutoBuyCrossCheckEnabled: bool = True
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
