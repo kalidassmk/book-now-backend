@@ -1266,13 +1266,17 @@ class TradeExecutor:
         current_price_data: Mapping[str, Any],
         qty: Optional[float] = None,
         rule_label: str = "MANUAL",
-    ) -> None:
+        bypass_kill_switch: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         # iter 94 — hard kill switch (manual-only sell mode).
         # The operator wants ALL bot-side sells disabled — including the
         # "Manual Sell" button on our internal dashboard, since they
         # prefer to act directly on Binance UI. If you need to re-enable
         # this, set HARD_DISABLE_AUTOSELL=False and redeploy.
-        if self.HARD_DISABLE_AUTOSELL:
+        # iter 130 — `bypass_kill_switch=True` is set by the Quick Trade
+        # endpoint, which IS the operator's manual exit tool — the kill
+        # switch was meant to silence BOT auto-exits, not operator clicks.
+        if self.HARD_DISABLE_AUTOSELL and not bypass_kill_switch:
             sell_price = _price_of(current_price_data)
             await self._publish_blocked_sell(symbol, sell_price, rule_label, source="try_manual_sell")
             logger.warning(
@@ -1280,7 +1284,7 @@ class TradeExecutor:
                 "(manual-only mode; iter94). Sell on Binance UI directly.",
                 rule_label, symbol, sell_price,
             )
-            return
+            return None
         try:
             sell_price = _price_of(current_price_data)
             if qty is not None and qty > 0:
@@ -1293,15 +1297,22 @@ class TradeExecutor:
                 buy = json.loads(buy_raw)
                 qty_str = str(buy.get("executedQty") or "0")
 
+            resp: Optional[Dict[str, Any]] = None
             if self.live_mode:
                 logger.info("[%s] LIVE marketSell %s qty=%s @ ~%s", rule_label, symbol, qty_str, sell_price)
-                await self._ws_api.place_order(
+                resp = await self._ws_api.place_order(
                     symbol=symbol, side="SELL", order_type="MARKET", quantity=qty_str,
                 )
                 if self._dust is not None:
                     await self._dust.sweep_to_bnb(symbol.replace("USDT", ""))
             else:
                 logger.info("[%s] PAPER marketSell %s qty=%s @ ~%s", rule_label, symbol, qty_str, sell_price)
+                resp = {
+                    "symbol": symbol,
+                    "orderId": int(time.time() * 1000),
+                    "executedQty": qty_str,
+                    "status": "FILLED_PAPER",
+                }
 
             await self._redis.hdel(redis_keys.BUY_KEY, symbol)
             self._state.mark_sold(symbol)
@@ -1314,8 +1325,59 @@ class TradeExecutor:
             }
             await self._redis.hset(redis_keys.SELL_KEY, symbol, json.dumps(sell_payload))
             logger.info("[%s SELL] Completed for %s", rule_label, symbol)
+            return resp if isinstance(resp, dict) else None
         except Exception as e:
             logger.error("[%s SELL] Failed for %s: %s", rule_label, symbol, e)
+            return None
+
+    # iter 130 — Manual LIMIT SELL for the Quick Trade UI.
+    # Takes an EXPLICIT absolute price (operator picked it from the order
+    # book or the chart).  GTC; bypasses HARD_DISABLE_AUTOSELL by design —
+    # this method is only callable from the Quick Trade endpoint, which is
+    # the operator's explicit exit tool.  Bot paths still use
+    # `_place_limit_sell` and respect the kill switch.
+    async def try_manual_limit_sell(
+        self,
+        symbol: str,
+        qty: float,
+        price: float,
+        rule_label: str = "MANUAL_LIMIT",
+    ) -> Optional[Dict[str, Any]]:
+        try:
+            from decimal import Decimal as _D
+            qty_dec = await self._filters.round_quantity(symbol, _to_decimal(qty))
+            price_dec = await self._filters.round_price(symbol, _to_decimal(price))
+            try:
+                await self._filters.validate_notional(symbol, qty_dec, price_dec)
+            except Exception as e:
+                logger.warning("[%s LIMIT-SELL] notional check %s: %s", rule_label, symbol, e)
+                # Fall through — Binance will reject if truly under min-notional.
+            if self.live_mode:
+                logger.info(
+                    "[%s] LIVE limitSell %s qty=%s price=%s",
+                    rule_label, symbol, qty_dec, price_dec,
+                )
+                resp = await self._ws_api.place_order(
+                    symbol=symbol, side="SELL", order_type="LIMIT",
+                    quantity=str(qty_dec), price=str(price_dec), time_in_force="GTC",
+                )
+            else:
+                logger.info(
+                    "[%s] PAPER limitSell %s qty=%s price=%s",
+                    rule_label, symbol, qty_dec, price_dec,
+                )
+                resp = {
+                    "symbol": symbol,
+                    "orderId": int(time.time() * 1000),
+                    "price": str(price_dec),
+                    "origQty": str(qty_dec),
+                    "executedQty": "0",
+                    "status": "NEW_PAPER",
+                }
+            return resp if isinstance(resp, dict) else None
+        except Exception as e:
+            logger.error("[%s LIMIT-SELL] %s failed: %s", rule_label, symbol, e, exc_info=True)
+            return None
 
     async def cancel_order(self, symbol: str, order_id: int) -> None:
         logger.info("[Cancel] cancel order %s for %s", order_id, symbol)
@@ -1328,6 +1390,59 @@ class TradeExecutor:
         except Exception as e:
             logger.error("[Cancel] %s #%s failed: %s", symbol, order_id, e)
             raise
+
+    # iter 135 — If the cancelled order is the SAME order we registered as
+    # the symbol's open position (via _record_manual_buy), evict the
+    # Redis BUY hash + in-memory state so the operator can immediately
+    # place a NEW order on the same symbol.  Used by the Quick Trade
+    # cancel-and-replace flow.
+    #
+    # Bug it fixes: try_manual_limit_buy / market_buy both gate on
+    # `is_already_bought()`.  Without this eviction the edit flow
+    # silently dropped the new order with HTTP 400 "Failed to place
+    # limit order" — operator saw cancel succeed then nothing.
+    async def evict_if_matches(self, symbol: str, order_id: int) -> bool:
+        try:
+            raw = await self._redis.hget(redis_keys.BUY_KEY, symbol)
+            if not raw:
+                # No tracked position for this symbol — still clear in-memory
+                # in case state and Redis drifted apart.
+                if self._state.is_already_bought(symbol):
+                    self._state.mark_sold(symbol)
+                    self._tsl.reset(symbol)
+                    logger.info("[Evict] %s in-memory only (no Redis BUY) — cleared", symbol)
+                    return True
+                return False
+            try:
+                rec = json.loads(raw)
+            except Exception:
+                logger.warning("[Evict] %s BUY-hash JSON unparseable; clearing anyway", symbol)
+                await self._redis.hdel(redis_keys.BUY_KEY, symbol)
+                self._state.mark_sold(symbol)
+                self._tsl.reset(symbol)
+                return True
+            tracked_id = rec.get("orderId")
+            try:
+                tracked_id_int = int(tracked_id) if tracked_id is not None else None
+            except (TypeError, ValueError):
+                tracked_id_int = None
+            if tracked_id_int is None or tracked_id_int == int(order_id):
+                await self._redis.hdel(redis_keys.BUY_KEY, symbol)
+                self._state.mark_sold(symbol)
+                self._tsl.reset(symbol)
+                logger.info(
+                    "[Evict] %s #%s matched tracked orderId %s — BUY hash + state cleared",
+                    symbol, order_id, tracked_id_int,
+                )
+                return True
+            logger.info(
+                "[Evict] %s #%s did NOT match tracked orderId %s — position kept",
+                symbol, order_id, tracked_id_int,
+            )
+            return False
+        except Exception as e:
+            logger.error("[Evict] %s #%s eviction check failed: %s", symbol, order_id, e)
+            return False
 
     # ── Internal helpers ─────────────────────────────────────────────────
 

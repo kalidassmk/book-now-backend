@@ -146,6 +146,54 @@ async def manual_limit_buy(
     return resp
 
 
+# iter 130 — Quick Trade SELL endpoints.
+#
+# The legacy /api/v1/sell/{symbol} is gated by HARD_DISABLE_AUTOSELL
+# (iter94) so bot paths can't trigger sells.  The Quick Trade panel is
+# the operator's EXPLICIT manual exit tool, so these two routes bypass
+# the kill switch.  Bot paths still hit the old endpoint.
+
+@router.get("/order/market-sell/{symbol}")
+async def manual_market_sell(
+    symbol: str,
+    qty: Optional[float] = Query(default=None),
+    state: AppState = Depends(get_state),
+) -> Any:
+    cp = await _resolve_current_price(state, symbol)
+    if cp is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No live price for {symbol}. Is the pipeline running?",
+        )
+    resp = await state.trade_executor.try_manual_sell(
+        symbol, cp, qty=qty,
+        rule_label="QUICK_TRADE_MARKET",
+        bypass_kill_switch=True,
+    )
+    if resp is None:
+        raise HTTPException(status_code=400, detail="Failed to place market sell.")
+    return resp
+
+
+@router.get("/order/limit-sell/{symbol}")
+async def manual_limit_sell(
+    symbol: str,
+    qty: float = Query(..., ge=0),
+    price: float = Query(..., ge=0),
+    state: AppState = Depends(get_state),
+) -> Any:
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="qty must be > 0")
+    if price <= 0:
+        raise HTTPException(status_code=400, detail="price must be > 0")
+    resp = await state.trade_executor.try_manual_limit_sell(
+        symbol, qty=qty, price=price, rule_label="QUICK_TRADE_LIMIT",
+    )
+    if resp is None:
+        raise HTTPException(status_code=400, detail="Failed to place limit sell.")
+    return resp
+
+
 @router.post("/order/pattern-buy/{symbol}")
 async def pattern_bot_buy(
     symbol: str,
@@ -246,6 +294,13 @@ async def cancel_order(
         await state.trade_executor.cancel_order(symbol, order_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Cancel failed: {e}")
+    # iter 135 — Free up the symbol so the next manual buy isn't blocked
+    # by `is_already_bought()`.  Best-effort; failures are logged inside
+    # the helper.  See booknow/trading/executor.py:evict_if_matches.
+    try:
+        await state.trade_executor.evict_if_matches(symbol, order_id)
+    except Exception as e:
+        logger.warning("[/order/cancel] evict_if_matches failed: %s", e)
     return "Order cancelled successfully."
 
 

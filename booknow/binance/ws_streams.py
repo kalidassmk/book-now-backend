@@ -61,6 +61,12 @@ logger = logging.getLogger("booknow.ws_streams")
 
 _USDT = "USDT"
 _USDT_LEN = 4
+# iter136 — the operator trades USDC / FDUSD pairs manually (Quick Trade),
+# not just USDT. Widen the price-stream universe so CURRENT_PRICE carries
+# those pairs too, which is what /api/v1/order/* manual routes read to
+# resolve a live price. Auto-buy/sell stay hard-disabled in the executor,
+# so this only feeds the operator's manual order placement + dashboards.
+_QUOTES = ("USDT", "USDC", "FDUSD")
 _STREAM_URL = "wss://stream.binance.com:9443/ws/!ticker_1h@arr"
 _RECONNECT_BACKOFF_MAX_S = 30
 _BAN_DEFAULT_COOLDOWN_S = 120
@@ -170,13 +176,13 @@ class MarketStreamService:
         if not isinstance(tickers, list):
             return
 
-        # Filter to USDT pairs, drop delisted, sort highest-percentage first
+        # Filter to USDT/USDC/FDUSD pairs, drop delisted, sort by percentage
         # (matches the Java consumer's ordering for downstream consumers
         # that grab a "top movers" slice without a sort).
         valid: List[Dict[str, Any]] = [
             t for t in tickers
             if isinstance(t.get("s"), str)
-            and t["s"].endswith(_USDT)
+            and t["s"].endswith(_QUOTES)
             and t["s"] not in self._delist
         ]
         try:
