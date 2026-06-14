@@ -600,6 +600,7 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
     surge_5m      = 0.0
     chg_5m_pct    = 0.0
     fast_pass     = False
+    klines_1m     = None
     if abs(chg_24h_pct) >= fast_prefilter_chg:
         klines_1m = fetch_minute_klines(symbol, limit=65)
         short_vol_5m, short_base_pm, surge_5m, chg_5m_pct = compute_short_vol_surge(
@@ -665,6 +666,20 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
     else:
         label = f"WATCH_{direction}"
 
+    # ── Buy/Sell volume over last 5 closed 1m candles (UI-only; additive).
+    # Uses klines_1m already fetched on the fast path — no extra API call.
+    # On the pure slow path klines_1m is None → buy/sell stay None. ──
+    buy_vol = sell_vol = None
+    try:
+        if klines_1m and len(klines_1m) >= 2:
+            recent = klines_1m[:-1][-5:]  # exclude in-progress, last 5 closed
+            total_qv = sum(float(k[7]) for k in recent)
+            taker_buy = sum(float(k[10]) for k in recent)
+            buy_vol = round(taker_buy, 2)
+            sell_vol = round(max(0.0, total_qv - taker_buy), 2)
+    except (ValueError, IndexError, TypeError):
+        buy_vol = sell_vol = None
+
     return {
         "symbol": symbol,
         "ts": int(time.time() * 1000),
@@ -672,6 +687,8 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
         "score": score,
         "direction": direction,
         "trigger_price": last_price,
+        "buy_vol": buy_vol,
+        "sell_vol": sell_vol,
         "chg_24h_pct": round(chg_24h_pct, 2),
         "today_vol_usd": round(today_vol, 0),
         "avg_7d_vol_usd": round(avg_vol_7d, 0),

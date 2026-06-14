@@ -336,12 +336,25 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     if tier in ("STRONG", "NORMAL") and cum_chg_10m > max_cum:
         tier = "MEGA"
 
+    # ── Buy/Sell volume on trigger candle (UI-only; additive) ──
+    buy_vol = sell_vol = None
+    try:
+        tk = closed[-1]
+        total_qv = float(tk[7])      # quote asset volume (USDT)
+        taker_buy = float(tk[10])    # taker buy quote volume (USDT)
+        buy_vol = round(taker_buy, 2)
+        sell_vol = round(max(0.0, total_qv - taker_buy), 2)
+    except (ValueError, IndexError, TypeError):
+        buy_vol = sell_vol = None
+
     return {
         "symbol": symbol,
         "ts": int(time.time() * 1000),
         "tier": tier,
         "trigger_close": c,
         "trigger_open": o,
+        "buy_vol": buy_vol,
+        "sell_vol": sell_vol,
         "chg_1m":  round(chg_1m, 3),
         "chg_5m":  round(chg_5m, 3),
         "chg_30m": round(chg_30m, 3),
