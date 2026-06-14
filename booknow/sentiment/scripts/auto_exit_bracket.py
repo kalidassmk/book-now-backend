@@ -27,8 +27,8 @@ What this subprocess does (DRY-RUN):
        c. SKIP and flag NO_COST_BASIS — we NEVER guess a buy price, because a
           wrong reference price would mean a real-money loss.
   4. From the cost basis it computes the bracket:
-          TP price      = cost * (1 + autoExitTpPct/100)        # +2%
-          SL trigger    = cost * (1 - autoExitSlPct/100)        # -2%
+          TP price      = cost * (1 + autoExitTpPct/100)        # +30%
+          SL trigger    = cost * (1 - autoExitSlPct/100)        # -4%
           SL limit      = SL trigger * (1 - autoExitSlLimitGap) # just below
      and classifies the situation against the live price:
           NORMAL          live between SL and TP — a standard bracket
@@ -78,8 +78,8 @@ DEFAULTS: Dict[str, Any] = {
     "autoExitDryRunEnabled": True,    # run the scanner + publish intended brackets (zero risk)
     "autoExitLiveEnabled": False,     # PHASE 2 — actually place OCO brackets (NOT wired yet)
     # bracket math
-    "autoExitTpPct": 2.0,             # take-profit = cost * (1 + 2%)
-    "autoExitSlPct": 2.0,             # stop-loss  = cost * (1 - 2%)
+    "autoExitTpPct": 30.0,            # take-profit = cost * (1 + 30%)
+    "autoExitSlPct": 4.0,             # stop-loss  = cost * (1 - 4%)
     "autoExitSlLimitGap": 0.001,      # SL limit sits this far below the SL trigger (0.1%)
     # eligibility
     "autoExitMinUsd": 5.0,            # ignore dust below this USDT value
@@ -310,8 +310,8 @@ def build_bracket(
     cost: float,
     live: float,
 ) -> Dict[str, Any]:
-    tp_pct = _safe_float(cfg.get("autoExitTpPct"), 2.0)
-    sl_pct = _safe_float(cfg.get("autoExitSlPct"), 2.0)
+    tp_pct = _safe_float(cfg.get("autoExitTpPct"), 30.0)
+    sl_pct = _safe_float(cfg.get("autoExitSlPct"), 4.0)
     sl_gap = _safe_float(cfg.get("autoExitSlLimitGap"), 0.001)
     fee_buffer = _safe_float(cfg.get("autoExitFeeBuffer"), 0.999)
 
