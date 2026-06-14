@@ -157,4 +157,14 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("calm_consolidation.py",),
         kind="persistent",
     ),
+    # iter167 (2026-06-14) — Smart Buy Re-pricer ("chase-down"), PHASE 1
+    # DRY-RUN. Watches opt-in coins' taker buy-vs-sell flow; when sell
+    # volume dominates, computes a lower limit-buy price and PUBLISHES a
+    # dry-run reprice signal (BUY_REPRICER:SIGNALS:<date>). Places NO real
+    # orders — live execution (buyRepricerLiveEnabled) is not wired yet.
+    SubprocessTask(
+        name="Buy Repricer",
+        cmd_argv=("buy_repricer.py",),
+        kind="persistent",
+    ),
 ]
