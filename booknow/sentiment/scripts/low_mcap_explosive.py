@@ -661,7 +661,14 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
 
     # Build label
     explosive_min = float(cfg.get("lmcExplosiveScore", 75))
-    if score >= explosive_min:
+    # ── iter164 — EXPLOSIVE anti-chase guard (data-driven, 25d backtest) ──
+    # EXPLOSIVE_PUMP is LMC's buy-grade label and performed well overall, but
+    # entries fired after a large 5-minute run-up (|chg_5m| ≥ 2%) had sharply
+    # worse forward returns (avgRet −1.08, loss-rate 53%) — classic chasing.
+    # Downgrade to WATCH when the trigger 5m move is already extended.
+    max_chg5m = float(cfg.get("lmcMaxChg5mForExplosive", 2.0))
+    chase = bool(cfg.get("lmcExplosiveAntiChaseEnabled", True)) and abs(chg_5m_pct) >= max_chg5m
+    if score >= explosive_min and not chase:
         label = f"EXPLOSIVE_{direction}"
     else:
         label = f"WATCH_{direction}"

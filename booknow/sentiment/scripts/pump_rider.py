@@ -336,6 +336,18 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any]) -> Optional[Dict[str, Any]
     if tier in ("STRONG", "NORMAL") and cum_chg_10m > max_cum:
         tier = "MEGA"
 
+    # ── iter164 — Blow-off volume cap (data-driven, 25d backtest) ──
+    # Extreme 1-bar / 5-bar volume surges (≈ ≥8×) are blow-off tops. In the
+    # 25-day PumpRider backtest, vol_surge ≥ 8 had the worst forward-60m
+    # returns (avgRet −0.17~−0.28, loss-rate 29–36%), while moderate surges
+    # held up better. Downgrade NORMAL/STRONG buys to EARLY (alert-only) when
+    # either surge window is in blow-off territory. cfg-gated + reversible.
+    blowoff_mult = float(cfg.get("pumpRiderBlowoffVolMult", 8.0))
+    if (tier in ("STRONG", "NORMAL")
+            and bool(cfg.get("pumpRiderBlowoffCapEnabled", True))
+            and (vol_surge_5m >= blowoff_mult or vol_surge_1m >= blowoff_mult)):
+        tier = "EARLY"
+
     # ── Buy/Sell volume on trigger candle (UI-only; additive) ──
     buy_vol = sell_vol = None
     try:

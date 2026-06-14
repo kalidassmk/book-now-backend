@@ -602,6 +602,19 @@ def evaluate_symbol(symbol: str, cfg: Dict[str, Any],
     elif abs(d_score) >= mod_dir and m_score >= mod_mag:
         label = "MODERATE_PUMP" if d_score > 0 else "MODERATE_DUMP"
 
+    # ── iter164 — BIG_PUMP buy-grade tightening (data-driven, 25d backtest) ──
+    # BIG_PUMP is VSP's strongest buy label, but its raw forward return faded
+    # (chasing). Requiring (a) a strongly buy-dominant 5m taker ratio and
+    # (b) a non-blow-off 1m volume spike lifted avg 15m return +0.24% → +0.45%
+    # with a lower loss-rate. When BIG_PUMP fails either, downgrade it to
+    # MODERATE_PUMP (still publishes, lower conviction). cfg-gated + reversible.
+    if label == "BIG_PUMP" and bool(cfg.get("vspBigPumpTightenEnabled", True)):
+        tbr5 = float((d_breakdown.get("taker_buy_ratio") or {}).get("ratio_5m", 0.0) or 0.0)
+        min_tbr = float(cfg.get("vspBigPumpMinTaker5m", 0.60))
+        max_v1m = float(cfg.get("vspBigPumpMaxVol1mMult", 10.0))
+        if tbr5 < min_tbr or vol_1m_mult >= max_v1m:
+            label = "MODERATE_PUMP"
+
     # ── Buy/Sell volume on trigger candle (UI-only; additive) ──
     buy_vol = sell_vol = None
     try:
