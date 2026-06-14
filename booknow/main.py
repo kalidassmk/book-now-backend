@@ -243,6 +243,33 @@ async def _bootstrap() -> None:
         initial_config.tslPct, initial_config.maxHoldSeconds,
     )
 
+    # ── iter170: VSP-only REAL-MONEY auto-buy manager ────────────────
+    # Isolated execution path for the operator's "enable auto-buy for the
+    # VSP source ONLY" request.  Independent of autoBuyEnabled and the
+    # HARD_DISABLE_AUTOBUY/AUTOSELL kill switches — it buys at the VSP
+    # signal price (no chase), 20 USDT, +30% TP / -6% SL, max 5 positions.
+    # Fed by volume_spike_pattern.py via POST /api/v1/vsp/auto-buy/{symbol}.
+    from booknow.trading.vsp_autobuy import VspAutoBuyManager
+    vsp_autobuy = VspAutoBuyManager(
+        redis_client=redis,
+        ws_api=ws_api,
+        filter_service=filter_service,
+        delist_service=delist_service,
+        config_service=config_service,
+        guard=guard,
+        live_mode=settings.live_mode,
+    )
+    await vsp_autobuy.start()
+    log.info(
+        "  vsp-autobuy manager started (live=%s, enabled=%s, %sUSDT +%.0f%%/-%.0f%% cap=%s)",
+        settings.live_mode,
+        getattr(initial_config, "vspAutoBuyLiveEnabled", False),
+        getattr(initial_config, "vspAutoBuyUsdt", 20.0),
+        getattr(initial_config, "vspAutoBuyTpPct", 30.0),
+        getattr(initial_config, "vspAutoBuySlPct", 6.0),
+        getattr(initial_config, "vspAutoBuyMaxPositions", 5),
+    )
+
     # ── Phase 11: Rules engine — R1 / R2 / R3 ────────────────────────
     # Each reads ST*/CURRENT_PRICE and calls trade_executor.try_buy()
     # when its pattern fires. Sell-listeners on TradeState clear the
@@ -563,6 +590,7 @@ async def _bootstrap() -> None:
         dust_service=dust_service,
         coin_analyzer=coin_analyzer,
         scalper_engine=scalper_engine,
+        vsp_autobuy=vsp_autobuy,
     )
     fastapi_app = build_app(app_state)
     http_server = HttpServer(fastapi_app, host="0.0.0.0", port=settings.http_port)
@@ -620,6 +648,10 @@ async def _bootstrap() -> None:
             await position_monitor.stop()
         except Exception as e:
             log.warning("  position-monitor stop error: %s", e)
+        try:
+            await vsp_autobuy.stop()
+        except Exception as e:
+            log.warning("  vsp-autobuy stop error: %s", e)
         # Then processors, then market_stream — same reasoning.
         for proc in (fast_move, time_analyser, fast_analyse, ulf):
             try:

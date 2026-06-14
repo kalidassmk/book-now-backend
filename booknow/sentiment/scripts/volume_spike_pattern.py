@@ -60,7 +60,7 @@ log = logging.getLogger("VSP")
 
 CONFIG_KEY = "TRADING_CONFIG"
 DEFAULTS: Dict[str, Any] = {
-    "vspEnabled": False,
+    "vspEnabled": True,                       # iter170 — ON (VSP-only auto-buy)
     "vspPaperMode": True,                    # first 7 days paper-only
     "vspPaperModeEndDate": "2026-05-31",     # auto-flip to live after this date
     "vspTopSymbols": 100,
@@ -100,6 +100,12 @@ DEFAULTS: Dict[str, Any] = {
     # Live-mode buy threshold
     "vspLiveConfidence": 75,                 # min confidence to delegate buy
     "vspSellPctLabel": 5.0,                  # passed to pattern-buy
+
+    # iter170 — VSP-only REAL-MONEY auto-buy (mirrors trading_config.py).
+    # The subprocess just forwards BIG_PUMP signals to the backend's
+    # /api/v1/vsp/auto-buy/{symbol} endpoint, which owns all order logic.
+    "vspAutoBuyLiveEnabled": True,
+    "vspAutoBuyMinConfidence": 75,
 
     # Outcome tracking
     "vspOutcomeCheckMinutes": [5, 15, 30, 60],
@@ -706,25 +712,41 @@ def record_paper_trade(r: redis.Redis, event: Dict[str, Any], cfg: Dict[str, Any
 
 
 def delegate_buy(symbol: str, event: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
-    """POST to the python backend's pattern-buy endpoint (LIVE mode only)."""
+    """POST a BIG_PUMP signal to the backend's VSP-only auto-buy endpoint.
+
+    iter170 — replaces the old capped pattern-buy delegate.  We forward
+    the SIGNAL price (event['trigger_close']); the backend's
+    VspAutoBuyManager owns ALL order logic: buy at signal price (skip if
+    current price already above), 20 USDT, +30% TP / -6% SL bracket, and
+    a 5-position cap.  Gated server-side by vspAutoBuyLiveEnabled — this
+    path is isolated from every other bot/ladder.
+    """
+    signal_price = event.get("trigger_close")
+    confidence = event.get("confidence", 0)
+    label = event.get("label", "BIG_PUMP")
     url = (
-        f"{BACKEND_BASE}/api/v1/order/pattern-buy/{symbol}"
-        f"?sell_pct={cfg.get('vspSellPctLabel', 5.0)}&rule_label=VSP"
+        f"{BACKEND_BASE}/api/v1/vsp/auto-buy/{symbol}"
+        f"?signal_price={signal_price}&label={label}&confidence={confidence}"
     )
     try:
         r = requests.post(url, timeout=4)
         if r.status_code != 200:
             log.warning(
-                f"[VSP] delegate {symbol} HTTP {r.status_code}: {r.text[:200]}"
+                f"[VSP] auto-buy {symbol} HTTP {r.status_code}: {r.text[:200]}"
             )
             return False
+        try:
+            body = r.json()
+        except Exception:
+            body = {}
         log.info(
-            f"[VSP] 🚀 LIVE delegate {symbol} confidence={event.get('confidence')} "
-            f"label={event.get('label')} entry={event.get('trigger_close')}"
+            f"[VSP] 🚀 auto-buy {symbol} → {body.get('status')} "
+            f"({body.get('reason', '')}) conf={confidence} "
+            f"label={label} signal={signal_price}"
         )
         return True
     except Exception as exc:
-        log.error(f"[VSP] delegate {symbol} error: {exc}")
+        log.error(f"[VSP] auto-buy {symbol} error: {exc}")
         return False
 
 

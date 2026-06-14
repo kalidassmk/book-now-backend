@@ -241,6 +241,46 @@ async def pattern_bot_buy(
     }
 
 
+@router.post("/vsp/auto-buy/{symbol}")
+async def vsp_auto_buy(
+    symbol: str,
+    signal_price: float = Query(..., gt=0),
+    label: str = Query(default="BIG_PUMP"),
+    confidence: float = Query(default=0.0, ge=0.0),
+    state: AppState = Depends(get_state),
+) -> Any:
+    """iter170 — VSP-ONLY real-money auto-buy.
+
+    Called by ``volume_spike_pattern.py`` for BIG_PUMP signals.  This is
+    DELIBERATELY isolated from try_buy / autoBuyEnabled / the kill
+    switches — only the VspAutoBuyManager (gated by vspAutoBuyLiveEnabled)
+    decides whether to place a real order.  It buys at the VSP signal
+    price (skips if current price is already above), 20 USDT, with a
+    +30% TP / -6% SL bracket and a 5-position cap.
+    """
+    if state.vsp_autobuy is None:
+        raise HTTPException(status_code=503, detail="VSP auto-buy manager not running")
+    cp = await _resolve_current_price(state, symbol)
+    current = 0.0
+    if cp is not None and cp.get("price") is not None:
+        try:
+            current = float(cp.get("price"))
+        except (TypeError, ValueError):
+            current = 0.0
+    try:
+        result = await state.vsp_autobuy.handle_signal(
+            symbol=symbol,
+            signal_price=signal_price,
+            current_price=current,
+            label=label,
+            confidence=confidence,
+        )
+    except Exception as e:
+        logger.error("[vsp-auto-buy] %s failed: %s", symbol, e)
+        raise HTTPException(status_code=500, detail=f"vsp auto-buy error: {e}")
+    return {"symbol": symbol, "current_price": current, **result}
+
+
 # ── Analysis ─────────────────────────────────────────────────────────────
 
 
