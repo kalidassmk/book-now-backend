@@ -748,8 +748,8 @@ def publish_instant_pump(r: redis.Redis, event: Dict[str, Any]) -> None:
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         payload = json.dumps(event)
         r.rpush(f"INSTANT_PUMP:DETECTIONS:{date}", payload)
-        r.ltrim(f"INSTANT_PUMP:DETECTIONS:{date}", -1000, -1)
-        r.expire(f"INSTANT_PUMP:DETECTIONS:{date}", 14 * 24 * 3600)
+        r.ltrim(f"INSTANT_PUMP:DETECTIONS:{date}", -2000, -1)
+        r.expire(f"INSTANT_PUMP:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d retention (history page)
         r.hset("INSTANT_PUMP:LATEST", event["symbol"], payload)
     except Exception as exc:
         log.debug(f"[INSTANT_PUMP] publish failed for {event.get('symbol')}: {exc}")
@@ -759,7 +759,8 @@ def publish_detection(r: redis.Redis, event: Dict[str, Any]) -> None:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         r.rpush(f"LMC:DETECTIONS:{date}", json.dumps(event))
-        r.expire(f"LMC:DETECTIONS:{date}", 14 * 24 * 3600)
+        r.ltrim(f"LMC:DETECTIONS:{date}", -2000, -1)        # cap day-key (t3.micro RAM)
+        r.expire(f"LMC:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d retention (history page)
         r.hset("LMC:LATEST", event["symbol"], json.dumps(event))
         r.rpush("LMC:OUTCOME_PENDING", json.dumps({
             "symbol": event["symbol"],

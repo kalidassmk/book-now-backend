@@ -641,7 +641,8 @@ def publish_detection(r: redis.Redis, event: Dict[str, Any]) -> None:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         r.rpush(f"VSP:DETECTIONS:{date}", json.dumps(event))
-        r.expire(f"VSP:DETECTIONS:{date}", 14 * 24 * 3600)  # 14d retention
+        r.ltrim(f"VSP:DETECTIONS:{date}", -2000, -1)        # cap day-key (t3.micro RAM)
+        r.expire(f"VSP:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d retention (history page)
         r.hset("VSP:LATEST", event["symbol"], json.dumps(event))
         # Outcome-pending queue for the tracker pass
         r.rpush("VSP:OUTCOME_PENDING", json.dumps({

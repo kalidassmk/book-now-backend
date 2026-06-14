@@ -1864,7 +1864,8 @@ class MultiSymbolScalper:
             }
             payload = _json.dumps(event)
             await asyncio.to_thread(self.redis.rpush, f"FAST_SCALPER:DETECTIONS:{date}", payload)
-            await asyncio.to_thread(self.redis.expire, f"FAST_SCALPER:DETECTIONS:{date}", 14 * 24 * 3600)
+            await asyncio.to_thread(self.redis.ltrim, f"FAST_SCALPER:DETECTIONS:{date}", -2000, -1)  # cap day-key
+            await asyncio.to_thread(self.redis.expire, f"FAST_SCALPER:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d
             await asyncio.to_thread(self.redis.hset, "FAST_SCALPER:LATEST", symbol, payload)
             log.info(f"📡 [scalper-signal] {symbol} would_buy @ {signal_price} (source={source})")
         except Exception as e:

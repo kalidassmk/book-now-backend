@@ -534,7 +534,8 @@ def publish_detection(r: redis.Redis, event: Dict[str, Any]) -> None:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         r.rpush(f"CCP:DETECTIONS:{date}", json.dumps(event))
-        r.expire(f"CCP:DETECTIONS:{date}", 14 * 24 * 3600)
+        r.ltrim(f"CCP:DETECTIONS:{date}", -2000, -1)        # cap day-key (t3.micro RAM)
+        r.expire(f"CCP:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d retention (history page)
         r.hset("CCP:LATEST", event["symbol"], json.dumps(event))
         r.rpush("CCP:OUTCOME_PENDING", json.dumps({
             "symbol": event["symbol"],
