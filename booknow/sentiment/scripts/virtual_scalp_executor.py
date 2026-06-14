@@ -867,7 +867,8 @@ class VirtualScalpExecutor:
             }
             payload = _json.dumps(event)
             self.r.rpush(f"VIRTUAL_SCALPER:DETECTIONS:{date}", payload)
-            self.r.expire(f"VIRTUAL_SCALPER:DETECTIONS:{date}", 14 * 24 * 3600)
+            self.r.ltrim(f"VIRTUAL_SCALPER:DETECTIONS:{date}", -2000, -1)        # cap day-key (t3.micro RAM)
+            self.r.expire(f"VIRTUAL_SCALPER:DETECTIONS:{date}", 90 * 24 * 3600)  # iter157 90d retention
             self.r.hset("VIRTUAL_SCALPER:LATEST", symbol, payload)
             print(f"📡 [v-scalper-signal] {symbol} would_buy @ {signal_price} (source={source})")
         except Exception as e:
