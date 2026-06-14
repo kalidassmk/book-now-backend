@@ -801,7 +801,7 @@ class TradingConfig:
     # vspPaperModeEndDate).  Live mode delegates BIG_PUMP buys at
     # confidence ≥ vspLiveConfidence via pattern-buy — inherits
     # iter65 resistance gate + iter66 depth check + HARD-SL.
-    vspEnabled: bool = False         # iter 84 — KILL SWITCH OFF (operator-opt-in)
+    vspEnabled: bool = True          # iter170 — ON: operator enabled VSP-only auto-buy
     vspPaperMode: bool = True
     vspPaperModeEndDate: str = "2026-05-31"  # auto-live from June 1st
     vspTopSymbols: int = 100
@@ -842,6 +842,35 @@ class TradingConfig:
     vspLiveConfidence: int = 75
     vspSellPctLabel: float = 5.0
     iter69VspAppliedAt: str = "2026-05-24"
+
+    # ──────────────────────────────────────────────────────────────────
+    # iter170 (2026-06-15) — VSP-only REAL-MONEY auto-buy ("VSP Auto-Buy")
+    # ──────────────────────────────────────────────────────────────────
+    # Operator wants auto-buy enabled for ONE source ONLY: the
+    # Volume-Spike-Pattern BIG_PUMP signal.  This path is DELIBERATELY
+    # INDEPENDENT of every other buy gate:
+    #   • NOT gated by global ``autoBuyEnabled``       (other bots stay off)
+    #   • NOT gated by ``HARD_DISABLE_AUTOBUY`` (executor try_buy stays off)
+    #   • exits are NOT gated by ``HARD_DISABLE_AUTOSELL`` (the VSP bracket
+    #     must be able to take profit / stop loss on its own positions)
+    # so turning it on enables VSP buys and NOTHING else.
+    #
+    # Spec (operator, 2026-06-15):
+    #   • BUY at the SIGNAL price (limit); SKIP if current price already
+    #     ABOVE the signal price (no chasing a coin that already ran);
+    #   • 20 USDT per position;
+    #   • +30% take-profit  → resting GTC LIMIT SELL on the book;
+    #   • -6% stop-loss     → monitored MARKET exit (VspAutoBuyManager tick);
+    #   • max 5 concurrent VSP positions  ($100 exposure cap).
+    #
+    # Redis state: VSP:AUTOBUY:POS  (hash symbol → position json).
+    vspAutoBuyLiveEnabled: bool = True     # the ONLY real-money gate for VSP
+    vspAutoBuyUsdt: float = 20.0           # per-position size
+    vspAutoBuyTpPct: float = 30.0          # take-profit target
+    vspAutoBuySlPct: float = 6.0           # stop-loss
+    vspAutoBuyMaxPositions: int = 5        # concurrent cap ($100 total)
+    vspAutoBuyNoChase: bool = True         # skip when current > signal
+    vspAutoBuyMinConfidence: int = 75      # min VSP confidence to act
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
