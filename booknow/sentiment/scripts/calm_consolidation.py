@@ -494,7 +494,14 @@ def evaluate_symbol(symbol: str, ticker: Dict[str, Any],
 
     direction, dir_meta = classify_direction(klines_1h, klines_1d)
     quality_min = float(cfg.get("ccpQualityScore", 75))
-    if score >= quality_min:
+    # ── iter164 — CALM (buy-grade) only for REVERSAL_UP (data-driven, 25d) ──
+    # In the 25-day backtest, CALM_REVERSAL_UP averaged +11.5% / 120m while
+    # CALM_NEUTRAL averaged −0.63% and NEUTRAL / BREAKDOWN_RISK directions were
+    # flat-to-negative. Promote to the high-conviction CALM_ label only when
+    # the direction is REVERSAL_UP; otherwise keep WATCH_ regardless of score.
+    require_rev = bool(cfg.get("ccpCalmRequiresReversalUp", True))
+    is_buy_dir = (direction == "REVERSAL_UP")
+    if score >= quality_min and (is_buy_dir or not require_rev):
         label = f"CALM_{direction}"
     else:
         label = f"WATCH_{direction}"
