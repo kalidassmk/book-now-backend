@@ -167,4 +167,17 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("buy_repricer.py",),
         kind="persistent",
     ),
+    # iter168 (2026-06-14) — Auto Exit Bracket ("away-mode protector"),
+    # PHASE 1 DRY-RUN. Scans ALL holdings that have NO open sell order and
+    # publishes an intended +2% take-profit / -2% stop-loss bracket
+    # (AUTO_EXIT:STATE + AUTO_EXIT:SIGNALS:<date>) computed from each coin's
+    # actual BUY cost basis. Places NO real orders — live OCO execution
+    # (autoExitLiveEnabled) is Phase 2 and intentionally not wired yet. This
+    # watcher is INDEPENDENT of HARD_DISABLE_AUTOSELL (turning it on does not
+    # re-enable any bot ladder/auto exits).
+    SubprocessTask(
+        name="Auto Exit Bracket",
+        cmd_argv=("auto_exit_bracket.py",),
+        kind="persistent",
+    ),
 ]
