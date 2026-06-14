@@ -7,9 +7,9 @@ Auto Exit Bracket ("away-mode protector") — PHASE 1: DRY-RUN ONLY.
 Motivation — the operator places a limit BUY and then walks away from the
 computer.  When that buy fills they have a coin sitting on Binance with NO
 sell order attached, fully unprotected.  They asked for an automatic
-"trace algorithm" that, while they're away, attaches a +2% take-profit AND
-a -2% stop-loss to every bought coin that has no sell order yet, so a win
-is locked at +2% and a loss is capped at -2% without them having to be at
+"trace algorithm" that, while they're away, attaches a +30% take-profit AND
+a -4% stop-loss to every bought coin that has no sell order yet, so a win
+is locked at +30% and a loss is capped at -4% without them having to be at
 the screen.
 
 What this subprocess does (DRY-RUN):
@@ -32,8 +32,8 @@ What this subprocess does (DRY-RUN):
           SL limit      = SL trigger * (1 - autoExitSlLimitGap) # just below
      and classifies the situation against the live price:
           NORMAL          live between SL and TP — a standard bracket
-          ALREADY_ABOVE_TP live already >= TP (coin already up >2%)
-          ALREADY_BELOW_SL live already <= SL trigger (coin already down >2%)
+          ALREADY_ABOVE_TP live already >= TP (coin already up >30%)
+          ALREADY_BELOW_SL live already <= SL trigger (coin already down >4%)
   5. PUBLISHES the intended bracket to `AUTO_EXIT:STATE` (hash, for the UI)
      and `AUTO_EXIT:SIGNALS:<date>` (history list).  It places NO real order.
 
@@ -321,9 +321,9 @@ def build_bracket(
     sell_qty = free_qty * fee_buffer
 
     if live >= tp_price:
-        situation = "ALREADY_ABOVE_TP"   # already up >= +2% from cost
+        situation = "ALREADY_ABOVE_TP"   # already up >= +30% from cost
     elif live <= sl_trigger:
-        situation = "ALREADY_BELOW_SL"   # already down <= -2% from cost
+        situation = "ALREADY_BELOW_SL"   # already down <= -4% from cost
     else:
         situation = "NORMAL"
 
