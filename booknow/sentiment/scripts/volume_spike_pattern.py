@@ -106,6 +106,7 @@ DEFAULTS: Dict[str, Any] = {
     # /api/v1/vsp/auto-buy/{symbol} endpoint, which owns all order logic.
     "vspAutoBuyLiveEnabled": True,
     "vspAutoBuyMinConfidence": 75,
+    "vspAutoBuyCrossCheckEnabled": True,     # skip if EarlyPump/CCP/LMC/PumpRider hit it today
 
     # Outcome tracking
     "vspOutcomeCheckMinutes": [5, 15, 30, 60],
@@ -750,6 +751,68 @@ def delegate_buy(symbol: str, event: Dict[str, Any], cfg: Dict[str, Any]) -> boo
         return False
 
 
+def other_algo_signaled_today(
+    r: redis.Redis,
+    r_an: Optional[redis.Redis],
+    symbol: str,
+) -> Optional[str]:
+    """iter171 — VSP-only exclusivity gate.
+
+    Return the NAME of another detector that already fired ``symbol``
+    TODAY (UTC), or ``None`` if VSP is the only one.  We check:
+
+      • EarlyPump → EARLY_PUMP:LATEST hash on the analyse-DB (per-symbol,
+        carries ``ts`` ms — counted only if today).
+      • CCP       → CCP:DETECTIONS:<date>        (today-only by key)
+      • LMC       → LMC:DETECTIONS:<date> +
+                    INSTANT_PUMP:DETECTIONS:<date> (same algo family)
+      • PumpRider → PUMP_RIDER:DETECTIONS:<date>
+
+    The DETECTIONS:<date> lists are already scoped to today by their key,
+    so for those we just look for the symbol; for EarlyPump's LATEST hash
+    we verify the timestamp is from today.
+    """
+    symbol = symbol.upper()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # 1) EarlyPump — analyse-DB LATEST hash (timestamped).
+    if r_an is not None:
+        try:
+            raw = r_an.hget("EARLY_PUMP:LATEST", symbol)
+            if raw:
+                ev = json.loads(raw)
+                ts = float(ev.get("ts") or 0)
+                if ts > 0:
+                    d = datetime.fromtimestamp(
+                        ts / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+                    if d == today:
+                        return "EarlyPump"
+        except Exception as exc:
+            log.debug(f"[VSP] EarlyPump cross-check {symbol}: {exc}")
+
+    # 2-4) Today's DETECTIONS lists on the main DB (key already = today).
+    checks = (
+        ("CCP", f"CCP:DETECTIONS:{today}"),
+        ("LMC", f"LMC:DETECTIONS:{today}"),
+        ("LMC", f"INSTANT_PUMP:DETECTIONS:{today}"),
+        ("PumpRider", f"PUMP_RIDER:DETECTIONS:{today}"),
+    )
+    for name, key in checks:
+        try:
+            items = r.lrange(key, 0, 999) or []
+        except Exception as exc:
+            log.debug(f"[VSP] {name} cross-check {symbol}: {exc}")
+            continue
+        for it in items:
+            try:
+                ev = json.loads(it)
+            except Exception:
+                continue
+            if str(ev.get("symbol", "")).upper() == symbol:
+                return name
+    return None
+
+
 def is_paper_mode(cfg: Dict[str, Any]) -> bool:
     if not bool(cfg.get("vspPaperMode", True)):
         return False
@@ -864,6 +927,11 @@ def run_outcome_tracker(r: redis.Redis, cfg: Dict[str, Any]) -> None:
 
 def main() -> None:
     r = get_redis()
+    try:
+        r_an = get_redis_analyse()   # EarlyPump detections live here
+    except Exception as exc:
+        log.warning(f"[VSP] analyse-DB unavailable ({exc}); EarlyPump cross-check off")
+        r_an = None
     log.info("[VSP] started — backend=%s, redis=%s:%s",
              BACKEND_BASE, REDIS_HOST, REDIS_PORT)
 
@@ -925,7 +993,18 @@ def main() -> None:
                             f"entry={event['trigger_close']}"
                         )
                     else:
-                        delegate_buy(sym, event, cfg)
+                        # iter171 — VSP-only exclusivity: skip the buy if
+                        # another algo already flagged this coin today.
+                        blocker = None
+                        if bool(cfg.get("vspAutoBuyCrossCheckEnabled", True)):
+                            blocker = other_algo_signaled_today(r, r_an, sym)
+                        if blocker:
+                            log.info(
+                                f"[VSP] ⛔ skip auto-buy {sym} — already signalled "
+                                f"today by {blocker} (VSP-only exclusivity)"
+                            )
+                        else:
+                            delegate_buy(sym, event, cfg)
                 # BIG_DUMP — emit dashboard banner; never short.
                 set_cooldown(r, sym, int(cfg.get("vspCooldownSec", 600)))
 
