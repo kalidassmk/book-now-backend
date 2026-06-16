@@ -898,6 +898,23 @@ class TradingConfig:
     signalAutoBuySourcePump: bool = True        # pump-history SIGNAL
     signalAutoBuySourceOrderflow: bool = True   # orderflow-history BUY
     signalAutoBuySourceBuysignals: bool = True  # coin-history strong-buys
+    # iter174 (2026-06-16) — entry discipline (operator rules).
+    #   • NO RE-BUY: once a coin is bought it is remembered forever and never
+    #     auto-bought again (rule A1/A5 — enter on the FIRST cluster signal
+    #     only, never on the 5th-10th re-fire).  0 hours = never re-buy;
+    #     set >0 to allow re-buying the same coin after a cooldown.
+    #   • VOLUME-SURGE SWEET SPOT (rule A2): only buy when 2.5× ≤ surge ≤ 8×
+    #     (skip >12× blow-off tops) — enforced only when the signal carries a
+    #     volume-surge figure.
+    #   • ANTI-CHASE (rule A4): skip if the signal candle already ran hot
+    #     (chg ≥ chgMaxPct) — enforced only when the signal carries a chg%.
+    # These same rules cover the coins shown on position-planner.html because
+    # that page reads the very same signal feeds this manager buys from.
+    signalAutoBuyRebuyCooldownHours: int = 0      # 0 = NEVER re-buy a coin
+    signalAutoBuyEntryFiltersEnabled: bool = True  # apply vol-band + anti-chase
+    signalAutoBuyVolSurgeMin: float = 2.5         # rule A2 lower band
+    signalAutoBuyVolSurgeMax: float = 8.0         # rule A2 upper band
+    signalAutoBuyChgMaxPct: float = 8.0           # rule A4 anti-chase ceiling
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)

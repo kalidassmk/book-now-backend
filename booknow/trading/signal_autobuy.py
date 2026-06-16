@@ -63,6 +63,7 @@ from booknow.repository import redis_keys
 
 
 POS_KEY = "SIGNAL:AUTOBUY:POS"           # hash symbol -> position json (the cap)
+BOUGHT_KEY = "SIGNAL:AUTOBUY:BOUGHT"      # hash symbol -> {ts, source} — NO RE-BUY ledger
 SEEN_KEY_PREFIX = "SIGNAL:AUTOBUY:SEEN:"  # set per UTC date (signal dedup)
 LOG_KEY_PREFIX = "SIGNAL:AUTOBUY:LOG:"    # list per UTC date (observability)
 
@@ -238,7 +239,9 @@ class SignalAutoBuyManager(AsyncProcessor):
             if not sym or price <= 0:
                 continue
             res.append({"source": source, "symbol": sym, "ts": ts,
-                        "label": label or source.upper(), "price": price})
+                        "label": label or source.upper(), "price": price,
+                        "vol_surge": _f(ev.get("vol_surge")),
+                        "chg_pct": _f(ev.get("chg_pct"))})
         return res
 
     async def _scan_buysignals(self, date: str, cutoff_ms: int) -> List[Dict[str, Any]]:
@@ -275,8 +278,14 @@ class SignalAutoBuyManager(AsyncProcessor):
                 if not sym or price <= 0:
                     continue
                 label = str(ev.get("label") or ev.get("tier") or kind).upper()
+                vol_surge = _f(ev.get("vol_surge") or ev.get("vol_surge_x")
+                               or ev.get("surge_5m") or ev.get("vol_surge_5m")
+                               or ev.get("vs5m") or ev.get("vs1m"))
+                chg_pct = _f(ev.get("chg_pct") or ev.get("price_change_pct")
+                             or ev.get("chg_5m_pct") or ev.get("chg_5m"))
                 res.append({"source": "buysignals:" + kind, "symbol": sym,
-                            "ts": ts, "label": label, "price": price})
+                            "ts": ts, "label": label, "price": price,
+                            "vol_surge": vol_surge, "chg_pct": chg_pct})
         return res
 
     @staticmethod
@@ -302,6 +311,31 @@ class SignalAutoBuyManager(AsyncProcessor):
         signal_price = _f(sig["price"])
         if signal_price <= 0:
             return {"status": "skipped", "reason": "bad signal_price"}
+
+        # ── NO RE-BUY (rule A1/A5): once a coin was bought, never buy it
+        # again (0h cooldown = forever).  Covers the same coins shown on
+        # position-planner.html since it reads the same signal feeds.
+        if await self._recently_bought(cfg, symbol):
+            await self._log_event(event="skip_rebuy", source=sig["source"], symbol=symbol)
+            return {"status": "skipped", "reason": "already bought (no re-buy)"}
+
+        # ── entry filters (rules A2 vol-surge band + A4 anti-chase) ──
+        if bool(getattr(cfg, "signalAutoBuyEntryFiltersEnabled", True)):
+            vs = _f(sig.get("vol_surge"))
+            if vs > 0:  # only gate when the signal carries a surge figure
+                vmin = _f(getattr(cfg, "signalAutoBuyVolSurgeMin", 2.5), 2.5)
+                vmax = _f(getattr(cfg, "signalAutoBuyVolSurgeMax", 8.0), 8.0)
+                if vs < vmin or vs > vmax:
+                    await self._log_event(event="skip_volband", source=sig["source"],
+                                          symbol=symbol, vol_surge=vs, lo=vmin, hi=vmax)
+                    return {"status": "skipped",
+                            "reason": f"vol_surge {vs:.1f}x outside [{vmin},{vmax}]"}
+            chg = _f(sig.get("chg_pct"))
+            chg_max = _f(getattr(cfg, "signalAutoBuyChgMaxPct", 8.0), 8.0)
+            if chg > 0 and chg_max > 0 and chg > chg_max:
+                await self._log_event(event="skip_chase_candle", source=sig["source"],
+                                      symbol=symbol, chg_pct=chg, max=chg_max)
+                return {"status": "skipped", "reason": f"chg {chg:.1f}% > {chg_max}% (chasing)"}
 
         # No-chase: don't buy a coin that already ran above the signal.
         current_price = await self._current_price(symbol)
@@ -382,6 +416,15 @@ class SignalAutoBuyManager(AsyncProcessor):
                 "ts": int(time.time() * 1000),
             }
             await self._redis.hset(POS_KEY, symbol, json.dumps(pos))
+            # Record in the NO-RE-BUY ledger so this coin is never auto-bought
+            # again (until cooldown elapses, if one is configured).
+            try:
+                await self._redis.hset(BOUGHT_KEY, symbol, json.dumps({
+                    "ts": int(time.time() * 1000), "source": sig["source"],
+                    "fillPrice": float(fill_price),
+                }))
+            except Exception:
+                pass
             await self._log_event(
                 event="bought", source=sig["source"], symbol=symbol,
                 usdt=usdt, qty=str(executed), fillPrice=float(fill_price),
@@ -402,6 +445,32 @@ class SignalAutoBuyManager(AsyncProcessor):
             await self._redis.hdel(POS_KEY, symbol)
         except Exception:
             pass
+
+    async def _recently_bought(self, cfg: Any, symbol: str) -> bool:
+        """True if ``symbol`` is in the NO-RE-BUY ledger and the cooldown
+        (if any) has not yet elapsed.  cooldown=0 ⇒ remembered forever."""
+        try:
+            raw = await self._redis.hget(BOUGHT_KEY, symbol)
+        except Exception:
+            return False
+        if not raw:
+            return False
+        cooldown_h = int(getattr(cfg, "signalAutoBuyRebuyCooldownHours", 0) or 0)
+        if cooldown_h <= 0:
+            return True  # never re-buy
+        try:
+            ts = int(json.loads(raw).get("ts", 0))
+        except Exception:
+            return True
+        age_h = (time.time() * 1000 - ts) / 3_600_000.0
+        if age_h >= cooldown_h:
+            # cooldown elapsed — forget it so it can be bought again.
+            try:
+                await self._redis.hdel(BOUGHT_KEY, symbol)
+            except Exception:
+                pass
+            return False
+        return True
 
     # ── cap self-healing ─────────────────────────────────────────────
     async def _sweep_reservations(self) -> None:
