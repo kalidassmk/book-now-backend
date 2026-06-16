@@ -915,6 +915,11 @@ class TradingConfig:
     signalAutoBuyVolSurgeMin: float = 2.5         # rule A2 lower band
     signalAutoBuyVolSurgeMax: float = 8.0         # rule A2 upper band
     signalAutoBuyChgMaxPct: float = 8.0           # rule A4 anti-chase ceiling
+    # iter175 (2026-06-16) — don't buy a coin that has ALREADY run up a lot on
+    # the day.  Reads the live 24h change % (CURRENT_PRICE.percentage); if the
+    # coin is already up ≥ this, skip — we're too late (e.g. +45%/+50% tops).
+    # 0 = disable this check.
+    signalAutoBuy24hMaxPct: float = 30.0          # skip if 24h change ≥ this %
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
