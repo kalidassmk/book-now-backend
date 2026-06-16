@@ -34,6 +34,7 @@ if TYPE_CHECKING:  # pragma: no cover
     from booknow.trading.executor import TradeExecutor
     from booknow.trading.state import TradeState
     from booknow.trading.vsp_autobuy import VspAutoBuyManager
+    from booknow.trading.signal_autobuy import SignalAutoBuyManager
 
 
 @dataclass
@@ -57,3 +58,4 @@ class AppState:
     coin_analyzer: Optional["CoinAnalyzer"] = None
     scalper_engine: Optional["ScalperEngine"] = None     # order-flow scalper
     vsp_autobuy: Optional["VspAutoBuyManager"] = None     # iter170 VSP-only auto-buy
+    signal_autobuy: Optional["SignalAutoBuyManager"] = None  # iter173 multi-source auto-buy

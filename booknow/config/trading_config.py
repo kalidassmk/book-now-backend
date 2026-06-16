@@ -878,6 +878,28 @@ class TradingConfig:
     vspAutoBuyCrossCheckEnabled: bool = True
 
     # ──────────────────────────────────────────────────────────────────
+    # iter173 (2026-06-16) — MULTI-SOURCE auto-buy (SignalAutoBuyManager)
+    # ──────────────────────────────────────────────────────────────────
+    # Operator wants every coin that lights up on the three history pages
+    # auto-bought with a fixed-USDT MARKET buy:
+    #   • coin-history "buysignals" strong-buys  (LMC EXCLUDED)
+    #   • pump-history     PUMP_RADAR SIGNAL
+    #   • orderflow-history ORDERFLOW_RADAR BUY
+    # MARKET buy, 5.05 USDT/coin, max 19 concurrent coins, no-chase, and a
+    # self-healing cap (a slot frees when its coin is sold / base = dust).
+    # Master gate defaults to FALSE — paper-first; flip to True to go live.
+    # Redis state: SIGNAL:AUTOBUY:POS (hash symbol → position json).
+    signalAutoBuyLiveEnabled: bool = False    # the ONLY real-money gate
+    signalAutoBuyUsdt: float = 5.05           # per-coin MARKET buy size
+    signalAutoBuyMaxPositions: int = 19       # concurrent coin cap
+    signalAutoBuyNoChase: bool = True         # skip when live price > signal
+    signalAutoBuyMaxAgeSec: int = 120         # only act on signals this fresh
+    signalAutoBuyReconcileEnabled: bool = True  # free slot when coin is sold
+    signalAutoBuySourcePump: bool = True        # pump-history SIGNAL
+    signalAutoBuySourceOrderflow: bool = True   # orderflow-history BUY
+    signalAutoBuySourceBuysignals: bool = True  # coin-history strong-buys
+
+    # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
     # ──────────────────────────────────────────────────────────────────
     # Subprocess `low_mcap_explosive.py` detects small-cap coins (7d

@@ -35,9 +35,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import List, Optional
+
+import redis.asyncio as aioredis
 
 from booknow.analysis.coin_analyzer import CoinAnalyzer
 from booknow.api import AppState, build_app
@@ -268,6 +271,54 @@ async def _bootstrap() -> None:
         getattr(initial_config, "vspAutoBuyTpPct", 30.0),
         getattr(initial_config, "vspAutoBuySlPct", 6.0),
         getattr(initial_config, "vspAutoBuyMaxPositions", 5),
+    )
+
+    # ── iter173: MULTI-SOURCE REAL-MONEY auto-buy manager ────────────
+    # Auto-buys every coin that lights up on the three history pages with
+    # a fixed-USDT MARKET buy: coin-history strong-buys (LMC EXCLUDED),
+    # pump-history SIGNAL, orderflow-history BUY.  5.05 USDT/coin, max 19
+    # concurrent coins, no-chase, self-healing cap.  Master gate
+    # ``signalAutoBuyLiveEnabled`` defaults OFF (paper-first).  Reads the
+    # radar SIGNALS lists + EarlyPump from the ANALYSE redis, detectors +
+    # balances + prices from MAIN redis, so it needs BOTH clients.
+    redis_analyse = aioredis.Redis(
+        host=os.getenv("REDIS_ANALYSE_HOST", "redis-analyse"),
+        port=int(os.getenv("REDIS_ANALYSE_PORT", "6379")),
+        password=os.getenv("REDIS_ANALYSE_PASS") or None,
+        decode_responses=True,
+        socket_keepalive=True,
+        socket_connect_timeout=3,
+        socket_timeout=3,
+        health_check_interval=30,
+    )
+    try:
+        await redis_analyse.ping()
+        log.info("  redis-analyse ping OK")
+    except Exception as e:
+        log.warning("  redis-analyse ping failed (%s) — signal-autobuy radar "
+                    "sources may be empty until it connects", e)
+    from booknow.trading.signal_autobuy import SignalAutoBuyManager
+    signal_autobuy = SignalAutoBuyManager(
+        redis_client=redis,
+        redis_analyse=redis_analyse,
+        ws_api=ws_api,
+        filter_service=filter_service,
+        delist_service=delist_service,
+        config_service=config_service,
+        guard=guard,
+        live_mode=settings.live_mode,
+    )
+    await signal_autobuy.start()
+    log.info(
+        "  signal-autobuy manager started (live=%s, enabled=%s, %sUSDT cap=%s, "
+        "sources: pump=%s orderflow=%s buysignals=%s)",
+        settings.live_mode,
+        getattr(initial_config, "signalAutoBuyLiveEnabled", False),
+        getattr(initial_config, "signalAutoBuyUsdt", 5.05),
+        getattr(initial_config, "signalAutoBuyMaxPositions", 19),
+        getattr(initial_config, "signalAutoBuySourcePump", True),
+        getattr(initial_config, "signalAutoBuySourceOrderflow", True),
+        getattr(initial_config, "signalAutoBuySourceBuysignals", True),
     )
 
     # ── Phase 11: Rules engine — R1 / R2 / R3 ────────────────────────
@@ -591,6 +642,7 @@ async def _bootstrap() -> None:
         coin_analyzer=coin_analyzer,
         scalper_engine=scalper_engine,
         vsp_autobuy=vsp_autobuy,
+        signal_autobuy=signal_autobuy,
     )
     fastapi_app = build_app(app_state)
     http_server = HttpServer(fastapi_app, host="0.0.0.0", port=settings.http_port)
@@ -652,6 +704,14 @@ async def _bootstrap() -> None:
             await vsp_autobuy.stop()
         except Exception as e:
             log.warning("  vsp-autobuy stop error: %s", e)
+        try:
+            await signal_autobuy.stop()
+        except Exception as e:
+            log.warning("  signal-autobuy stop error: %s", e)
+        try:
+            await redis_analyse.aclose()
+        except Exception:
+            pass
         # Then processors, then market_stream — same reasoning.
         for proc in (fast_move, time_analyser, fast_analyse, ulf):
             try:
