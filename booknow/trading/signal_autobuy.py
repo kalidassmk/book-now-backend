@@ -336,6 +336,16 @@ class SignalAutoBuyManager(AsyncProcessor):
                 await self._log_event(event="skip_chase_candle", source=sig["source"],
                                       symbol=symbol, chg_pct=chg, max=chg_max)
                 return {"status": "skipped", "reason": f"chg {chg:.1f}% > {chg_max}% (chasing)"}
+            # 24h run-up cap: don't buy a coin already up a lot on the day
+            # (e.g. +45%/+50% tops) — reads the live 24h change %.
+            p24_max = _f(getattr(cfg, "signalAutoBuy24hMaxPct", 30.0), 30.0)
+            if p24_max > 0:
+                p24 = await self._price_change_24h(symbol)
+                if p24 is not None and p24 >= p24_max:
+                    await self._log_event(event="skip_24h_runup", source=sig["source"],
+                                          symbol=symbol, pct_24h=p24, max=p24_max)
+                    return {"status": "skipped",
+                            "reason": f"24h up {p24:.1f}% ≥ {p24_max}% (too late)"}
 
         # No-chase: don't buy a coin that already ran above the signal.
         current_price = await self._current_price(symbol)
@@ -562,5 +572,18 @@ class SignalAutoBuyManager(AsyncProcessor):
             obj = json.loads(raw)
             p = float(obj.get("price") or 0)
             return p if p > 0 else None
+        except Exception:
+            return None
+
+    async def _price_change_24h(self, symbol: str) -> Optional[float]:
+        """Live 24h change % from the CURRENT_PRICE hash (Binance ticker 'P').
+        None if unknown — caller must then NOT block on it."""
+        try:
+            raw = await self._redis.hget(redis_keys.CURRENT_PRICE, symbol)
+            if not raw:
+                return None
+            obj = json.loads(raw)
+            v = obj.get("percentage")
+            return float(v) if v is not None else None
         except Exception:
             return None
