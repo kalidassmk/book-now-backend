@@ -163,6 +163,31 @@ class MultiSymbolScalper:
         self.ntp_min_24h_change_pct = 5.0
         self.ntp_max_from_high_pct = 2.0
 
+        # ── DIP-BUY mean-reversion entry (iter180, 2026-06-17) ───────────
+        # ROOT-CAUSE FIX for ROSEUSDT (-6.6%) and the 18-coin 06-17 basket:
+        # the legacy evaluate_entry was a MOMENTUM BREAKOUT strategy — it
+        # required `close > prev_high` (buy a fresh high), RSI 60-82
+        # (already hot) and stacked up-EMAs. By design it bought strength
+        # = bought tops. ROSE was bought on its 02:00 spike top.
+        #
+        # Operator's redesign (2026-06-17): "price too down → buy the dip,
+        # but only AFTER it has fully come down and shows it won't fall
+        # again (bottom confirmation), then buy the first up-move."
+        #
+        # When dip_buy_enabled, evaluate_entry runs the mean-reversion
+        # logic below instead. Set dipBuyEnabled=false in TRADING_CONFIG to
+        # revert to the old momentum path (kept intact). Thresholds are
+        # hot-reloaded via cfg.get (non-strict — missing keys keep these
+        # safe defaults so the bot never refuses to trade).
+        self.dip_buy_enabled        = True
+        self.dip_lookback_bars      = 30     # 1m bars to define the recent swing (30 min)
+        self.dip_min_drop_pct       = 1.5    # must be ≥1.5% below the recent-window high
+        self.dip_max_drop_pct       = 8.0    # but NOT a free-fall >8% in the window (knife)
+        self.dip_rsi_oversold       = 35.0   # RSI must have dipped to/below this (sold off)
+        self.dip_max_24h_drop_pct   = 12.0   # reject coins down >12% on 24h (death spiral)
+        self.dip_max_24h_pump_pct   = 12.0   # reject coins up >12% on 24h (parabolic/blow-off)
+        self.dip_hard_stop_pct      = 2.5    # protective % stop for dip positions (poll path)
+
         # Fast-drop-without-volume filter (Pattern C). Watches price +
         # volume during the limit-buy wait window and cancels the order
         # if the coin is bleeding without capitulation volume.
@@ -671,6 +696,33 @@ class MultiSymbolScalper:
         self.min_vol_24h_usd    = float(cfg["minVol24hUsd"])
         self.limit_buy_offset_pct = float(cfg["limitBuyOffsetPct"])
         self.limit_buy_timeout_sec = int(cfg["limitBuyTimeoutSec"])
+
+        # iter180 DIP-BUY overrides — NON-STRICT (cfg.get) so a frontend
+        # that hasn't shipped these keys yet keeps the safe __init__
+        # defaults instead of the bot refusing to trade.
+        def _cfg_bool(key, cur):
+            v = cfg.get(key)
+            return bool(v) if v is not None else cur
+        def _cfg_float(key, cur):
+            v = cfg.get(key)
+            try:
+                return float(v) if v is not None else cur
+            except (TypeError, ValueError):
+                return cur
+        def _cfg_int(key, cur):
+            v = cfg.get(key)
+            try:
+                return int(v) if v is not None else cur
+            except (TypeError, ValueError):
+                return cur
+        self.dip_buy_enabled      = _cfg_bool("dipBuyEnabled", self.dip_buy_enabled)
+        self.dip_lookback_bars    = _cfg_int("dipLookbackBars", self.dip_lookback_bars)
+        self.dip_min_drop_pct     = _cfg_float("dipMinDropPct", self.dip_min_drop_pct)
+        self.dip_max_drop_pct     = _cfg_float("dipMaxDropPct", self.dip_max_drop_pct)
+        self.dip_rsi_oversold     = _cfg_float("dipRsiOversold", self.dip_rsi_oversold)
+        self.dip_max_24h_drop_pct = _cfg_float("dipMax24hDropPct", self.dip_max_24h_drop_pct)
+        self.dip_max_24h_pump_pct = _cfg_float("dipMax24hPumpPct", self.dip_max_24h_pump_pct)
+        self.dip_hard_stop_pct    = _cfg_float("dipHardStopPct", self.dip_hard_stop_pct)
 
         self.fk_enabled = bool(cfg["fallingKnifeFilterEnabled"])
         self.fk_max_change_24h_pct = float(cfg["maxChange24hPct"])
@@ -1227,13 +1279,117 @@ class MultiSymbolScalper:
         except Exception:
             return None
 
+    def _evaluate_entry_dip(self, symbol, df, btc_df, ticker_24h=None):
+        """iter180 DIP-BUY (mean-reversion). Buys AFTER a sell-off has
+        bottomed and the FIRST up-move prints — never on a breakout.
+
+        Replaces the momentum 'buy new high' logic that bought ROSEUSDT on
+        its 02:00 spike top (-6.6%). Gate chain (ALL must pass):
+
+          0. BTC not crashing               (macro safety — kept)
+          1. DIP depth: price ≥ dip_min_drop_pct below the recent-window
+             high (the coin has actually sold off)
+          2. NOT a free-fall: drop ≤ dip_max_drop_pct in the window
+             (don't catch a knife mid-plunge)
+          3. OVERSOLD: RSI dipped to/below dip_rsi_oversold in the window
+          4. TURNING UP: RSI now rising again and back ≥ oversold line
+          5. BOTTOM FORMED: the current bar is NOT a new window low
+             (a higher low = sellers stepping back)
+          6. UP-MOVE TRIGGER: green candle that either closes above the
+             prior bar's high OR reclaims ema9 (the first bounce)
+          7. 24h sanity: enough volume + range to bounce, and 24h change
+             neither collapsing (< -dip_max_24h_drop_pct) nor parabolic
+             (> dip_max_24h_pump_pct)
+        """
+        if df is None or btc_df is None or len(df) < 30:
+            return False, None
+        try:
+            curr = df.iloc[-1]
+            prev = df.iloc[-2]
+            btc  = btc_df.iloc[-1]
+            n = max(5, int(self.dip_lookback_bars))
+            win = df.iloc[-n:]
+            recent_high = float(win['high'].max())
+            recent_low  = float(win['low'].min())
+            close = float(curr['close'])
+            open_ = float(curr['open'])
+            low   = float(curr['low'])
+            ema9  = float(curr['ema9'])
+            drop_from_high = ((close - recent_high) / recent_high * 100.0) if recent_high > 0 else 0.0
+
+            rsi_win = df['rsi'].iloc[-n:].dropna()
+            rsi_min = float(rsi_win.min()) if not rsi_win.empty else 50.0
+            rsi_now = float(curr['rsi']) if pd.notna(curr['rsi']) else 50.0
+            rsi_prev = float(prev['rsi']) if pd.notna(prev['rsi']) else rsi_now
+
+            # 0. BTC trend filter (must not be crashing)
+            btc_ok = bool(btc['close'] > btc['ema21'])
+            # 1. sold off enough
+            dip_ok = drop_from_high <= -self.dip_min_drop_pct
+            # 2. but not a free-fall (knife)
+            not_knife = drop_from_high >= -self.dip_max_drop_pct
+            # 3. & 4. oversold then turning up
+            was_oversold = rsi_min <= self.dip_rsi_oversold
+            rsi_turning = (rsi_now > rsi_prev) and (rsi_now >= self.dip_rsi_oversold)
+            # 5. bottom formed — current bar isn't a fresh low
+            bottom_formed = low > recent_low
+            # 6. first up-move trigger
+            bullish = close > open_
+            up_trigger = bullish and ((close > float(prev['high'])) or (close > ema9))
+
+            # 7. 24h sanity
+            ticker_24h_ok = True
+            change_24h = range_24h = vol_24h = 0.0
+            if ticker_24h:
+                change_24h = float(ticker_24h.get('percentage') or 0)
+                high = float(ticker_24h.get('high') or 0)
+                low24 = float(ticker_24h.get('low') or 0)
+                range_24h = ((high - low24) / low24 * 100) if low24 > 0 else 0
+                vol_24h = float(ticker_24h.get('quoteVolume') or 0)
+                ticker_24h_ok = (
+                    vol_24h >= self.min_vol_24h_usd and
+                    range_24h >= self.min_range_24h_pct and
+                    change_24h >= -self.dip_max_24h_drop_pct and
+                    change_24h <= self.dip_max_24h_pump_pct
+                )
+
+            matrix = {
+                "strategy": "dip_buy",
+                "btc_stable": btc_ok,
+                "dip_depth_ok": bool(dip_ok),
+                "not_knife": bool(not_knife),
+                "was_oversold": bool(was_oversold),
+                "rsi_turning_up": bool(rsi_turning),
+                "bottom_formed": bool(bottom_formed),
+                "up_trigger": bool(up_trigger),
+                "ticker_24h": bool(ticker_24h_ok),
+                "drop_from_high_pct": round(drop_from_high, 2),
+                "rsi_min": round(rsi_min, 1),
+                "rsi_now": round(rsi_now, 1),
+                "change_24h_pct": round(change_24h, 2),
+                "range_24h_pct": round(range_24h, 2),
+                "vol_24h_m_usd": round(vol_24h / 1_000_000, 2),
+            }
+            passed = (btc_ok and dip_ok and not_knife and was_oversold
+                      and rsi_turning and bottom_formed and up_trigger
+                      and ticker_24h_ok)
+            return passed, matrix
+        except Exception as exc:
+            log.debug(f"dip evaluate_entry failed for {symbol}: {exc}")
+            return False, None
+
     def evaluate_entry(self, symbol, df, btc_df, ticker_24h=None):
-        """Micro-Trend Momentum Acceleration Strategy + 24h market filter.
+        """Entry router. iter180: when ``dip_buy_enabled`` (default), use
+        the mean-reversion DIP-BUY strategy. Otherwise fall through to the
+        legacy Micro-Trend Momentum Acceleration breakout logic (kept for
+        a one-flag revert via dipBuyEnabled=false).
 
         ticker_24h is an optional dict with Binance's 24h ticker fields
         (percentage, high, low, quoteVolume). Pre-fetched by the caller
         in async context. None disables the 24h filter for this call.
         """
+        if self.dip_buy_enabled:
+            return self._evaluate_entry_dip(symbol, df, btc_df, ticker_24h)
         if df is None or btc_df is None or len(df) < 20: return False, None
 
         curr = df.iloc[-1]
@@ -1375,6 +1531,8 @@ class MultiSymbolScalper:
             # oco_list_id and no tp_order_id). When either is active we
             # let Binance handle it for tighter timing.
             if not pos.get('oco_list_id') and not pos.get('tp_order_id'):
+                buy_price = float(pos.get('buy_price') or 0)
+                pnl_pct = ((float(curr['close']) - buy_price) / buy_price * 100.0) if buy_price > 0 else 0.0
                 if pnl >= self.profit_target_usdt:
                     log.info(f"💰 [{symbol}] Profit Target Hit (poll): +${pnl:.2f}")
                     await self.execute_sell(symbol, curr['close'])
@@ -1383,6 +1541,14 @@ class MultiSymbolScalper:
                     # (stopLossUsdt > 0). Option B sets it to 0 so this
                     # branch is dead — patient hold until TP or trend exit.
                     log.info(f"🛡️ [{symbol}] Stop Loss Hit (poll): -${pnl:.2f}")
+                    await self.execute_sell(symbol, curr['close'])
+                elif (self.dip_buy_enabled and self.dip_hard_stop_pct > 0
+                      and pnl_pct <= -self.dip_hard_stop_pct):
+                    # iter180: dip-buy positions MUST have a real stop — the
+                    # bottom thesis was wrong. Protects even when the USDT
+                    # stop is disabled (Option B). Mean-reversion bleeds
+                    # without this (the MEGAUSDT/ROSE failure mode).
+                    log.info(f"🛡️ [{symbol}] Dip Hard-Stop (poll): {pnl_pct:.2f}% ≤ -{self.dip_hard_stop_pct:.1f}%")
                     await self.execute_sell(symbol, curr['close'])
             return
 
