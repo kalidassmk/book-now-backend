@@ -896,8 +896,12 @@ class TradingConfig:
     signalAutoBuyMaxAgeSec: int = 120         # only act on signals this fresh
     signalAutoBuyReconcileEnabled: bool = True  # free slot when coin is sold
     signalAutoBuySourcePump: bool = True        # pump-history SIGNAL
-    signalAutoBuySourceOrderflow: bool = True   # orderflow-history BUY
-    signalAutoBuySourceBuysignals: bool = True  # coin-history strong-buys
+    # iter177 (2026-06-18) — orderflow + buysignals BUY BREAKOUTS / HIGHS, which
+    # is exactly what kept losing money (e.g. ROSE bought on its 02:00 spike top
+    # then bled out).  Operator decision: turn BOTH OFF — the new mean-reversion
+    # "dip" source (deep-down + confirmed turn-up) is the only active auto-buy.
+    signalAutoBuySourceOrderflow: bool = False  # OFF (was buying breakout tops)
+    signalAutoBuySourceBuysignals: bool = False # OFF (was buying breakout tops)
     # iter174 (2026-06-16) — entry discipline (operator rules).
     #   • NO RE-BUY: once a coin is bought it is remembered forever and never
     #     auto-bought again (rule A1/A5 — enter on the FIRST cluster signal
@@ -970,6 +974,31 @@ class TradingConfig:
     signalAutoBuyOfTrailActivatePct: float = 3.0   # arm the trailing stop once +3%
     signalAutoBuyOfTrailPct: float = 2.0           # then exit on a 2% give-back from peak
     signalAutoBuyOfTimeStopHours: float = 4.0      # orderflow moves fast — exit after 4h
+    # iter177 (2026-06-18) — DEEP-DIP REVERSAL source.  The operator was losing
+    # money because orderflow/buysignals bought BREAKOUT TOPS (ROSE @ its 02:00
+    # spike top).  This is the OPPOSITE strategy — a mean-reversion detector
+    # (sentiment/scripts/dip_hunter.py) watches 5m klines for a coin that has
+    # dropped DEEP (≥8% below its recent-window high) and then publishes SIGNAL
+    # only after SIX gates confirm the bottom is in and price is turning UP:
+    #   deep-down ≥8% • not-a-knife (≤35% drop) • oversold (window RSI ≤35) •
+    #   higher-low formed (curr_low > prior swing low) • RSI turning up •
+    #   first GREEN reversal candle (close>open AND close>prev high).
+    # It writes DIP_RADAR:SIGNALS:<date> (MAIN redis); this manager consumes it as
+    # the "dip" source.  Like accumulation, dip signals BYPASS the pump-tuned
+    # vol-band / anti-chase / no-chase filters (those exist to avoid chasing tops,
+    # the inverse of a dip) while still honoring no-re-buy, the 24h run-up cap, the
+    # position cap, and the ban/delist guards.  Buy size = signalAutoBuyUsdt (5.05).
+    signalAutoBuySourceDip: bool = True            # deep-dip reversal SIGNAL (ONLY active buy source)
+    dipScanTopN: int = 120                         # how many top symbols the detector scans
+    dipMinDropPct: float = 8.0                     # "deep down": must be ≥ this % below the recent high
+    # iter177 DIP EXIT — protect each live dip buy.  Mean-reversion gives the
+    # bounce room (wider trail-activate) but a failed reversal is cut at a hard
+    # stop.  LIVE selling ON (protective complement to the user-authorised live BUY).
+    signalAutoBuyDipStopLiveEnabled: bool = True   # place the protective market SELL for live dip buys
+    signalAutoBuyDipStopPct: float = 4.0           # hard stop: sell at -4% from fill (failed reversal)
+    signalAutoBuyDipTrailActivatePct: float = 5.0  # arm the trailing stop once +5%
+    signalAutoBuyDipTrailPct: float = 3.0          # then exit on a 3% give-back from peak
+    signalAutoBuyDipTimeStopHours: float = 12.0    # mean-reversion can take time — exit after 12h
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)

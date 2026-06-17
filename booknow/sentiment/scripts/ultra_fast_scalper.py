@@ -179,7 +179,13 @@ class MultiSymbolScalper:
         # revert to the old momentum path (kept intact). Thresholds are
         # hot-reloaded via cfg.get (non-strict — missing keys keep these
         # safe defaults so the bot never refuses to trade).
-        self.dip_buy_enabled        = True
+        # iter177 (2026-06-18) — DEFAULT OFF.  The deep-dip strategy now lives in
+        # the dedicated backend detector (sentiment/scripts/dip_hunter.py →
+        # DIP_RADAR → SignalAutoBuyManager "dip" source), which is the single
+        # live dip-buy system.  Fast Scalper reverts to its momentum path so the
+        # two don't double-buy the same dips.  (Set dipBuyEnabled=true in
+        # TRADING_CONFIG to re-arm the scalper's own dip logic if ever needed.)
+        self.dip_buy_enabled        = False
         self.dip_lookback_bars      = 30     # 1m bars to define the recent swing (30 min)
         self.dip_min_drop_pct       = 1.5    # must be ≥1.5% below the recent-window high
         self.dip_max_drop_pct       = 8.0    # but NOT a free-fall >8% in the window (knife)

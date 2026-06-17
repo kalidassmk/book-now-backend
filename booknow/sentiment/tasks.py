@@ -139,6 +139,20 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("stealth_accumulation.py",),
         kind="persistent",
     ),
+    # iter177 (2026-06-18) — Deep-Dip Reversal detector.
+    # The OPPOSITE of a breakout buyer: finds a coin that has dropped DEEP
+    # (≥8% below its recent 5m-window high) and fires SIGNAL only AFTER six
+    # gates confirm the bottom is in and price is turning UP (not-a-knife,
+    # oversold RSI, higher-low formed, RSI rising, first green reversal
+    # candle).  Built because orderflow/buysignals kept buying breakout TOPS
+    # (ROSE @ its spike top) and bleeding out.  Writes DIP_RADAR:SIGNALS:<date>;
+    # SignalAutoBuyManager consumes it as the "dip" source.  Buys nothing
+    # itself.  Gated by signalAutoBuySourceDip.
+    SubprocessTask(
+        name="Dip Hunter",
+        cmd_argv=("dip_hunter.py",),
+        kind="persistent",
+    ),
     # iter 69 (2026-05-24) — Volume-Spike Pattern (VSP) classifier.
     # Detects volume spikes and uses taker-buy-ratio + candle structure
     # to classify direction (BIG_PUMP / BIG_DUMP / MODERATE / UNCERTAIN)

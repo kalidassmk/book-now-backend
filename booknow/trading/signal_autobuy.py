@@ -222,6 +222,13 @@ class SignalAutoBuyManager(AsyncProcessor):
                 out += await self._scan_radar(
                     self._redis, f"STEALTH_ACCUM:SIGNALS:{d}",
                     "accumulation", {"SIGNAL"}, cutoff_ms)
+        # iter177 — deep-dip reversal SIGNAL (MAIN redis; the dip_hunter.py
+        # subprocess writes radar-shaped events on a confirmed deep-down turn-up).
+        if bool(getattr(cfg, "signalAutoBuySourceDip", True)):
+            for d in dates:
+                out += await self._scan_radar(
+                    self._redis, f"DIP_RADAR:SIGNALS:{d}",
+                    "dip", {"SIGNAL"}, cutoff_ms)
         return out
 
     async def _scan_radar(
@@ -341,6 +348,15 @@ class SignalAutoBuyManager(AsyncProcessor):
         # run-up cap still applies to every source.
         is_accum = sig["source"] == "accumulation"
 
+        # iter177 — dip signals carry their OWN entry discipline in the detector
+        # (deep-down ≥8% + not-knife + oversold RSI + higher-low bottom-confirm +
+        # RSI turning up + first green reversal candle).  They are mean-reversion
+        # by design, so they BYPASS the pump-tuned vol-band / chg / no-chase
+        # filters (which exist to avoid chasing breakout TOPS — the opposite of a
+        # dip).  The 24h run-up cap still applies.
+        is_dip = sig["source"] == "dip"
+        bypass_pump_filters = is_accum or is_dip
+
         # ── EARLY_PUMP v2 breakout gate (iter177) ────────────────────────
         # The raw early_pump signal is ~break-even after fees; the edge is in
         # the BREAKOUT subset — high score AND price breaking its 24h high.
@@ -364,7 +380,7 @@ class SignalAutoBuyManager(AsyncProcessor):
 
         # ── entry filters (rules A2 vol-surge band + A4 anti-chase) ──
         if bool(getattr(cfg, "signalAutoBuyEntryFiltersEnabled", True)):
-            if not is_accum:
+            if not bypass_pump_filters:
                 vs = _f(sig.get("vol_surge"))
                 if vs > 0:  # only gate when the signal carries a surge figure
                     vmin = _f(getattr(cfg, "signalAutoBuyVolSurgeMin", 2.5), 2.5)
@@ -394,7 +410,7 @@ class SignalAutoBuyManager(AsyncProcessor):
         # No-chase: don't buy a coin that already ran above the signal.  Skipped
         # for accumulation — the ignition bar is EXPECTED to be moving up.
         current_price = await self._current_price(symbol)
-        if not is_accum and bool(getattr(cfg, "signalAutoBuyNoChase", True)):
+        if not bypass_pump_filters and bool(getattr(cfg, "signalAutoBuyNoChase", True)):
             if current_price is not None and current_price > signal_price:
                 await self._log_event(event="skip_chase", source=sig["source"],
                                       symbol=symbol, signal=signal_price, now=current_price)
@@ -537,6 +553,15 @@ class SignalAutoBuyManager(AsyncProcessor):
         of_time_stop_h = _f(getattr(cfg, "signalAutoBuyOfTimeStopHours", 4.0), 4.0)
         of_live = self.live_mode and bool(
             getattr(cfg, "signalAutoBuyOfStopLiveEnabled", True))
+        # iter177 — dip params (mean-reversion: give the bounce room, protect
+        # against a failed reversal with a hard stop; live-sell ON as the
+        # complement to the user-authorised live dip BUY).
+        dip_stop_pct = _f(getattr(cfg, "signalAutoBuyDipStopPct", 4.0), 4.0)
+        dip_trail_act = _f(getattr(cfg, "signalAutoBuyDipTrailActivatePct", 5.0), 5.0)
+        dip_trail_pct = _f(getattr(cfg, "signalAutoBuyDipTrailPct", 3.0), 3.0)
+        dip_time_stop_h = _f(getattr(cfg, "signalAutoBuyDipTimeStopHours", 12.0), 12.0)
+        dip_live = self.live_mode and bool(
+            getattr(cfg, "signalAutoBuyDipStopLiveEnabled", True))
         now_ms = int(time.time() * 1000)
 
         for sym, val in (raw or {}).items():
@@ -553,6 +578,9 @@ class SignalAutoBuyManager(AsyncProcessor):
             elif src == "orderflow":
                 stop_pct, trail_act, trail_pct, time_stop_h, live_sell = (
                     of_stop_pct, of_trail_act, of_trail_pct, of_time_stop_h, of_live)
+            elif src == "dip":
+                stop_pct, trail_act, trail_pct, time_stop_h, live_sell = (
+                    dip_stop_pct, dip_trail_act, dip_trail_pct, dip_time_stop_h, dip_live)
             else:
                 continue
             fill = _f(pos.get("fillPrice"))
