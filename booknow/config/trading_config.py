@@ -920,6 +920,19 @@ class TradingConfig:
     # coin is already up ≥ this, skip — we're too late (e.g. +45%/+50% tops).
     # 0 = disable this check.
     signalAutoBuy24hMaxPct: float = 30.0          # skip if 24h change ≥ this %
+    # iter176 (2026-06-17) — STEALTH ACCUMULATION source.  Instead of chasing
+    # aggressive pump tops, buy the QUIET coin just before it moves: a backend
+    # detector (sentiment/scripts/stealth_accumulation.py) watches 15m klines for
+    # a tight-range coil with hidden demand (high taker-buy% on low volume), then
+    # fires SIGNAL on the FIRST ignition bar that breaks the coil high with a
+    # volume burst.  Backtest (20 coins / 5 days): 8 signals, 75% win, no big
+    # losses — it enters BEFORE the pump rather than at the top.  The detector
+    # writes STEALTH_ACCUM:SIGNALS:<date> (MAIN redis); this manager consumes it
+    # as its own source.  Because the detector's signature already encodes the
+    # entry discipline, accumulation signals BYPASS the pump-tuned vol-band /
+    # anti-chase / no-chase filters, while still honoring no-re-buy, the 24h
+    # run-up cap, the position cap, and the ban/delist guards.
+    signalAutoBuySourceAccumulation: bool = True   # stealth-accumulation SIGNAL
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)

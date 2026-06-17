@@ -126,6 +126,19 @@ SENTIMENT_TASKS: List[SubprocessTask] = [
         cmd_argv=("pump_rider.py",),
         kind="persistent",
     ),
+    # iter176 (2026-06-17) — Stealth Accumulation detector.
+    # Finds a coin in SLOW movement being quietly accumulated (tight 15m
+    # coil, hidden taker-buy demand) and fires SIGNAL on the FIRST ignition
+    # bar that breaks the coil with a volume burst — entering BEFORE the
+    # pump instead of chasing the top.  Backtest (20 coins/5d): 75% win, no
+    # big losses.  Writes STEALTH_ACCUM:SIGNALS:<date>; SignalAutoBuyManager
+    # consumes it as the "accumulation" source (paper-first).  Buys nothing
+    # itself.  Gated by signalAutoBuySourceAccumulation.
+    SubprocessTask(
+        name="Stealth Accumulation",
+        cmd_argv=("stealth_accumulation.py",),
+        kind="persistent",
+    ),
     # iter 69 (2026-05-24) — Volume-Spike Pattern (VSP) classifier.
     # Detects volume spikes and uses taker-buy-ratio + candle structure
     # to classify direction (BIG_PUMP / BIG_DUMP / MODERATE / UNCERTAIN)

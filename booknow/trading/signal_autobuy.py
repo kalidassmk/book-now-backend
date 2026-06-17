@@ -211,6 +211,13 @@ class SignalAutoBuyManager(AsyncProcessor):
         if bool(getattr(cfg, "signalAutoBuySourceBuysignals", True)):
             for d in dates:
                 out += await self._scan_buysignals(d, cutoff_ms)
+        # iter176 — stealth-accumulation SIGNAL (MAIN redis; the
+        # stealth_accumulation.py subprocess writes radar-shaped events).
+        if bool(getattr(cfg, "signalAutoBuySourceAccumulation", True)):
+            for d in dates:
+                out += await self._scan_radar(
+                    self._redis, f"STEALTH_ACCUM:SIGNALS:{d}",
+                    "accumulation", {"SIGNAL"}, cutoff_ms)
         return out
 
     async def _scan_radar(
@@ -319,23 +326,30 @@ class SignalAutoBuyManager(AsyncProcessor):
             await self._log_event(event="skip_rebuy", source=sig["source"], symbol=symbol)
             return {"status": "skipped", "reason": "already bought (no re-buy)"}
 
+        # iter176 — accumulation signals carry their OWN entry discipline in the
+        # detector (tight coil + hidden demand + ignition + anti-chase), so they
+        # BYPASS the pump-tuned vol-band / chg / no-chase filters.  The 24h
+        # run-up cap still applies to every source.
+        is_accum = sig["source"] == "accumulation"
+
         # ── entry filters (rules A2 vol-surge band + A4 anti-chase) ──
         if bool(getattr(cfg, "signalAutoBuyEntryFiltersEnabled", True)):
-            vs = _f(sig.get("vol_surge"))
-            if vs > 0:  # only gate when the signal carries a surge figure
-                vmin = _f(getattr(cfg, "signalAutoBuyVolSurgeMin", 2.5), 2.5)
-                vmax = _f(getattr(cfg, "signalAutoBuyVolSurgeMax", 8.0), 8.0)
-                if vs < vmin or vs > vmax:
-                    await self._log_event(event="skip_volband", source=sig["source"],
-                                          symbol=symbol, vol_surge=vs, lo=vmin, hi=vmax)
-                    return {"status": "skipped",
-                            "reason": f"vol_surge {vs:.1f}x outside [{vmin},{vmax}]"}
-            chg = _f(sig.get("chg_pct"))
-            chg_max = _f(getattr(cfg, "signalAutoBuyChgMaxPct", 8.0), 8.0)
-            if chg > 0 and chg_max > 0 and chg > chg_max:
-                await self._log_event(event="skip_chase_candle", source=sig["source"],
-                                      symbol=symbol, chg_pct=chg, max=chg_max)
-                return {"status": "skipped", "reason": f"chg {chg:.1f}% > {chg_max}% (chasing)"}
+            if not is_accum:
+                vs = _f(sig.get("vol_surge"))
+                if vs > 0:  # only gate when the signal carries a surge figure
+                    vmin = _f(getattr(cfg, "signalAutoBuyVolSurgeMin", 2.5), 2.5)
+                    vmax = _f(getattr(cfg, "signalAutoBuyVolSurgeMax", 8.0), 8.0)
+                    if vs < vmin or vs > vmax:
+                        await self._log_event(event="skip_volband", source=sig["source"],
+                                              symbol=symbol, vol_surge=vs, lo=vmin, hi=vmax)
+                        return {"status": "skipped",
+                                "reason": f"vol_surge {vs:.1f}x outside [{vmin},{vmax}]"}
+                chg = _f(sig.get("chg_pct"))
+                chg_max = _f(getattr(cfg, "signalAutoBuyChgMaxPct", 8.0), 8.0)
+                if chg > 0 and chg_max > 0 and chg > chg_max:
+                    await self._log_event(event="skip_chase_candle", source=sig["source"],
+                                          symbol=symbol, chg_pct=chg, max=chg_max)
+                    return {"status": "skipped", "reason": f"chg {chg:.1f}% > {chg_max}% (chasing)"}
             # 24h run-up cap: don't buy a coin already up a lot on the day
             # (e.g. +45%/+50% tops) — reads the live 24h change %.
             p24_max = _f(getattr(cfg, "signalAutoBuy24hMaxPct", 30.0), 30.0)
@@ -347,9 +361,10 @@ class SignalAutoBuyManager(AsyncProcessor):
                     return {"status": "skipped",
                             "reason": f"24h up {p24:.1f}% ≥ {p24_max}% (too late)"}
 
-        # No-chase: don't buy a coin that already ran above the signal.
+        # No-chase: don't buy a coin that already ran above the signal.  Skipped
+        # for accumulation — the ignition bar is EXPECTED to be moving up.
         current_price = await self._current_price(symbol)
-        if bool(getattr(cfg, "signalAutoBuyNoChase", True)):
+        if not is_accum and bool(getattr(cfg, "signalAutoBuyNoChase", True)):
             if current_price is not None and current_price > signal_price:
                 await self._log_event(event="skip_chase", source=sig["source"],
                                       symbol=symbol, signal=signal_price, now=current_price)
