@@ -167,6 +167,10 @@ class SignalAutoBuyManager(AsyncProcessor):
         elif not self.live_mode:
             await self._reconcile_paper()
 
+        # 1b) protect open early_pump positions (iter177 exit monitor).
+        if bool(getattr(cfg, "signalAutoBuyEpStopEnabled", True)):
+            await self._monitor_ep_exits(cfg)
+
         # 2) collect fresh signals from the enabled sources.
         signals = await self._collect_signals(cfg, cutoff_ms)
         if not signals:
@@ -292,7 +296,12 @@ class SignalAutoBuyManager(AsyncProcessor):
                              or ev.get("chg_5m_pct") or ev.get("chg_5m"))
                 res.append({"source": "buysignals:" + kind, "symbol": sym,
                             "ts": ts, "label": label, "price": price,
-                            "vol_surge": vol_surge, "chg_pct": chg_pct})
+                            "vol_surge": vol_surge, "chg_pct": chg_pct,
+                            # iter177 — early_pump v2 breakout gate inputs.
+                            "score": _f(ev.get("score")),
+                            "dist_hi": (_f(ev.get("dist_to_24h_high_pct"))
+                                        if ev.get("dist_to_24h_high_pct") is not None
+                                        else None)})
         return res
 
     @staticmethod
@@ -331,6 +340,27 @@ class SignalAutoBuyManager(AsyncProcessor):
         # BYPASS the pump-tuned vol-band / chg / no-chase filters.  The 24h
         # run-up cap still applies to every source.
         is_accum = sig["source"] == "accumulation"
+
+        # ── EARLY_PUMP v2 breakout gate (iter177) ────────────────────────
+        # The raw early_pump signal is ~break-even after fees; the edge is in
+        # the BREAKOUT subset — high score AND price breaking its 24h high.
+        # Gate ONLY the buysignals:early_pump source; fail safe when the
+        # detector hasn't stamped dist_hi yet (half-deploy → treat as no-break).
+        if sig["source"] == "buysignals:early_pump" and bool(
+                getattr(cfg, "signalAutoBuyEarlyPumpBreakoutGate", True)):
+            min_score = _f(getattr(cfg, "signalAutoBuyEarlyPumpMinScore", 90.0), 90.0)
+            max_dist = _f(getattr(cfg, "signalAutoBuyEarlyPumpMaxDistHighPct", 2.0), 2.0)
+            score = _f(sig.get("score"))
+            dist_hi = sig.get("dist_hi")
+            if score < min_score:
+                await self._log_event(event="skip_ep_lowscore", source=sig["source"],
+                                      symbol=symbol, score=score, min=min_score)
+                return {"status": "skipped", "reason": f"early_pump score {score:.0f} < {min_score:.0f}"}
+            if dist_hi is None or _f(dist_hi) > max_dist:
+                await self._log_event(event="skip_ep_nobreakout", source=sig["source"],
+                                      symbol=symbol, dist_hi=dist_hi, max=max_dist)
+                return {"status": "skipped",
+                        "reason": f"early_pump not breakout (distHigh={dist_hi})"}
 
         # ── entry filters (rules A2 vol-surge band + A4 anti-chase) ──
         if bool(getattr(cfg, "signalAutoBuyEntryFiltersEnabled", True)):
@@ -470,6 +500,107 @@ class SignalAutoBuyManager(AsyncProcessor):
             await self._redis.hdel(POS_KEY, symbol)
         except Exception:
             pass
+
+    # ── exit protection for early_pump positions (iter177) ───────────────
+    async def _monitor_ep_exits(self, cfg: Any) -> None:
+        """Guard every OPEN buysignals:early_pump position with a hard stop, a
+        trailing give-back, and a time-stop.  These positions previously sat
+        with NO sell order (MEGAUSDT slid to -6.8% while open).
+
+        Selling is real-money, so it only fires when BOTH self.live_mode and
+        ``signalAutoBuyEpStopLiveEnabled`` are on.  Otherwise it previews the
+        intended exit to the log once (live positions are left untouched).  In
+        paper mode the exit is simulated (slot released, no order)."""
+        try:
+            raw = await self._redis.hgetall(POS_KEY)
+        except Exception:
+            return
+        stop_pct = _f(getattr(cfg, "signalAutoBuyEpStopPct", 4.0), 4.0)
+        trail_act = _f(getattr(cfg, "signalAutoBuyEpTrailActivatePct", 4.0), 4.0)
+        trail_pct = _f(getattr(cfg, "signalAutoBuyEpTrailPct", 3.0), 3.0)
+        time_stop_h = _f(getattr(cfg, "signalAutoBuyEpTimeStopHours", 8.0), 8.0)
+        live_sell = self.live_mode and bool(
+            getattr(cfg, "signalAutoBuyEpStopLiveEnabled", False))
+        now_ms = int(time.time() * 1000)
+
+        for sym, val in (raw or {}).items():
+            try:
+                pos = json.loads(val)
+            except Exception:
+                continue
+            if pos.get("state") != "OPEN":
+                continue
+            if not str(pos.get("source") or "").startswith("buysignals:early_pump"):
+                continue
+            fill = _f(pos.get("fillPrice"))
+            cur = await self._current_price(sym)
+            if fill <= 0 or cur is None:
+                continue
+            pnl = (cur - fill) / fill * 100.0
+            peak = max(_f(pos.get("peakPct"), pnl), pnl)
+            age_h = (now_ms - int(pos.get("ts", now_ms))) / 3_600_000.0
+
+            reason: Optional[str] = None
+            if pnl <= -stop_pct:
+                reason = f"stop -{stop_pct:.1f}%"
+            elif peak >= trail_act and (peak - pnl) >= trail_pct:
+                reason = f"trail {trail_pct:.1f}% off peak {peak:.1f}%"
+            elif time_stop_h > 0 and age_h >= time_stop_h:
+                reason = f"time-stop {time_stop_h:.0f}h"
+
+            if reason is None:
+                # keep the trailing high-water mark fresh for the next tick.
+                if peak > _f(pos.get("peakPct"), -1e9):
+                    pos["peakPct"] = peak
+                    try:
+                        await self._redis.hset(POS_KEY, sym, json.dumps(pos))
+                    except Exception:
+                        pass
+                continue
+
+            if live_sell:
+                try:
+                    buffer = 0.999  # fee/rounding headroom
+                    raw_qty = _d(pos.get("qty")) * _d(buffer)
+                    qty = await self._filters.round_quantity(sym, raw_qty)
+                    if qty <= 0:
+                        continue
+                    await self._ws_api.place_order(
+                        symbol=sym, side="SELL", order_type="MARKET",
+                        quantity=str(qty),
+                    )
+                    await self._log_event(event="ep_exit", symbol=sym,
+                                          source=pos.get("source"), reason=reason,
+                                          pnl_pct=round(pnl, 2), qty=str(qty), live=True)
+                    self.log.info("[SIG-AB] EARLY_PUMP exit SELL %s @ %s (%s, pnl=%.1f%%)",
+                                  sym, cur, reason, pnl)
+                    await self._release(sym)
+                except Exception as e:
+                    self.log.error("[SIG-AB] ep exit sell %s failed: %s", sym, e)
+                continue
+
+            if not self.live_mode:
+                # paper: simulate the exit so the sim's P&L reflects the stop.
+                await self._log_event(event="ep_exit", symbol=sym,
+                                      source=pos.get("source"), reason=reason,
+                                      pnl_pct=round(pnl, 2), live=False, paper=True)
+                await self._release(sym)
+                continue
+
+            # live position but live-sell disabled → preview the exit once.
+            if pos.get("epExitIntent") != reason:
+                pos["epExitIntent"] = reason
+                pos["peakPct"] = peak
+                try:
+                    await self._redis.hset(POS_KEY, sym, json.dumps(pos))
+                except Exception:
+                    pass
+                await self._log_event(event="ep_exit_preview", symbol=sym,
+                                      source=pos.get("source"), reason=reason,
+                                      pnl_pct=round(pnl, 2), live=False)
+                self.log.info("[SIG-AB] EARLY_PUMP exit PREVIEW %s (%s, pnl=%.1f%%) "
+                              "— enable signalAutoBuyEpStopLiveEnabled to act",
+                              sym, reason, pnl)
 
     async def _recently_bought(self, cfg: Any, symbol: str) -> bool:
         """True if ``symbol`` is in the NO-RE-BUY ledger and the cooldown

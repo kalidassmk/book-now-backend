@@ -933,6 +933,31 @@ class TradingConfig:
     # anti-chase / no-chase filters, while still honoring no-re-buy, the 24h
     # run-up cap, the position cap, and the ban/delist guards.
     signalAutoBuySourceAccumulation: bool = True   # stealth-accumulation SIGNAL
+    # iter177 (2026-06-17) — EARLY_PUMP v2 "Breakout-Confirmed".  A 162-trade
+    # backtest (score≥80 detections, 2.5 days) showed the raw early_pump signal
+    # is ~break-even after fees (45% win, +0.09%/trade) — and that the original
+    # "avoid the highs / require uptrend" intuition was BACKWARDS.  EARLY_PUMP is
+    # a BREAKOUT play: the winners are bought when price is breaking its 24h high.
+    #   • score≥90  AND  within 2% of the 24h high  → 66% win, +0.92%/trade,
+    #     worst -1.8% (n=38).  The detector (server.js early-pump-watch) now
+    #     writes dist_to_24h_high_pct on every detection; we gate on it here.
+    # Only the buysignals:early_pump source is affected — every other source is
+    # untouched.  Gate fails safe: a detection missing the field is treated as
+    # NOT a breakout (skipped) so a half-deployed frontend can't sneak buys in.
+    signalAutoBuyEarlyPumpBreakoutGate: bool = True   # require breakout for early_pump
+    signalAutoBuyEarlyPumpMinScore: float = 90.0      # raise from the 80 scan floor
+    signalAutoBuyEarlyPumpMaxDistHighPct: float = 2.0  # ≤ this % below 24h high = breakout
+    # iter177 EXIT — early_pump positions had NO stop, so MEGAUSDT fell to -6.8%
+    # while open.  Monitor every tick and exit on: hard stop, trailing give-back,
+    # or a time-stop.  Backtest worst-case capped near -4%.  LIVE selling is OFF
+    # by default (logs the intended exit to SIGNAL:AUTOBUY:LOG); flip
+    # signalAutoBuyEpStopLiveEnabled on after watching the paper log.
+    signalAutoBuyEpStopEnabled: bool = True        # run the exit monitor (log-only until live)
+    signalAutoBuyEpStopLiveEnabled: bool = False   # actually place the market SELL
+    signalAutoBuyEpStopPct: float = 4.0            # hard stop: sell at -4% from fill
+    signalAutoBuyEpTrailActivatePct: float = 4.0   # arm the trailing stop once +4%
+    signalAutoBuyEpTrailPct: float = 3.0           # then exit on a 3% give-back from peak
+    signalAutoBuyEpTimeStopHours: float = 8.0      # exit no matter what after 8h
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)
