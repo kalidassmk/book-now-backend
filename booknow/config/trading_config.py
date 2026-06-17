@@ -958,6 +958,18 @@ class TradingConfig:
     signalAutoBuyEpTrailActivatePct: float = 4.0   # arm the trailing stop once +4%
     signalAutoBuyEpTrailPct: float = 3.0           # then exit on a 3% give-back from peak
     signalAutoBuyEpTimeStopHours: float = 8.0      # exit no matter what after 8h
+    # iter179 ORDERFLOW EXIT — the orderflow redesign emits LIVE label==BUY on a
+    # gated pullback fill, so those real-money positions MUST have a protective
+    # stop too.  Backtest of the old confirm-buys showed median MAE ≈ -2%, so the
+    # orderflow stop is tighter than early_pump's.  The same monitor loop guards
+    # both sources; these params apply when pos["source"]=="orderflow".  LIVE
+    # selling is ON here (the protective complement to the user-authorised live
+    # BUY) — an unprotected live buy would bleed exactly like MEGAUSDT did.
+    signalAutoBuyOfStopLiveEnabled: bool = True    # place the protective market SELL for live orderflow buys
+    signalAutoBuyOfStopPct: float = 2.5            # tighter hard stop: sell at -2.5% (median MAE ≈ -2%)
+    signalAutoBuyOfTrailActivatePct: float = 3.0   # arm the trailing stop once +3%
+    signalAutoBuyOfTrailPct: float = 2.0           # then exit on a 2% give-back from peak
+    signalAutoBuyOfTimeStopHours: float = 4.0      # orderflow moves fast — exit after 4h
 
     # ──────────────────────────────────────────────────────────────────
     # iter 70 (2026-05-24) — Low Market Cap + High Volume (LMC)

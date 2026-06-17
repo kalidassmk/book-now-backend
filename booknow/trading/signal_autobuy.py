@@ -503,24 +503,40 @@ class SignalAutoBuyManager(AsyncProcessor):
 
     # ── exit protection for early_pump positions (iter177) ───────────────
     async def _monitor_ep_exits(self, cfg: Any) -> None:
-        """Guard every OPEN buysignals:early_pump position with a hard stop, a
-        trailing give-back, and a time-stop.  These positions previously sat
-        with NO sell order (MEGAUSDT slid to -6.8% while open).
+        """Guard every OPEN protected position with a hard stop, a trailing
+        give-back, and a time-stop.  Covers two sources:
 
-        Selling is real-money, so it only fires when BOTH self.live_mode and
-        ``signalAutoBuyEpStopLiveEnabled`` are on.  Otherwise it previews the
-        intended exit to the log once (live positions are left untouched).  In
-        paper mode the exit is simulated (slot released, no order)."""
+          • ``buysignals:early_pump`` — these positions previously sat with NO
+            sell order (MEGAUSDT slid to -6.8% while open).  Live selling gated
+            by ``signalAutoBuyEpStopLiveEnabled`` (OFF by default, preview-only).
+          • ``orderflow`` — the iter179 redesign emits LIVE label==BUY on a gated
+            pullback fill, so those real-money buys need a tighter protective
+            stop (median MAE ≈ -2%).  Live selling ON by default
+            (``signalAutoBuyOfStopLiveEnabled``) as the complement to the
+            user-authorised live BUY.
+
+        Selling is real-money, so it only fires when BOTH self.live_mode and the
+        source's live-sell flag are on.  Otherwise it previews the intended exit
+        to the log once (live positions left untouched).  In paper mode the exit
+        is simulated (slot released, no order)."""
         try:
             raw = await self._redis.hgetall(POS_KEY)
         except Exception:
             return
-        stop_pct = _f(getattr(cfg, "signalAutoBuyEpStopPct", 4.0), 4.0)
-        trail_act = _f(getattr(cfg, "signalAutoBuyEpTrailActivatePct", 4.0), 4.0)
-        trail_pct = _f(getattr(cfg, "signalAutoBuyEpTrailPct", 3.0), 3.0)
-        time_stop_h = _f(getattr(cfg, "signalAutoBuyEpTimeStopHours", 8.0), 8.0)
-        live_sell = self.live_mode and bool(
+        # early_pump params
+        ep_stop_pct = _f(getattr(cfg, "signalAutoBuyEpStopPct", 4.0), 4.0)
+        ep_trail_act = _f(getattr(cfg, "signalAutoBuyEpTrailActivatePct", 4.0), 4.0)
+        ep_trail_pct = _f(getattr(cfg, "signalAutoBuyEpTrailPct", 3.0), 3.0)
+        ep_time_stop_h = _f(getattr(cfg, "signalAutoBuyEpTimeStopHours", 8.0), 8.0)
+        ep_live = self.live_mode and bool(
             getattr(cfg, "signalAutoBuyEpStopLiveEnabled", False))
+        # orderflow params (tighter stop, live-sell ON)
+        of_stop_pct = _f(getattr(cfg, "signalAutoBuyOfStopPct", 2.5), 2.5)
+        of_trail_act = _f(getattr(cfg, "signalAutoBuyOfTrailActivatePct", 3.0), 3.0)
+        of_trail_pct = _f(getattr(cfg, "signalAutoBuyOfTrailPct", 2.0), 2.0)
+        of_time_stop_h = _f(getattr(cfg, "signalAutoBuyOfTimeStopHours", 4.0), 4.0)
+        of_live = self.live_mode and bool(
+            getattr(cfg, "signalAutoBuyOfStopLiveEnabled", True))
         now_ms = int(time.time() * 1000)
 
         for sym, val in (raw or {}).items():
@@ -530,7 +546,14 @@ class SignalAutoBuyManager(AsyncProcessor):
                 continue
             if pos.get("state") != "OPEN":
                 continue
-            if not str(pos.get("source") or "").startswith("buysignals:early_pump"):
+            src = str(pos.get("source") or "")
+            if src.startswith("buysignals:early_pump"):
+                stop_pct, trail_act, trail_pct, time_stop_h, live_sell = (
+                    ep_stop_pct, ep_trail_act, ep_trail_pct, ep_time_stop_h, ep_live)
+            elif src == "orderflow":
+                stop_pct, trail_act, trail_pct, time_stop_h, live_sell = (
+                    of_stop_pct, of_trail_act, of_trail_pct, of_time_stop_h, of_live)
+            else:
                 continue
             fill = _f(pos.get("fillPrice"))
             cur = await self._current_price(sym)
